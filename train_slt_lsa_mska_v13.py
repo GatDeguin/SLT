@@ -20,6 +20,7 @@ python tools/train_slt_lsa_mska_v13.py \
 """
 
 import os, re, math, json, argparse, random, warnings
+from functools import partial
 import os.path as osp
 from typing import List, Tuple, Dict, Optional
 
@@ -636,17 +637,32 @@ def validate_bleu(model: KP2Text, ld_val, tok, device='cuda', beam=5, max_len=64
     return bleu, refs, hyps
 
 def make_dataloaders(train_ds, val_ds, pad_id, args):
+    collate = partial(collate_batch, pad_id=pad_id)
+    common_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=getattr(args, 'pin_memory', False),
+    )
+    if args.num_workers > 0:
+        common_kwargs.update(
+            prefetch_factor=getattr(args, 'prefetch_factor', 2),
+            persistent_workers=getattr(args, 'persistent_workers', False),
+        )
+
     train_ld = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=getattr(args, 'pin_memory', False),
-        collate_fn=lambda b: collate_batch(b, pad_id),
-        drop_last=False
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        drop_last=False,
+        **common_kwargs,
     )
     val_ld = DataLoader(
-        val_ds, batch_size=max(1, args.batch_size), shuffle=False,
-        num_workers=args.num_workers, pin_memory=getattr(args, 'pin_memory', False),
-        collate_fn=lambda b: collate_batch(b, pad_id),
-        drop_last=False
+        val_ds,
+        batch_size=max(1, args.batch_size),
+        shuffle=False,
+        collate_fn=collate,
+        drop_last=False,
+        **common_kwargs,
     )
     return train_ld, val_ld
 
