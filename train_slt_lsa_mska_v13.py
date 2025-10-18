@@ -703,6 +703,26 @@ def main():
 
     # Filtrar CSV
     train_rows, val_rows = prepare_rows(args.csv, args.csv_delim, kp_map, fps=args.fps)
+
+    if len(train_rows) > 0 and len(val_rows) == 0:
+        plog("[WARN] CSV sin partición de validación. Separa automáticamente 10% para val.")
+        if len(train_rows) == 1:
+            # Caso extremo: un solo ejemplo. Usar el mismo para train y val.
+            val_rows = [train_rows[0]]
+        else:
+            n_val = max(1, int(round(0.1 * len(train_rows))))
+            # asegurar al menos un ejemplo en train
+            if n_val >= len(train_rows):
+                n_val = len(train_rows) - 1
+            idx = list(range(len(train_rows)))
+            random.Random(SEED).shuffle(idx)
+            val_idx = set(idx[:n_val])
+            new_train = []
+            new_val = []
+            for i, row in enumerate(train_rows):
+                (new_val if i in val_idx else new_train).append(row)
+            train_rows, val_rows = new_train, new_val
+
     plog(f"[INFO] [train] ejemplos={len(train_rows):,} | [val] ejemplos={len(val_rows):,}")
     d_in = 158 if args.xy_only else 237
     plog(f"[INFO] d_in={d_in} | xy_only={args.xy_only} | min_conf={args.min_conf}")
