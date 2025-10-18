@@ -445,9 +445,10 @@ class KP2Text(nn.Module):
 
 def build_optimizer(model: KP2Text, lr_enc=3e-4, lr_dec=1e-5, weight_decay=0.0):
     enc_params = list(model.in_proj.parameters()) + list(model.encoder.parameters()) + list(model.posenc.parameters())
+    enc_param_ids = {id(p) for p in enc_params}
     dec_params = []
     for p in model.decoder.parameters():
-        if p.requires_grad and (p not in enc_params):
+        if p.requires_grad and id(p) not in enc_param_ids:
             dec_params.append(p)
     param_groups = [
         {'params': enc_params, 'lr': lr_enc},
