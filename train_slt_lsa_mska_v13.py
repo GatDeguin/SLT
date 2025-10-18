@@ -594,9 +594,11 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
             scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
+        prev_step = getattr(opt, '_step_count', 0)
         scaler.step(opt)
         scaler.update()
-        sched.step()
+        if getattr(opt, '_step_count', 0) > prev_step:
+            sched.step()
         opt.zero_grad(set_to_none=True)
 
         total += float(loss.detach().cpu().item())
