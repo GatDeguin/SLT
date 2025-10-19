@@ -19,7 +19,7 @@ python tools/train_slt_lsa_mska_v13.py \
 
 """
 
-import os, re, math, json, argparse, random, warnings
+import os, re, math, json, argparse, random, warnings, inspect
 from functools import partial
 import os.path as osp
 from typing import List, Tuple, Dict, Optional
@@ -592,22 +592,62 @@ class _NullGradScaler:
         pass
 
 
+def _instantiate_with_optional_kwargs(cls, base_kwargs: Dict, optional_kwargs: Dict):
+    """
+    Instantiates ``cls`` passing ``base_kwargs`` and adding optional kwargs only when
+    they are supported by the constructor. Falls back to removing the optional
+    kwargs if instantiation still raises ``TypeError`` (for very old torch
+    versions).
+    """
+
+    if cls is None:
+        return None
+
+    kwargs = dict(base_kwargs)
+
+    try:
+        sig = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):
+        sig = None
+
+    if sig is not None:
+        for name, value in optional_kwargs.items():
+            if name in sig.parameters:
+                kwargs[name] = value
+    else:
+        # Best effort: try passing everything first, then fall back below if
+        # the constructor rejects the parameters.
+        kwargs.update(optional_kwargs)
+
+    try:
+        return cls(**kwargs)
+    except TypeError:
+        for name in optional_kwargs:
+            kwargs.pop(name, None)
+        try:
+            return cls(**kwargs)
+        except TypeError:
+            return None
+
+
 def _create_grad_scaler(device_type: str, use_amp: bool):
     if not use_amp:
         return _NullGradScaler()
 
-    # Prefer the new torch.amp API when available.
+    base_kwargs = {'enabled': True}
+    optional_kwargs = {'device_type': device_type}
+
     grad_scaler = None
+
+    # Prefer the new torch.amp API when available.
     if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
-        try:
-            grad_scaler = torch.amp.GradScaler(device_type=device_type, enabled=True)
-        except TypeError:
-            grad_scaler = torch.amp.GradScaler(enabled=True)
+        grad_scaler = _instantiate_with_optional_kwargs(
+            torch.amp.GradScaler, base_kwargs, optional_kwargs
+        )
 
     if grad_scaler is None and device_type == 'cuda' and hasattr(torch.cuda, 'amp'):
         scaler_cls = getattr(torch.cuda.amp, 'GradScaler', None)
-        if scaler_cls is not None:
-            grad_scaler = scaler_cls(enabled=True)
+        grad_scaler = _instantiate_with_optional_kwargs(scaler_cls, base_kwargs, {})
 
     return grad_scaler if grad_scaler is not None else _NullGradScaler()
 
