@@ -75,6 +75,7 @@ class OptimConfig:
     scheduler_step_size: int = 5
     scheduler_gamma: float = 0.5
     label_smoothing: float = 0.1
+    grad_clip_norm: Optional[float] = None
 
 
 @dataclass
@@ -383,12 +384,27 @@ def parse_args() -> argparse.Namespace:
         help="T_max parameter for CosineAnnealingLR when scheduler=cosine",
     )
     parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing applied to the loss")
+    parser.add_argument(
+        "--clip-grad-norm",
+        type=float,
+        default=None,
+        help="Optional maximum norm for gradient clipping before each optimisation step.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Checkpoint path to resume training from (loads model, optimiser and AMP scaler state).",
+    )
 
     args = parser.parse_args()
     if args.decoder_config and args.decoder_model:
         parser.error("--decoder-model and --decoder-config are mutually exclusive")
     if not args.tokenizer and not args.decoder_model:
         parser.error("Provide --tokenizer when --decoder-model is not specified")
+    if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
+        logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
+        args.clip_grad_norm = None
     return args
 
 
@@ -451,6 +467,7 @@ def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, Op
         scheduler_step_size=args.scheduler_step_size,
         scheduler_gamma=args.scheduler_gamma,
         label_smoothing=args.label_smoothing,
+        grad_clip_norm=args.clip_grad_norm,
     )
 
     if scheduler_choice == "cosine":
@@ -558,6 +575,8 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     val_loss: float,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    best_val: Optional[float] = None,
 ) -> None:
     state = {
         "epoch": epoch,
@@ -565,6 +584,10 @@ def _save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "val_loss": float(val_loss),
     }
+    if scaler is not None:
+        state["scaler_state"] = scaler.state_dict()
+    if best_val is not None:
+        state["best_val"] = float(best_val)
     torch.save(state, path)
 
 
@@ -695,9 +718,35 @@ def main() -> None:
     best_val = float("inf")
     best_path = data_config.work_dir / "best.pt"
     last_path = data_config.work_dir / "last.pt"
+    start_epoch = 0
+
+    if args.resume is not None:
+        checkpoint_path = args.resume
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer_state = checkpoint.get("optimizer_state")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        if scaler is not None and "scaler_state" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state"])
+        best_val = float(checkpoint.get("best_val", checkpoint.get("val_loss", best_val)))
+        start_epoch = int(checkpoint.get("epoch", 0))
+        logging.info("Resumed training from %s at epoch %d", checkpoint_path, start_epoch)
+
+    if args.epochs <= start_epoch:
+        logging.info(
+            "Checkpoint epoch (%d) is greater than or equal to requested epochs (%d). Nothing to do.",
+            start_epoch,
+            args.epochs,
+        )
+        if writer is not None:
+            writer.close()
+        return
 
     logging.info("Starting training for %d epochs", args.epochs)
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         train_loss = train_epoch(
             model,
             train_loader,
@@ -705,6 +754,7 @@ def main() -> None:
             _loss_fn,
             device=device,
             scaler=scaler,
+            grad_clip_norm=optim_config.grad_clip_norm,
         )
         val_loss = eval_epoch(model, val_loader, _loss_fn, device=device)
 
@@ -720,12 +770,28 @@ def main() -> None:
             writer.add_scalar("loss/train", train_loss, epoch)
             writer.add_scalar("loss/val", val_loss, epoch)
 
-        _save_checkpoint(last_path, model=model, optimizer=optimizer, epoch=epoch, val_loss=val_loss)
+        _save_checkpoint(
+            last_path,
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            val_loss=val_loss,
+            scaler=scaler,
+            best_val=best_val,
+        )
 
         if val_loss < best_val:
             best_val = val_loss
             logging.info("New best validation loss: %.4f", best_val)
-            _save_checkpoint(best_path, model=model, optimizer=optimizer, epoch=epoch, val_loss=val_loss)
+            _save_checkpoint(
+                best_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                val_loss=val_loss,
+                scaler=scaler,
+                best_val=best_val,
+            )
 
         if scheduler is not None:
             scheduler.step()
