@@ -690,12 +690,42 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
             skipped += 1
             plog(f"[WARN] Paso omitido: loss no finito (valor={float(loss.detach().cpu())}).")
             opt.zero_grad(set_to_none=True)
+            scaler.update()
             continue
 
         scaler.scale(loss).backward()
+
+        # Desescalar siempre antes de inspeccionar gradientes
+        scaler.unscale_(opt)
+
+        grads_finite = True
+        grad_norm = None
         if grad_clip is not None and grad_clip > 0:
-            scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if grad_norm is not None and not torch.isfinite(grad_norm):
+                grads_finite = False
+
+        if grads_finite:
+            for group in opt.param_groups:
+                if not grads_finite:
+                    break
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        grads_finite = False
+                        break
+
+        if not grads_finite:
+            skipped += 1
+            if grad_norm is not None and not torch.isfinite(grad_norm):
+                msg = f"grad_norm no finito (valor={float(grad_norm)})"
+            else:
+                msg = "gradientes no finitos detectados"
+            plog(f"[WARN] Paso omitido: {msg}.")
+            opt.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
 
         prev_step = getattr(opt, '_step_count', 0)
         scaler.step(opt)
