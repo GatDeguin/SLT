@@ -132,6 +132,7 @@ def _build_collate(tokenizer: PreTrainedTokenizerBase, *, max_length: int):
             "hand_r": merged["hand_r"],
             "pose": merged["pose"],
             "pad_mask": merged["pad_mask"],
+            "lengths": merged["lengths"],
             "miss_mask_hl": merged["miss_mask_hl"],
             "miss_mask_hr": merged["miss_mask_hr"],
             "labels": labels,
