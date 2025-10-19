@@ -309,7 +309,7 @@ def main() -> None:
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(
+        train_result = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -318,12 +318,14 @@ def main() -> None:
             scaler=scaler,
             autocast_dtype=autocast_dtype,
         )
-        val_loss = eval_epoch(
+        val_result = eval_epoch(
             model,
             val_loader,
             _loss_fn,
             device=device,
         )
+        train_loss = getattr(train_result, "loss", train_result)
+        val_loss = getattr(val_result, "loss", val_result)
         torch.save(model.state_dict(), args.work_dir / "last.pt")
         if val_loss < best_val:
             best_val = val_loss

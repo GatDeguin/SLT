@@ -197,3 +197,27 @@ def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:
     assert mask[2, 0].item() is False
     assert mask[2, 1].item() is True
     assert torch.allclose(pose[2, 1, :2], torch.tensor([0.3, 0.4]))
+
+
+def test_missing_metadata_columns_raise(tmp_path: Path) -> None:
+    face_dir = tmp_path / "face"
+    hand_l_dir = tmp_path / "hand_l"
+    hand_r_dir = tmp_path / "hand_r"
+    pose_dir = tmp_path / "pose"
+    for directory in (face_dir, hand_l_dir, hand_r_dir, pose_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    csv_path = tmp_path / "subs.csv"
+    csv_path.write_text("video_id;text\nvid001;hola\n", encoding="utf-8")
+    index_path = tmp_path / "index.csv"
+    index_path.write_text("identifier\nvid001\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        LsaTMultiStream(
+            str(face_dir),
+            str(hand_l_dir),
+            str(hand_r_dir),
+            str(pose_dir),
+            str(csv_path),
+            str(index_path),
+        )

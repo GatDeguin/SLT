@@ -77,3 +77,25 @@ sesión (ruta configurable). Cada entrada de metadata contiene:
 - bandera `success` y descripción de error si aplica.
 
 Esta metadata permite reanudar ejecuciones (`--resume`) y auditar errores puntuales.
+
+## Flujo de trabajo recomendado
+
+1. **Instalación**: crea un entorno virtual e instala `requirements-dev.txt` para
+   disponer del paquete `slt`, PyTorch y las herramientas de desarrollo
+   utilizadas en CI (`pytest`, `ruff`, `black`, `mypy`, `onnx`).
+2. **Preparación de datos**: ejecuta `tools/extract_rois_v2.py` con los videos
+   brutos para generar `face/`, `hand_l/`, `hand_r/` y `pose/`; construye los
+   CSV de metadata y splits siguiendo la estructura anterior.
+3. **Entrenamiento**: utiliza `python -m slt` para un *smoke test* rápido o
+   `tools/train_slt_multistream_v9.py` para sesiones largas. Ambos scripts
+   consumen `LsaTMultiStream` y respetan los campos detallados en este contrato.
+4. **Evaluación**: ejecuta `tools/eval_slt_multistream_v9.py` con el checkpoint y
+   los splits de validación/prueba para obtener CER, BLEU y pérdida agregada.
+5. **Exportación y despliegue**: genera artefactos ONNX/TorchScript con
+   `tools/export_onnx_encoder_v9.py` y valida la inferencia en tiempo real usando
+   `tools/demo_realtime_multistream.py` o `tools/test_realtime_pipeline.py`.
+
+Los tests automatizados (`tests/data/`, `tests/models/`, `tests/training/` y
+`tests/test_cli_main.py`) replican este flujo a escala reducida. Consulta la
+tabla de métricas en el `README.md` para conocer los valores esperados que
+servirán como referencia durante la verificación del entorno.

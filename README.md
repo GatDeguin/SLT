@@ -6,29 +6,51 @@ utilizado durante la experimentación con el corpus LSA-T. El comando
 los *DataLoaders* y ejecuta un entrenamiento corto con los modelos de prueba
 incluidos en el paquete.
 
-## Requisitos de datos
+## Instalación
 
-## Requisitos de entorno
+El proyecto se distribuye como un paquete editable. Para un entorno de
+desarrollo completo instala las dependencias de la siguiente manera:
 
-- GPU con soporte CUDA recomendada para inferencia en tiempo real (el código también puede ejecutarse en CPU con menor FPS).
-- MediaPipe (`pip install .[media]`) para la detección de rostro, manos y pose.
-- `onnxruntime` opcional (`pip install .[export]`) si deseas cargar modelos exportados en formato ONNX.
+```bash
+python -m venv .venv
+source .venv/bin/activate  # En Windows utiliza `.venv\\Scripts\\activate`
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+```
 
-La demostración espera la misma estructura de carpetas generada por el script
-`extract_rois_v2.py`:
+Esto instalará el paquete `slt`, las dependencias de ejecución (PyTorch,
+Transformers, Pandas, etc.) y las herramientas de desarrollo utilizadas en CI
+(`pytest`, `ruff`, `black`, `mypy`, `onnx`). Para trabajar con la extracción de
+regiones y la demo en tiempo real puedes instalar extras opcionales:
 
-- `face/<video_id>_fXXXXXX.jpg`
-- `hand_l/<video_id>_fXXXXXX.jpg`
-- `hand_r/<video_id>_fXXXXXX.jpg`
-- `pose/<video_id>.npz` con la clave `pose`
+```bash
+pip install .[media]     # MediaPipe para extracción de ROI
+pip install .[export]    # Dependencias para exportar a ONNX/TorchScript
+```
 
-Además se necesitan:
+## Preparación de datos
 
-- Un CSV principal (`video_id;texto`).
-- Dos CSV con los identificadores para los splits de entrenamiento y
-  validación.
+La demo y los scripts de entrenamiento esperan la estructura generada por
+`tools/extract_rois_v2.py`. El flujo típico es:
 
-## Ejecución rápida
+1. Ejecutar `tools/extract_rois_v2.py` sobre los videos brutos para generar las
+   carpetas `face/`, `hand_l/`, `hand_r/` y `pose/`.
+2. Generar el CSV principal `subs.csv` con columnas `video_id;texto`.
+3. Crear dos CSV adicionales (`train.csv` y `val.csv`) con la lista de
+   identificadores utilizados en cada split.
+
+```bash
+python tools/extract_rois_v2.py \
+  --videos data/raw_videos \
+  --output data/rois \
+  --metadata meta.csv
+```
+
+El dataset multi-stream (`slt.data.LsaTMultiStream`) validará la presencia de
+las columnas requeridas y normalizará automáticamente los streams de imagen,
+pose y máscaras de confianza.
+
+## Entrenamiento
 
 ```bash
 python -m slt \
@@ -46,7 +68,70 @@ python -m slt \
 El script guardará `last.pt` y `best.pt` en `--work-dir` y mostrará en consola
 la pérdida de entrenamiento/validación por época. Ajusta los parámetros según
 la disponibilidad de hardware (por ejemplo `--device cpu` para forzar la
-Ejecución en CPU).
+ejecución en CPU). Si deseas un control más detallado del pipeline utiliza el
+script `tools/train_slt_multistream_v9.py`, que expone opciones adicionales
+para optimización, *logging* y reanudación de checkpoints:
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --config configs/demo.json \
+  --tokenizer hf-internal-testing/tiny-random-T5 \
+  --face-dir data/rois/face \
+  --train-index data/lsa_t/index/train.csv \
+  --val-index data/lsa_t/index/val.csv \
+  --epochs 40 --batch-size 4
+```
+
+Consulta `docs/train_slt_multistream_v9.md` para una referencia completa de
+argumentos y buenas prácticas.
+
+## Evaluación
+
+El script `tools/eval_slt_multistream_v9.py` calcula métricas de traducción
+utilizando los checkpoints generados durante el entrenamiento. Un ejemplo de
+uso es:
+
+```bash
+python tools/eval_slt_multistream_v9.py \
+  --checkpoint work_dirs/multistream_v9/best.pt \
+  --tokenizer hf-internal-testing/tiny-random-T5 \
+  --face-dir data/rois/face \
+  --metadata-csv data/lsa_t/subs.csv \
+  --index data/lsa_t/index/test.csv
+```
+
+El script reporta pérdida promedio y, si se proporcionan referencias, métricas
+como CER y BLEU mediante `sacrebleu`.
+
+## Exportación y despliegue
+
+Para desplegar el encoder multi-stream en aplicaciones móviles o backends
+livianos, exporta a ONNX y TorchScript con `tools/export_onnx_encoder_v9.py`:
+
+```bash
+python tools/export_onnx_encoder_v9.py \
+  --checkpoint work_dirs/multistream_v9/best.pt \
+  --onnx exports/encoder.onnx \
+  --torchscript exports/encoder.ts \
+  --image-size 224 --sequence-length 64 --d-model 512
+```
+
+Luego utiliza `tools/demo_realtime_multistream.py` o
+`tools/test_realtime_pipeline.py` para validar el modelo exportado en una demo
+de cámara web o sobre videos pregrabados. Ambos scripts aceptan modelos
+TorchScript/ONNX y un tokenizer de HuggingFace para decodificar el texto.
+
+## Métricas esperadas
+
+La siguiente tabla resume valores de referencia obtenidos con los stubs
+incluidos en el repositorio. Funcionan como chequeos de humo para validar que
+el entorno está correctamente configurado.
+
+| Escenario | Métrica | Valor esperado |
+|-----------|---------|----------------|
+| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida inicial (`eval_epoch`) | ≈ 30.09 |
+| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida final tras 3 épocas | ≈ 0.60 |
+| Exportación encoder (`tests/test_export.py`) | Archivos generados | `encoder_*.onnx`, `encoder_*.ts` |
 
 ## Sustituir los stubs por modelos reales
 

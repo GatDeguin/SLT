@@ -47,3 +47,21 @@ include = ["slt*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["B905"]
+
+[tool.mypy]
+python_version = "3.9"
+packages = ["slt", "tools"]
+ignore_missing_imports = true
+warn_unused_configs = true
