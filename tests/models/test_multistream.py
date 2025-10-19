@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from slt.models.backbones import ViTConfig
+from slt.models.backbones import ViTConfig, load_dinov2_backbone
 from slt.models.multistream import MultiStreamEncoder
 
 
@@ -113,3 +113,66 @@ def test_missing_hand_masks_trigger_hook() -> None:
     for _, mask in model.calls:
         assert mask.dtype == torch.bool
         assert mask.shape == (batch, time)
+
+
+def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
+    config = _tiny_vit_config()
+
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_dim = 32
+            self.proj = torch.nn.Linear(3 * config.image_size * config.image_size, self.embed_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if x.dim() != 4:
+                raise AssertionError("Backbone inputs must be BCHW tensors")
+            batch = x.size(0)
+            flat = x.view(batch, -1)
+            return self.proj(flat)
+
+    reference = DummyBackbone()
+    checkpoint_path = tmp_path / "dummy.pt"
+    torch.save(reference.state_dict(), checkpoint_path)
+
+    calls = []
+
+    def fake_torchhub_load(repo, model, pretrained=True, trust_repo=True):
+        calls.append((repo, model, pretrained))
+        module = DummyBackbone()
+        if pretrained:
+            module.load_state_dict(reference.state_dict())
+        return module
+
+    monkeypatch.setattr(torch.hub, "load", fake_torchhub_load)
+
+    spec = f"file::{checkpoint_path}:dummy"
+    backbones = {
+        "face": load_dinov2_backbone(spec),
+        "hand_left": load_dinov2_backbone(spec),
+        "hand_right": load_dinov2_backbone(spec, freeze=True),
+    }
+
+    encoder = MultiStreamEncoder(
+        backbone_config=config,
+        projector_dim=16,
+        d_model=32,
+        pose_dim=39,
+        positional_num_positions=32,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 64},
+        backbones=backbones,
+    )
+
+    batch, time = 2, 3
+    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+
+    output = encoder(face, hand_l, hand_r, pose)
+
+    assert output.shape == (batch, time, 32)
+    assert len(calls) == 3
+    assert all(param.requires_grad for param in backbones["face"].parameters())
+    assert all(param.requires_grad for param in backbones["hand_left"].parameters())
+    assert all(not param.requires_grad for param in backbones["hand_right"].parameters())

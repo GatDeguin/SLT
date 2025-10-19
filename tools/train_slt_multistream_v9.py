@@ -22,7 +22,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
-from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
+from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig, load_dinov2_backbone
 from slt.training.loops import eval_epoch, train_epoch
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
@@ -54,6 +54,12 @@ class ModelConfig:
     decoder_layers: int = 2
     decoder_heads: int = 8
     decoder_dropout: float = 0.1
+    face_backbone: Optional[str] = None
+    hand_left_backbone: Optional[str] = None
+    hand_right_backbone: Optional[str] = None
+    freeze_face_backbone: bool = False
+    freeze_hand_left_backbone: bool = False
+    freeze_hand_right_backbone: bool = False
 
 
 @dataclass
@@ -107,6 +113,16 @@ class MultiStreamClassifier(nn.Module):
             "dropout": config.temporal_dropout,
         }
 
+        backbone_specs = {
+            "face": (config.face_backbone, config.freeze_face_backbone),
+            "hand_left": (config.hand_left_backbone, config.freeze_hand_left_backbone),
+            "hand_right": (config.hand_right_backbone, config.freeze_hand_right_backbone),
+        }
+        external_backbones: Dict[str, torch.nn.Module] = {}
+        for stream, (spec, freeze_flag) in backbone_specs.items():
+            if spec:
+                external_backbones[stream] = load_dinov2_backbone(spec, freeze=freeze_flag)
+
         self.encoder = MultiStreamEncoder(
             backbone_config=vit_config,
             projector_dim=config.projector_dim,
@@ -116,6 +132,7 @@ class MultiStreamClassifier(nn.Module):
             projector_dropout=config.projector_dropout,
             fusion_dropout=config.fusion_dropout,
             temporal_kwargs=temporal_kwargs,
+            backbones=external_backbones if external_backbones else None,
         )
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
@@ -265,6 +282,46 @@ def parse_args() -> argparse.Namespace:
         help="Dropout probability inside the seq2seq decoder",
     )
     parser.add_argument(
+        "--face-backbone",
+        type=str,
+        default=None,
+        help=(
+            "Backbone specification for the face stream. The value is forwarded to "
+            "slt.models.backbones.load_dinov2_backbone, e.g. 'torchhub::facebookresearch/dinov2:dinov2_vits14'."
+        ),
+    )
+    parser.add_argument(
+        "--hand-left-backbone",
+        type=str,
+        default=None,
+        help=(
+            "Backbone specification for the left hand stream (see --face-backbone for format)."
+        ),
+    )
+    parser.add_argument(
+        "--hand-right-backbone",
+        type=str,
+        default=None,
+        help=(
+            "Backbone specification for the right hand stream (see --face-backbone for format)."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-face-backbone",
+        action="store_true",
+        help="Freeze all parameters in the face backbone after loading external weights.",
+    )
+    parser.add_argument(
+        "--freeze-hand-left-backbone",
+        action="store_true",
+        help="Freeze all parameters in the left hand backbone after loading external weights.",
+    )
+    parser.add_argument(
+        "--freeze-hand-right-backbone",
+        action="store_true",
+        help="Freeze all parameters in the right hand backbone after loading external weights.",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         required=True,
@@ -338,6 +395,12 @@ def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, Op
         decoder_layers=args.decoder_layers,
         decoder_heads=args.decoder_heads,
         decoder_dropout=args.decoder_dropout,
+        face_backbone=args.face_backbone,
+        hand_left_backbone=args.hand_left_backbone,
+        hand_right_backbone=args.hand_right_backbone,
+        freeze_face_backbone=args.freeze_face_backbone,
+        freeze_hand_left_backbone=args.freeze_hand_left_backbone,
+        freeze_hand_right_backbone=args.freeze_hand_right_backbone,
     )
 
     scheduler_choice = args.scheduler.lower()
