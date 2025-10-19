@@ -865,7 +865,12 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.work_dir, exist_ok=True)
-    device = args.device
+    requested_device = args.device
+    if requested_device.startswith('cuda') and not torch.cuda.is_available():
+        plog(f"[WARN] CUDA no disponible. Forzando ejecución en CPU en lugar de '{requested_device}'.")
+        device = 'cpu'
+    else:
+        device = requested_device
     plog(f"[INFO] Dispositivo: {device}")
 
     kp_map = list_npy(args.kp_dir)
