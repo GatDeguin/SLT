@@ -1,3 +1,444 @@
+
+⸻
+
+requirements.txt (mínimo funcional)
+
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+mediapipe==0.10.14
+tqdm==4.66.4
+sacrebleu==2.4.2
+transformers==4.43.3
+
+Si usás CUDA 12.x, asegurate de instalar la build de PyTorch que corresponda.
+
+⸻
+
+tools/extract_rois_v2.py
+
+Crea crops por frame de cara / mano izq / mano der y un .npz con pose superior. Incluye opción de blur facial parcial (ojos+boca nítidos).
+
+# tools/extract_rois_v2.py
+import os, cv2, math, json, numpy as np
+from pathlib import Path
+from typing import Dict
+
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
+    print("[WARN] MediaPipe no disponible. pip install mediapipe")
+
+def ensure_dir(p: str): Path(p).mkdir(parents=True, exist_ok=True)
+
+def expand_clamp_bbox(x, y, w, h, scale, W, H):
+    cx, cy = x + w/2, y + h/2
+    w2, h2 = w*scale, h*scale
+    x1 = max(0, int(cx - w2/2)); y1 = max(0, int(cy - h2/2))
+    x2 = min(W, int(cx + w2/2)); y2 = min(H, int(cy + h2/2))
+    return x1, y1, x2-x1, y2-y1
+
+def crop_square(img, x, y, w, h, out=224):
+    H, W = img.shape[:2]
+    side = max(w, h); cx, cy = x+w//2, y+h//2
+    x1 = max(0, cx - side//2); y1 = max(0, cy - side//2)
+    x2 = min(W, x1 + side);    y2 = min(H, y1 + side)
+    crop = img[y1:y2, x1:x2]
+    return cv2.resize(crop, (out, out), interpolation=cv2.INTER_LINEAR)
+
+def blur_face_preserve_eyes_mouth(img, face_landmarks):
+    if face_landmarks is None: return img
+    H, W = img.shape[:2]
+    mask = np.zeros((H, W), dtype=np.uint8)
+    keep_idxs = list(range(0, 18)) + list(range(33, 134)) + list(range(263, 363))  # aprox
+    for k, lm in enumerate(face_landmarks.landmark):
+        if k in keep_idxs:
+            cv2.circle(mask, (int(lm.x*W), int(lm.y*H)), 6, 255, -1)
+    blurred = cv2.GaussianBlur(img, (31,31), 0)
+    mask3 = cv2.merge([mask,mask,mask])
+    inv = 255 - mask3
+    return cv2.bitwise_and(blurred, inv) + cv2.bitwise_and(img, mask3)
+
+def process_video(vid_path: str, out_dirs: Dict[str,str], pose_dir: str, fps_target=25, face_blur=False):
+    assert mp is not None, "Se requiere MediaPipe"
+    mp_face, mp_hands, mp_pose = mp.solutions.face_mesh, mp.solutions.hands, mp.solutions.pose
+
+    cap = cv2.VideoCapture(vid_path)
+    if not cap.isOpened():
+        print(f"[ERR] No se pudo abrir {vid_path}"); return False
+
+    base = Path(vid_path).stem
+    face_out, hl_out, hr_out = out_dirs['face'], out_dirs['hand_l'], out_dirs['hand_r']
+    for d in (face_out, hl_out, hr_out, pose_dir): ensure_dir(d)
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or fps_target
+    stride = max(1, int(round(fps / fps_target)))
+
+    with mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as fmesh, \
+         mp_hands.Hands(static_image_mode=False, max_num_hands=2) as hands, \
+         mp_pose.Pose(static_image_mode=False, model_complexity=1) as pose:
+
+        t, idx, pose_list = 0, 0, []
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            if idx % stride != 0: idx += 1; continue
+            H, W = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            f_res = fmesh.process(rgb)
+            h_res = hands.process(rgb)
+            p_res = pose.process(rgb)
+
+            # CARA
+            face_crop = np.zeros((224,224,3), dtype=np.uint8)
+            if f_res.multi_face_landmarks:
+                flm = f_res.multi_face_landmarks[0]
+                xs = [int(l.x*W) for l in flm.landmark]; ys = [int(l.y*H) for l in flm.landmark]
+                x1, y1, x2, y2 = max(0,min(xs)), max(0,min(ys)), min(W,max(xs)), min(H,max(ys))
+                x,y,w,h = expand_clamp_bbox(x1, y1, x2-x1, y2-y1, 1.2, W, H)
+                fc = frame[y:y+h, x:x+w].copy()
+                if face_blur: fc = blur_face_preserve_eyes_mouth(fc, flm)
+                face_crop = crop_square(fc, 0,0,w,h,224)
+            cv2.imwrite(os.path.join(face_out, f"{base}_f{t:06d}.jpg"), face_crop)
+
+            # MANOS
+            hl_crop = np.zeros((224,224,3), dtype=np.uint8)
+            hr_crop = np.zeros((224,224,3), dtype=np.uint8)
+            if h_res.multi_hand_landmarks:
+                hands_info = []
+                for hlm, handed in zip(h_res.multi_hand_landmarks, h_res.multi_handedness):
+                    xs = [int(l.x*W) for l in hlm.landmark]; ys = [int(l.y*H) for l in hlm.landmark]
+                    x1,y1,x2,y2 = max(0,min(xs)), max(0,min(ys)), min(W,max(xs)), min(H,max(ys))
+                    hands_info.append(((x1,y1,x2,y2), handed.classification[0].label))
+                for (x1,y1,x2,y2), label in hands_info:
+                    x,y,w,h = expand_clamp_bbox(x1, y1, x2-x1, y2-y1, 1.2, W, H)
+                    hc = crop_square(frame, x,y,w,h,224)
+                    if label.lower().startswith('left'): hl_crop = hc
+                    else: hr_crop = hc
+            cv2.imwrite(os.path.join(hl_out, f"{base}_f{t:06d}.jpg"), hl_crop)
+            cv2.imwrite(os.path.join(hr_out, f"{base}_f{t:06d}.jpg"), hr_crop)
+
+            # POSE (17 puntos superiores)
+            lmk = np.zeros((17,3), dtype=np.float32)
+            if p_res.pose_landmarks:
+                for k, lm in enumerate(p_res.pose_landmarks.landmark[:17]):
+                    lmk[k] = (lm.x, lm.y, lm.visibility)
+            pose_list.append(lmk.reshape(-1))
+
+            t += 1; idx += 1
+
+    cap.release()
+    np.savez(os.path.join(pose_dir, f"{base}.npz"), pose=np.array(pose_list, dtype=np.float32))
+    return True
+
+def run_bulk(videos_dir: str, out_root: str, fps_target=25, face_blur=False):
+    vd = Path(videos_dir)
+    out_dirs = {'face': os.path.join(out_root,'face'),
+                'hand_l': os.path.join(out_root,'hand_l'),
+                'hand_r': os.path.join(out_root,'hand_r')}
+    pose_dir = os.path.join(out_root,'pose'); ensure_dir(pose_dir)
+    for p in vd.glob('*.mp4'):
+        print(f"Procesando {p.name}")
+        process_video(str(p), out_dirs, pose_dir, fps_target, face_blur)
+
+if __name__ == '__main__':
+    run_bulk(
+        videos_dir=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\lsa_t\videos",
+        out_root=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois",
+        fps_target=25,
+        face_blur=False
+    )
+
+
+⸻
+
+tools/pretrain_dino_face.py (stub auto-sup mínimal)
+
+Para producción, reemplazá por tu DINOv2-S real. Este stub sirve para probar el pipeline de punta a punta.
+
+# tools/pretrain_dino_face.py
+import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+
+class ImageFolderFlat(Dataset):
+    def __init__(self, root: str, img_size=224):
+        from PIL import Image; import numpy as np
+        self.Image = Image; self.np = np
+        self.files = [str(p) for p in Path(root).glob('*.jpg')]
+        self.img_size = img_size
+    def __len__(self): return len(self.files)
+    def __getitem__(self, i):
+        from PIL import Image; import numpy as np
+        p = self.files[i]
+        arr = np.asarray(Image.open(p).convert('RGB').resize((self.img_size,self.img_size)), dtype='float32')/255.
+        return torch.from_numpy(arr.transpose(2,0,1))
+
+class TinyViT(nn.Module):
+    def __init__(self, dim=384):
+        super().__init__()
+        self.conv = nn.Conv2d(3, dim, 16, 16)
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+    def forward(self, x): return self.pool(self.conv(x)).flatten(1)
+
+def train_stub(img_dir: str, out_dir: str, epochs=2, batch=256, lr=1e-3):
+    ds = ImageFolderFlat(img_dir)
+    dl = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=0)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    enc = TinyViT().to(device)
+    opt = torch.optim.AdamW(enc.parameters(), lr=lr)
+    for ep in range(epochs):
+        enc.train(); total=0
+        for x in dl:
+            x = x.to(device); h = enc(x)
+            loss = (h.norm(dim=1) - 1).abs().mean()  # dummy self-sup
+            opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item()*x.size(0)
+        print({"epoch": ep+1, "loss": total/len(ds)})
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(enc.state_dict(), str(Path(out_dir)/'encoder.pth'))
+
+if __name__=='__main__':
+    train_stub(
+        img_dir=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\face",
+        out_dir=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\work_dirs\dino_face_v1"
+    )
+
+
+⸻
+
+tools/pretrain_dino_hands.py (stub que reutiliza el de cara)
+
+# tools/pretrain_dino_hands.py
+import os, shutil, tempfile
+from pathlib import Path
+from pretrain_dino_face import train_stub
+
+def train_stub_hands(dir_l: str, dir_r: str, out_dir: str):
+    tmp = tempfile.mkdtemp()
+    for d in [dir_l, dir_r]:
+        for f in Path(d).glob("*.jpg"):
+            shutil.copyfile(str(f), str(Path(tmp)/f"{f.parent.name}_{f.name}"))
+    train_stub(tmp, out_dir, epochs=2)
+
+if __name__=='__main__':
+    train_stub_hands(
+        dir_l=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\hand_l",
+        dir_r=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\hand_r",
+        out_dir=r"G:\Apps\SENAR\v5 - MSKA\MSKA-main\work_dirs\dino_hands_v1"
+    )
+
+
+⸻
+
+tools/train_slt_multistream_v9.py
+
+Entrenador que usa el modelo multi-stream del canvas (cara+manos+pose). Mantengo el stub decoder; si querés, luego cambio a mBART-50.
+
+# tools/train_slt_multistream_v9.py
+import os, argparse, torch
+from torch.utils.data import DataLoader
+from __main__ import LsaTMultiStream, collate_fn, MultiStreamSLT, set_seed, train_epoch, eval_epoch
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--face_dir', required=True)
+    ap.add_argument('--hand_l_dir', required=True)
+    ap.add_argument('--hand_r_dir', required=True)
+    ap.add_argument('--pose_dir', required=True)
+    ap.add_argument('--csv', required=True)
+    ap.add_argument('--splits_dir', required=True)
+    ap.add_argument('--work_dir', required=True)
+    ap.add_argument('--epochs', type=int, default=40)
+    ap.add_argument('--batch_size', type=int, default=4)
+    ap.add_argument('--grad_accum', type=int, default=4)
+    ap.add_argument('--T', type=int, default=128)
+    ap.add_argument('--device', default='cuda')
+    args = ap.parse_args()
+
+    set_seed(123)
+    tr = LsaTMultiStream(args.face_dir,args.hand_l_dir,args.hand_r_dir,args.pose_dir,args.csv, os.path.join(args.splits_dir,'train.csv'), T=args.T)
+    va = LsaTMultiStream(args.face_dir,args.hand_l_dir,args.hand_r_dir,args.pose_dir,args.csv, os.path.join(args.splits_dir,'val.csv'),   T=args.T)
+    dl_tr = DataLoader(tr, batch_size=args.batch_size, shuffle=True,  num_workers=0, collate_fn=collate_fn)
+    dl_va = DataLoader(va, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+
+    device = args.device if torch.cuda.is_available() else 'cpu'
+    model = MultiStreamSLT(d_model=512, proj_dim=256, nhead=8, nlayers=6, vocab_size=32000, lkp_count=13).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device=='cuda'))
+
+    best = 1e9
+    os.makedirs(args.work_dir, exist_ok=True)
+    for epoch in range(args.epochs):
+        tr_loss = train_epoch(model, dl_tr, opt, scaler, device)
+        va_loss = eval_epoch(model, dl_va, device)
+        print({"epoch": epoch+1, "train_loss": tr_loss, "val_loss": va_loss})
+        if va_loss < best:
+            best = va_loss
+            torch.save(model.state_dict(), os.path.join(args.work_dir,'best.pth'))
+
+if __name__=='__main__':
+    main()
+
+
+⸻
+
+tools/eval_slt_multistream_v9.py
+
+Eval con pred stub (id de token), vuelca CSV para inspección. Cuando pasemos a mBART, acá metemos BLEU/WER/CER.
+
+# tools/eval_slt_multistream_v9.py
+import os, csv, argparse, torch
+from torch.utils.data import DataLoader
+from __main__ import LsaTMultiStream, collate_fn, MultiStreamSLT
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--face_dir', required=True)
+    ap.add_argument('--hand_l_dir', required=True)
+    ap.add_argument('--hand_r_dir', required=True)
+    ap.add_argument('--pose_dir', required=True)
+    ap.add_argument('--csv', required=True)
+    ap.add_argument('--splits_dir', required=True)
+    ap.add_argument('--out_csv', required=True)
+    ap.add_argument('--T', type=int, default=128)
+    args = ap.parse_args()
+
+    ds = LsaTMultiStream(args.face_dir,args.hand_l_dir,args.hand_r_dir,args.pose_dir,args.csv, os.path.join(args.splits_dir,'test.csv'), T=args.T)
+    dl = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0, collate_fn=collate_fn)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = MultiStreamSLT().to(device)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.eval()
+
+    rows = []
+    with torch.no_grad():
+        for batch in dl:
+            logits = model(batch['face'].to(device),
+                           batch['hand_l'].to(device),
+                           batch['hand_r'].to(device),
+                           batch['pose'].to(device),
+                           batch['pad_mask'].to(device))
+            preds = logits.argmax(dim=-1).tolist()
+            for vid, gold, pred in zip(batch['video_ids'], batch['texts'], preds):
+                rows.append([vid, gold, str(pred)])
+
+    with open(args.out_csv,'w',newline='',encoding='utf-8') as f:
+        w = csv.writer(f); w.writerow(['video_id','gold_text','pred_stub']); w.writerows(rows)
+
+if __name__=='__main__':
+    main()
+
+
+⸻
+
+tools/export_onnx_encoder_v9.py (stub ONNX)
+
+Exporta el forward completo del stub (cuando cambiemos a mBART, exportamos sólo el encoder).
+
+# tools/export_onnx_encoder_v9.py
+import argparse, torch
+from __main__ import MultiStreamSLT
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--out', required=True)
+    args = ap.parse_args()
+
+    model = MultiStreamSLT().cpu()
+    model.load_state_dict(torch.load(args.checkpoint, map_location='cpu'))
+    model.eval()
+
+    dummy_face = torch.randn(1,64,3,224,224)
+    dummy_hand = torch.randn(1,64,3,224,224)
+    dummy_pose = torch.randn(1,64,39)   # 13*3
+    dummy_mask = torch.ones(1,64,dtype=torch.bool)
+
+    torch.onnx.export(model,
+        (dummy_face, dummy_hand, dummy_hand, dummy_pose, dummy_mask, None, None),
+        args.out,
+        input_names=['face','hand_l','hand_r','pose','pad_mask','miss_mask_hl','miss_mask_hr'],
+        output_names=['logits'],
+        dynamic_axes={'face':{1:'T'}, 'hand_l':{1:'T'}, 'hand_r':{1:'T'}, 'pose':{1:'T'}, 'pad_mask':{1:'T'}},
+        opset_version=17)
+
+if __name__=='__main__':
+    main()
+
+
+⸻
+
+tools/demo_realtime_multistream.py (esqueleto)
+
+Para una demo en vivo con webcam (ROI con MediaPipe + forward del modelo). Dejo el esqueleto para que lo completes cuando pasemos a mBART.
+
+# tools/demo_realtime_multistream.py
+import cv2, torch, numpy as np
+from __main__ import MultiStreamSLT
+
+# TODO: conectar MediaPipe en vivo como en extract_rois_v2 y armar un buffer deslizante T=64..96
+#       luego llamar model(face, hand_l, hand_r, pose, pad_mask) y decodificar (cuando usemos mBART)
+
+def main():
+    cap = cv2.VideoCapture(0)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = MultiStreamSLT().to(device).eval()
+    print("Demo lista. Falta integrar MediaPipe en vivo y decodificador para texto.")
+    while True:
+        ok, frame = cap.read()
+        if not ok: break
+        cv2.imshow("SeñAR realtime (WIP)", frame)
+        if cv2.waitKey(1) & 0xFF == 27: break
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__=='__main__':
+    main()
+
+
+⸻
+
+Cómo correr (rápido)
+	1.	Extraer ROIs
+
+python tools/extract_rois_v2.py
+
+	2.	Pre-entrenos (stubs)
+
+python tools/pretrain_dino_face.py
+python tools/pretrain_dino_hands.py
+
+	3.	Entrenar SLT (stub)
+
+python tools/train_slt_multistream_v9.py ^
+  --face_dir "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\face" ^
+  --hand_l_dir "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\hand_l" ^
+  --hand_r_dir "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\hand_r" ^
+  --pose_dir  "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\rois\pose" ^
+  --csv       "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\lsa_t\subs.csv" ^
+  --splits_dir "G:\Apps\SENAR\v5 - MSKA\MSKA-main\data\lsa_t\index" ^
+  --work_dir  "G:\Apps\SENAR\v5 - MSKA\MSKA-main\work_dirs\slt_lsa_multistream" ^
+  --epochs 2 --batch_size 2 --T 64
+
+	4.	Evaluar (stub)
+
+python tools/eval_slt_multistream_v9.py ^
+  --checkpoint "G:\Apps\SENAR\v5 - MSKA\MSKA-main\work_dirs\slt_lsa_multistream\best.pth" ^
+  --face_dir "...\rois\face" --hand_l_dir "...\rois\hand_l" --hand_r_dir "...\rois\hand_r" --pose_dir "...\rois\pose" ^
+  --csv "...\lsa_t\subs.csv" --splits_dir "...\lsa_t\index" ^
+  --out_csv "G:\Apps\SENAR\v5 - MSKA\MSKA-main\work_dirs\slt_lsa_multistream\eval_stub.csv"
+
+
+
+
+
+
 # SeñAR / MSKA — Implementación Multi‑stream (cara+manos+pose) inspirada en SignMusketeers
 # v9 — Dataset, modelos, entrenamiento, evaluación y exportación
 # Estructura por módulos en un solo archivo para facilitar copia/ajuste inmediato.
