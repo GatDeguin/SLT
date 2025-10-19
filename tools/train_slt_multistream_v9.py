@@ -28,7 +28,7 @@ from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
 from slt.utils.text import create_tokenizer, encode_batch
 
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoConfig, PreTrainedTokenizerBase
 
 try:  # pragma: no cover - TensorBoard is an optional dependency.
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
@@ -54,6 +54,8 @@ class ModelConfig:
     decoder_layers: int = 2
     decoder_heads: int = 8
     decoder_dropout: float = 0.1
+    decoder_model: Optional[str] = None
+    decoder_config: Optional[str] = None
     face_backbone: Optional[str] = None
     hand_left_backbone: Optional[str] = None
     hand_right_backbone: Optional[str] = None
@@ -95,7 +97,7 @@ class DataConfig:
     precision: str = "amp"
     tensorboard: Optional[Path] = None
     pin_memory: bool = True
-    tokenizer: str = ""
+    tokenizer: Optional[str] = None
     max_target_length: int = 64
 
 
@@ -141,6 +143,19 @@ class MultiStreamClassifier(nn.Module):
         vocab_size = getattr(tokenizer, "vocab_size", None)
         if not vocab_size:
             vocab_size = len(tokenizer)
+
+        decoder_config = None
+        if config.decoder_config:
+            decoder_config = AutoConfig.from_pretrained(config.decoder_config)
+            hidden_size = getattr(decoder_config, "d_model", None)
+            if hidden_size is not None and hidden_size != config.d_model:
+                raise ValueError(
+                    "Decoder configuration hidden size does not match encoder dimensionality: "
+                    f"expected {config.d_model}, got {hidden_size}."
+                )
+
+        decoder_model_name = None if decoder_config is not None else config.decoder_model
+
         self.decoder = TextSeq2SeqDecoder(
             d_model=config.d_model,
             vocab_size=int(vocab_size),
@@ -149,6 +164,8 @@ class MultiStreamClassifier(nn.Module):
             dropout=config.decoder_dropout,
             pad_token_id=pad_id,
             eos_token_id=eos_id,
+            pretrained_model_name_or_path=decoder_model_name,
+            config=decoder_config,
         )
 
     def forward(
@@ -324,14 +341,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer",
         type=str,
-        required=True,
-        help="HuggingFace tokenizer identifier or local path",
+        default=None,
+        help="HuggingFace tokenizer identifier or local path. When omitted the decoder checkpoint is used.",
     )
     parser.add_argument(
         "--max-target-length",
         type=int,
         default=128,
         help="Maximum length of the tokenised target sequences",
+    )
+    parser.add_argument(
+        "--decoder-model",
+        type=str,
+        default=None,
+        help="Optional pretrained decoder model name or path passed to TextSeq2SeqDecoder.",
+    )
+    parser.add_argument(
+        "--decoder-config",
+        type=str,
+        default=None,
+        help="Optional decoder configuration name or path used to initialise TextSeq2SeqDecoder.",
     )
 
     # Optimiser arguments
@@ -355,7 +384,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--label-smoothing", type=float, default=0.1, help="Label smoothing applied to the loss")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.decoder_config and args.decoder_model:
+        parser.error("--decoder-model and --decoder-config are mutually exclusive")
+    if not args.tokenizer and not args.decoder_model:
+        parser.error("Provide --tokenizer when --decoder-model is not specified")
+    return args
 
 
 def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, OptimConfig]:
@@ -395,6 +429,8 @@ def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, Op
         decoder_layers=args.decoder_layers,
         decoder_heads=args.decoder_heads,
         decoder_dropout=args.decoder_dropout,
+        decoder_model=args.decoder_model,
+        decoder_config=args.decoder_config,
         face_backbone=args.face_backbone,
         hand_left_backbone=args.hand_left_backbone,
         hand_right_backbone=args.hand_right_backbone,
@@ -546,7 +582,10 @@ def main() -> None:
         logging.warning("CUDA requested but not available. Falling back to CPU.")
         device = torch.device("cpu")
 
-    tokenizer = create_tokenizer(data_config.tokenizer)
+    tokenizer_source = data_config.tokenizer or model_config.decoder_model
+    if tokenizer_source is None:
+        raise ValueError("Tokenizer source could not be resolved.")
+    tokenizer = create_tokenizer(tokenizer_source)
 
     train_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),
