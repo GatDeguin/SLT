@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, MutableMapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -20,6 +21,15 @@ except Exception:  # pragma: no cover - GradScaler/autocast optional
 Batch = Union[Dict[str, Any], Sequence[Any]]
 Inputs = Union[torch.Tensor, Sequence[Any], MutableMapping[str, Any]]
 LossFn = Callable[[torch.Tensor, Any], torch.Tensor]
+MetricFn = Callable[[Any, Any], Union[float, torch.Tensor]]
+
+
+@dataclass
+class LoopResult:
+    """Container with the aggregated loss and metrics for a loop."""
+
+    loss: float
+    metrics: Dict[str, float]
 
 
 def _move_to_device(data: Any, device: Union[str, torch.device]) -> Any:
@@ -58,11 +68,15 @@ def _split_batch(batch: Batch) -> Tuple[Inputs, Any]:
 
 
 def _call_model(model: nn.Module, inputs: Inputs) -> torch.Tensor:
+    return _execute_forward(model, inputs)
+
+
+def _execute_forward(callable_obj: Callable[..., torch.Tensor], inputs: Inputs) -> torch.Tensor:
     if isinstance(inputs, MutableMapping):
-        return model(**inputs)
+        return callable_obj(**inputs)
     if isinstance(inputs, (list, tuple)):
-        return model(*inputs)
-    return model(inputs)
+        return callable_obj(*inputs)
+    return callable_obj(inputs)
 
 
 def _count_items(targets: Any) -> int:
@@ -80,6 +94,26 @@ def _count_items(targets: Any) -> int:
     if hasattr(targets, "__len__"):
         return len(targets)  # type: ignore[arg-type]
     return 1
+
+
+def _update_metric_sums(
+    metric_sums: Dict[str, float],
+    outputs: Any,
+    targets: Any,
+    metric_fns: Optional[Dict[str, MetricFn]],
+    batch_items: int,
+) -> None:
+    if not metric_fns:
+        return
+    for name, fn in metric_fns.items():
+        value = fn(outputs, targets)
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(
+                    f"Metric '{name}' must return a scalar value, got shape {tuple(value.shape)}."
+                )
+            value = float(value.item())
+        metric_sums[name] = metric_sums.get(name, 0.0) + float(value) * batch_items
 
 
 def clip_gradients(
@@ -125,27 +159,80 @@ def train_epoch(
     autocast_dtype: Optional[torch.dtype] = torch.float16,
     grad_clip_norm: Optional[float] = None,
     grad_clip_norm_type: Union[float, int] = 2.0,
-) -> float:
-    """Run a single training epoch and return the average loss."""
+    grad_accum_steps: int = 1,
+    metrics: Optional[Dict[str, MetricFn]] = None,
+    forward_fn: Optional[Callable[..., torch.Tensor]] = None,
+) -> LoopResult:
+    """Run a single training epoch and return aggregated metrics."""
 
     model.train()
     total_loss = 0.0
     total_items = 0
+    metric_sums: Dict[str, float] = {}
+
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be a positive integer")
 
     use_amp = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
 
-    for batch in loader:
+    optimizer.zero_grad(set_to_none=True)
+    step_index = 0
+
+    for step_index, batch in enumerate(loader, start=1):
         inputs, targets = _split_batch(batch)
         inputs = _move_to_device(inputs, device)
         targets = _move_to_device(targets, device)
 
-        optimizer.zero_grad(set_to_none=True)
+        batch_items = _count_items(targets)
 
         if use_amp and autocast_dtype is not None:
             with autocast(dtype=autocast_dtype):
-                outputs = _call_model(model, inputs)
-                loss = loss_fn(outputs, targets)
+                outputs = (
+                    _call_model(model, inputs)
+                    if forward_fn is None
+                    else _execute_forward(forward_fn, inputs)
+                )
+                raw_loss = loss_fn(outputs, targets)
+            loss = raw_loss / grad_accum_steps
             scaler.scale(loss).backward()  # type: ignore[arg-type]
+            if step_index % grad_accum_steps == 0:
+                clip_gradients(
+                    optimizer,
+                    grad_clip_norm,
+                    scaler=scaler,
+                    parameters=model.parameters(),
+                    norm_type=grad_clip_norm_type,
+                )
+                scaler.step(optimizer)  # type: ignore[arg-type]
+                scaler.update()  # type: ignore[arg-type]
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            outputs = (
+                _call_model(model, inputs)
+                if forward_fn is None
+                else _execute_forward(forward_fn, inputs)
+            )
+            raw_loss = loss_fn(outputs, targets)
+            loss = raw_loss / grad_accum_steps
+            loss.backward()
+            if step_index % grad_accum_steps == 0:
+                clip_gradients(
+                    optimizer,
+                    grad_clip_norm,
+                    scaler=None,
+                    parameters=model.parameters(),
+                    norm_type=grad_clip_norm_type,
+                )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        total_loss += raw_loss.detach().item() * batch_items
+        total_items += batch_items
+        _update_metric_sums(metric_sums, outputs, targets, metrics, batch_items)
+
+    remainder = step_index % grad_accum_steps if step_index else 0
+    if remainder != 0:
+        if use_amp:
             clip_gradients(
                 optimizer,
                 grad_clip_norm,
@@ -156,9 +243,6 @@ def train_epoch(
             scaler.step(optimizer)  # type: ignore[arg-type]
             scaler.update()  # type: ignore[arg-type]
         else:
-            outputs = _call_model(model, inputs)
-            loss = loss_fn(outputs, targets)
-            loss.backward()
             clip_gradients(
                 optimizer,
                 grad_clip_norm,
@@ -167,15 +251,14 @@ def train_epoch(
                 norm_type=grad_clip_norm_type,
             )
             optimizer.step()
-
-        batch_items = _count_items(targets)
-        total_loss += loss.detach().item() * batch_items
-        total_items += batch_items
+        optimizer.zero_grad(set_to_none=True)
 
     if total_items == 0:
         raise RuntimeError("Empty training loader provided.")
 
-    return total_loss / total_items
+    averaged_metrics = {name: value / total_items for name, value in metric_sums.items()}
+
+    return LoopResult(total_loss / total_items, averaged_metrics)
 
 
 def eval_epoch(
@@ -184,12 +267,15 @@ def eval_epoch(
     loss_fn: LossFn,
     *,
     device: Union[str, torch.device] = "cuda",
-) -> float:
-    """Evaluate the model for a single epoch and return the average loss."""
+    metrics: Optional[Dict[str, MetricFn]] = None,
+    forward_fn: Optional[Callable[..., torch.Tensor]] = None,
+) -> LoopResult:
+    """Evaluate the model for a single epoch and return aggregated metrics."""
 
     model.eval()
     total_loss = 0.0
     total_items = 0
+    metric_sums: Dict[str, float] = {}
 
     with torch.no_grad():
         for batch in loader:
@@ -197,14 +283,21 @@ def eval_epoch(
             inputs = _move_to_device(inputs, device)
             targets = _move_to_device(targets, device)
 
-            outputs = _call_model(model, inputs)
+            outputs = (
+                _call_model(model, inputs)
+                if forward_fn is None
+                else _execute_forward(forward_fn, inputs)
+            )
             loss = loss_fn(outputs, targets)
 
             batch_items = _count_items(targets)
             total_loss += loss.detach().item() * batch_items
             total_items += batch_items
+            _update_metric_sums(metric_sums, outputs, targets, metrics, batch_items)
 
     if total_items == 0:
         raise RuntimeError("Empty evaluation loader provided.")
 
-    return total_loss / total_items
+    averaged_metrics = {name: value / total_items for name, value in metric_sums.items()}
+
+    return LoopResult(total_loss / total_items, averaged_metrics)

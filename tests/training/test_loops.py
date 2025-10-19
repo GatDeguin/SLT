@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from slt.training.loops import clip_gradients, eval_epoch, train_epoch
+from slt.training.loops import LoopResult, clip_gradients, eval_epoch, train_epoch
 from slt.training.optim import create_optimizer
 
 
@@ -54,10 +54,10 @@ def _run_training(device: torch.device):
 
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    initial_loss = eval_epoch(model, loader, loss_fn, device=device)
+    initial_loss = eval_epoch(model, loader, loss_fn, device=device).loss
     for _ in range(10):
         train_epoch(model, loader, optimizer, loss_fn, device=device, scaler=scaler)
-    final_loss = eval_epoch(model, loader, loss_fn, device=device)
+    final_loss = eval_epoch(model, loader, loss_fn, device=device).loss
 
     return initial_loss, final_loss
 
@@ -117,6 +117,59 @@ def test_clip_gradients_helper():
     assert norm is not None
 
 
+def test_gradient_accumulation_matches_large_batch():
+    device = torch.device("cpu")
+    torch.manual_seed(0)
+    dataset = LinearDataset(n_samples=64)
+    loader_large = DataLoader(dataset, batch_size=8, shuffle=False)
+    loader_micro = DataLoader(dataset, batch_size=4, shuffle=False)
+
+    model_large = SimpleRegressor(dataset.x.size(1)).to(device)
+    model_accum = SimpleRegressor(dataset.x.size(1)).to(device)
+    model_accum.load_state_dict(model_large.state_dict())
+
+    optimizer_large = create_optimizer(model_large.parameters(), {"lr": 0.05, "type": "adamw"})
+    optimizer_accum = create_optimizer(model_accum.parameters(), {"lr": 0.05, "type": "adamw"})
+    loss_fn = nn.MSELoss()
+
+    train_epoch(model_large, loader_large, optimizer_large, loss_fn, device=device)
+    train_epoch(
+        model_accum,
+        loader_micro,
+        optimizer_accum,
+        loss_fn,
+        device=device,
+        grad_accum_steps=2,
+    )
+
+    for param_large, param_accum in zip(model_large.parameters(), model_accum.parameters()):
+        assert torch.allclose(param_large, param_accum, atol=1e-6)
+
+
+def test_metric_aggregation():
+    device = torch.device("cpu")
+    dataset = LinearDataset(n_samples=32)
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    model = SimpleRegressor(dataset.x.size(1)).to(device)
+    optimizer = create_optimizer(model.parameters(), {"lr": 0.1, "type": "adamw"})
+    loss_fn = nn.MSELoss()
+
+    def mean_target(_, targets):
+        return targets.mean()
+
+    result = train_epoch(
+        model,
+        loader,
+        optimizer,
+        loss_fn,
+        device=device,
+        metrics={"mean_target": mean_target},
+    )
+
+    assert isinstance(result, LoopResult)
+    assert "mean_target" in result.metrics
+    assert math.isfinite(result.metrics["mean_target"])
+
 def test_resume_from_checkpoint(tmp_path):
     device = torch.device("cpu")
     torch.manual_seed(0)
@@ -137,7 +190,7 @@ def test_resume_from_checkpoint(tmp_path):
         train_epoch(model, make_loader(), optimizer, loss_fn, device=device, scaler=scaler)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
-    val_loss = eval_epoch(model, make_loader(), loss_fn, device=device)
+    val_loss = eval_epoch(model, make_loader(), loss_fn, device=device).loss
     torch.save(
         {
             "epoch": pre_epochs,
@@ -152,7 +205,7 @@ def test_resume_from_checkpoint(tmp_path):
 
     for _ in range(post_epochs):
         train_epoch(model, make_loader(), optimizer, loss_fn, device=device, scaler=scaler)
-    final_loss_expected = eval_epoch(model, make_loader(), loss_fn, device=device)
+    final_loss_expected = eval_epoch(model, make_loader(), loss_fn, device=device).loss
 
     model_resume = SimpleRegressor(dataset.x.size(1)).to(device)
     optimizer_resume = create_optimizer(model_resume.parameters(), {"lr": 0.05, "type": "adamw"})
@@ -164,7 +217,14 @@ def test_resume_from_checkpoint(tmp_path):
     assert checkpoint["epoch"] == pre_epochs
 
     for _ in range(post_epochs):
-        train_epoch(model_resume, make_loader(), optimizer_resume, loss_fn, device=device, scaler=scaler_resume)
+        train_epoch(
+            model_resume,
+            make_loader(),
+            optimizer_resume,
+            loss_fn,
+            device=device,
+            scaler=scaler_resume,
+        )
 
-    final_loss_resumed = eval_epoch(model_resume, make_loader(), loss_fn, device=device)
+    final_loss_resumed = eval_epoch(model_resume, make_loader(), loss_fn, device=device).loss
     assert final_loss_resumed == pytest.approx(final_loss_expected, rel=1e-6, abs=1e-6)
