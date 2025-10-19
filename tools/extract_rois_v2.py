@@ -1,11 +1,14 @@
 """Extracción de regiones de interés (cara y manos) con MediaPipe.
 
 Este script procesa videos y guarda crops cuadrados de cara y manos junto
-con la pose superior. Sirve como versión funcional del pseudocódigo incluido
-como referencia en la documentación del proyecto.
+con la pose superior. Incluye utilidades de línea de comandos para reanudar
+procesamientos, limitar FPS de muestreo y generar un registro de metadata
+por video, facilitando auditorías posteriores.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import warnings
 from pathlib import Path
@@ -139,11 +142,30 @@ def process_video(
     pose_dir: str,
     fps_target: int = 25,
     face_blur: bool = False,
-) -> bool:
-    """Procesa un único video y guarda los ROIs correspondientes."""
+    fps_limit: Optional[float] = None,
+) -> Dict[str, object]:
+    """Procesa un único video y guarda los ROIs correspondientes.
+
+    Devuelve un diccionario de metadata con métricas de procesamiento.
+    """
+
+    metadata = {
+        "video": Path(video_path).name,
+        "video_path": video_path,
+        "success": False,
+        "error": None,
+        "fps_source": None,
+        "fps_target": fps_target,
+        "fps_limit": fps_limit,
+        "frames_written": 0,
+        "pose_frames": 0,
+        "stride": None,
+        "face_blur": face_blur,
+    }
 
     if not _ensure_mediapipe_available():  # pragma: no cover - dependencias opcionales
-        return False
+        metadata["error"] = "mediapipe-no-disponible"
+        return metadata
 
     mp_face = mp.solutions.face_mesh
     mp_hands = mp.solutions.hands
@@ -151,103 +173,150 @@ def process_video(
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        warnings.warn(f"No se pudo abrir el video: {video_path}")
-        return False
+        msg = f"No se pudo abrir el video: {video_path}"
+        warnings.warn(msg)
+        metadata["error"] = "video-no-abre"
+        return metadata
 
-    basename = Path(video_path).stem
-    face_out = ensure_dir(out_dirs.get("face", os.path.join(pose_dir, "face")))
-    hand_l_out = ensure_dir(out_dirs.get("hand_l", os.path.join(pose_dir, "hand_l")))
-    hand_r_out = ensure_dir(out_dirs.get("hand_r", os.path.join(pose_dir, "hand_r")))
-    pose_out = ensure_dir(pose_dir)
+    try:
+        basename = Path(video_path).stem
+        face_out = ensure_dir(out_dirs.get("face", os.path.join(pose_dir, "face")))
+        hand_l_out = ensure_dir(out_dirs.get("hand_l", os.path.join(pose_dir, "hand_l")))
+        hand_r_out = ensure_dir(out_dirs.get("hand_r", os.path.join(pose_dir, "hand_r")))
+        pose_out = ensure_dir(pose_dir)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or fps_target
-    stride = max(1, int(round(fps / fps_target)))
+        fps = cap.get(cv2.CAP_PROP_FPS) or fps_target
+        metadata["fps_source"] = fps
+        if fps_limit and fps > fps_limit:
+            fps = fps_limit
+        stride = max(1, int(round(fps / fps_target)))
+        metadata["stride"] = stride
 
-    pose_frames: List[np.ndarray] = []
+        pose_frames: List[np.ndarray] = []
 
-    with (
-        mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh,
-        mp_hands.Hands(static_image_mode=False, max_num_hands=2) as hands,
-        mp_pose.Pose(static_image_mode=False, model_complexity=1) as pose,
-    ):
-        frame_index = 0
-        out_index = 0
+        with (
+            mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh,
+            mp_hands.Hands(static_image_mode=False, max_num_hands=2) as hands,
+            mp_pose.Pose(static_image_mode=False, model_complexity=1) as pose,
+        ):
+            frame_index = 0
+            out_index = 0
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
 
-            if frame_index % stride != 0:
-                frame_index += 1
-                continue
+                if frame_index % stride != 0:
+                    frame_index += 1
+                    continue
 
-            height, width = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                height, width = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            face_result = face_mesh.process(rgb)
-            hands_result = hands.process(rgb)
-            pose_result = pose.process(rgb)
+                face_result = face_mesh.process(rgb)
+                hands_result = hands.process(rgb)
+                pose_result = pose.process(rgb)
 
-            # Cara
-            face_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
-            if face_result.multi_face_landmarks:
-                face_landmarks = face_result.multi_face_landmarks[0]
-                xs = [int(landmark.x * width) for landmark in face_landmarks.landmark]
-                ys = [int(landmark.y * height) for landmark in face_landmarks.landmark]
-                x1 = max(0, min(xs))
-                y1 = max(0, min(ys))
-                x2 = min(width, max(xs))
-                y2 = min(height, max(ys))
-                x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
-
-                source_frame = blur_face_preserve_eyes_mouth(frame, face_landmarks) if face_blur else frame
-                patch = source_frame[y : y + h, x : x + w]
-                face_crop = crop_square(patch, 0, 0, patch.shape[1], patch.shape[0], 224)
-
-            cv2.imwrite(str(face_out / f"{basename}_f{out_index:06d}.jpg"), face_crop)
-
-            # Manos
-            left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
-            right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
-            if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
-                for landmarks, handedness in zip(
-                    hands_result.multi_hand_landmarks, hands_result.multi_handedness
-                ):
-                    xs = [int(l.x * width) for l in landmarks.landmark]
-                    ys = [int(l.y * height) for l in landmarks.landmark]
+                # Cara
+                face_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                if face_result.multi_face_landmarks:
+                    face_landmarks = face_result.multi_face_landmarks[0]
+                    xs = [int(landmark.x * width) for landmark in face_landmarks.landmark]
+                    ys = [int(landmark.y * height) for landmark in face_landmarks.landmark]
                     x1 = max(0, min(xs))
                     y1 = max(0, min(ys))
                     x2 = min(width, max(xs))
                     y2 = min(height, max(ys))
                     x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
-                    crop = crop_square(frame, x, y, w, h, 224)
-                    label = handedness.classification[0].label.lower()
-                    if label.startswith("left"):
-                        left_crop = crop
-                    else:
-                        right_crop = crop
 
-            cv2.imwrite(str(hand_l_out / f"{basename}_f{out_index:06d}.jpg"), left_crop)
-            cv2.imwrite(str(hand_r_out / f"{basename}_f{out_index:06d}.jpg"), right_crop)
+                    source_frame = blur_face_preserve_eyes_mouth(frame, face_landmarks) if face_blur else frame
+                    patch = source_frame[y : y + h, x : x + w]
+                    face_crop = crop_square(patch, 0, 0, patch.shape[1], patch.shape[0], 224)
 
-            # Pose
-            pose_vec = np.zeros((17, 3), dtype=np.float32)
-            if pose_result.pose_landmarks:
-                for idx, landmark in enumerate(pose_result.pose_landmarks.landmark[:17]):
-                    pose_vec[idx, 0] = landmark.x
-                    pose_vec[idx, 1] = landmark.y
-                    pose_vec[idx, 2] = landmark.visibility
-            pose_frames.append(pose_vec.reshape(-1))
+                cv2.imwrite(str(face_out / f"{basename}_f{out_index:06d}.jpg"), face_crop)
 
-            out_index += 1
-            frame_index += 1
+                # Manos
+                left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
+                    for landmarks, handedness in zip(
+                        hands_result.multi_hand_landmarks, hands_result.multi_handedness
+                    ):
+                        xs = [int(l.x * width) for l in landmarks.landmark]
+                        ys = [int(l.y * height) for l in landmarks.landmark]
+                        x1 = max(0, min(xs))
+                        y1 = max(0, min(ys))
+                        x2 = min(width, max(xs))
+                        y2 = min(height, max(ys))
+                        x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
+                        crop = crop_square(frame, x, y, w, h, 224)
+                        label = handedness.classification[0].label.lower()
+                        if label.startswith("left"):
+                            left_crop = crop
+                        else:
+                            right_crop = crop
 
-    cap.release()
+                cv2.imwrite(str(hand_l_out / f"{basename}_f{out_index:06d}.jpg"), left_crop)
+                cv2.imwrite(str(hand_r_out / f"{basename}_f{out_index:06d}.jpg"), right_crop)
 
-    pose_array = np.asarray(pose_frames, dtype=np.float32)
-    np.savez_compressed(pose_out / f"{basename}.npz", pose=pose_array)
-    return True
+                # Pose
+                pose_vec = np.zeros((17, 3), dtype=np.float32)
+                if pose_result.pose_landmarks:
+                    for idx, landmark in enumerate(pose_result.pose_landmarks.landmark[:17]):
+                        pose_vec[idx, 0] = landmark.x
+                        pose_vec[idx, 1] = landmark.y
+                        pose_vec[idx, 2] = landmark.visibility
+                pose_frames.append(pose_vec.reshape(-1))
+
+                out_index += 1
+                frame_index += 1
+
+        metadata["frames_written"] = out_index
+        metadata["pose_frames"] = len(pose_frames)
+
+        cap.release()
+
+        pose_array = np.asarray(pose_frames, dtype=np.float32)
+        np.savez_compressed(pose_out / f"{basename}.npz", pose=pose_array)
+        metadata["success"] = True
+        return metadata
+
+    except Exception as exc:  # pragma: no cover - flujo inesperado
+        metadata["error"] = str(exc)
+        return metadata
+    finally:
+        cap.release()
+
+
+def _metadata_path(out_root: str, metadata_path: Optional[str]) -> Path:
+    if metadata_path:
+        return ensure_dir(Path(metadata_path).parent) / Path(metadata_path).name
+    return ensure_dir(out_root) / "metadata.jsonl"
+
+
+def _read_metadata_index(path: Path) -> Dict[str, Dict[str, object]]:
+    index: Dict[str, Dict[str, object]] = {}
+    if not path.exists():
+        return index
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            video_name = entry.get("video")
+            if isinstance(video_name, str):
+                index[video_name] = entry
+    return index
+
+
+def _append_metadata(path: Path, entry: Dict[str, object]) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def run_bulk(
@@ -255,6 +324,9 @@ def run_bulk(
     out_root: str,
     fps_target: int = 25,
     face_blur: bool = False,
+    resume: bool = False,
+    metadata_path: Optional[str] = None,
+    fps_limit: Optional[float] = None,
 ) -> None:
     """Procesa todos los videos *.mp4 en ``videos_dir``."""
 
@@ -273,14 +345,47 @@ def run_bulk(
     }
     pose_dir = str(ensure_dir(Path(out_root) / "pose"))
 
+    meta_file = _metadata_path(out_root, metadata_path)
+    index = _read_metadata_index(meta_file)
+
+    processed = []
+    errors = []
+
     for video_path in sorted(videos_path.glob("*.mp4")):
-        print(f"Procesando {video_path.name}")
-        process_video(str(video_path), out_dirs, pose_dir, fps_target=fps_target, face_blur=face_blur)
+        video_name = video_path.name
+        if resume and video_name in index and index[video_name].get("success"):
+            print(f"Omitiendo {video_name} (ya procesado)")
+            continue
+
+        print(f"Procesando {video_name}")
+        entry = process_video(
+            str(video_path),
+            out_dirs,
+            pose_dir,
+            fps_target=fps_target,
+            face_blur=face_blur,
+            fps_limit=fps_limit,
+        )
+        entry["video"] = video_name
+        entry["video_path"] = str(video_path)
+        _append_metadata(meta_file, entry)
+        if entry.get("success"):
+            processed.append(entry)
+        else:
+            errors.append(entry)
+
+    if errors:
+        print("\nErrores detectados:")
+        for item in errors:
+            print(f"- {item['video']}: {item.get('error')}")
+
+    print(
+        f"\nProcesamiento finalizado. OK: {len(processed)}, "
+        f"Errores: {len(errors)}. Metadata: {meta_file}"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - ejecución manual
-    import argparse
-
     parser = argparse.ArgumentParser(description="Extracción de ROIs (cara/manos/pose)")
     parser.add_argument("videos_dir", help="Directorio con videos .mp4")
     parser.add_argument("out_root", help="Directorio destino para los recortes")
@@ -290,6 +395,28 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
         action="store_true",
         help="Aplica desenfoque de cara conservando ojos y boca",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Omite videos que ya tengan metadata de éxito registrada",
+    )
+    parser.add_argument(
+        "--metadata",
+        help="Ruta del archivo JSONL para registrar metadata (por defecto en out_root)",
+    )
+    parser.add_argument(
+        "--fps-limit",
+        type=float,
+        help="FPS máximo leído desde el video original antes de aplicar el muestreo",
+    )
 
     args = parser.parse_args()
-    run_bulk(args.videos_dir, args.out_root, fps_target=args.fps, face_blur=args.face_blur)
+    run_bulk(
+        args.videos_dir,
+        args.out_root,
+        fps_target=args.fps,
+        face_blur=args.face_blur,
+        resume=args.resume,
+        metadata_path=args.metadata,
+        fps_limit=args.fps_limit,
+    )

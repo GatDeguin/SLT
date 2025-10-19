@@ -5,6 +5,7 @@ import importlib
 import math
 import os
 import random
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional
@@ -44,6 +45,7 @@ class SampleItem:
     length: torch.Tensor
     miss_mask_hl: torch.Tensor
     miss_mask_hr: torch.Tensor
+    quality: Dict[str, Any]
     text: str
     video_id: str
 
@@ -76,6 +78,10 @@ class LsaTMultiStream(Dataset):
         lkp_count: int = 13,
         min_conf: float = 0.25,
         flip_prob: float = 0.2,
+        enable_flip: bool = True,
+        quality_checks: bool = True,
+        quality_strict: bool = False,
+        fps_tolerance: float = 1.0,
     ) -> None:
         pd = _get_pandas()
         np = _get_numpy()
@@ -89,6 +95,10 @@ class LsaTMultiStream(Dataset):
         self.lkp_count = lkp_count
         self.min_conf = min_conf
         self.flip_prob = flip_prob
+        self.enable_flip = enable_flip
+        self.quality_checks = quality_checks
+        self.quality_strict = quality_strict
+        self.fps_tolerance = fps_tolerance
         self._np = np
 
         df = pd.read_csv(csv_path, sep=";")
@@ -104,6 +114,31 @@ class LsaTMultiStream(Dataset):
         self.df = df.merge(idx[["video_id"]], on="video_id", how="inner")
         self.ids = self.df["video_id"].tolist()
         self.texts = dict(zip(df["video_id"], df["texto"]))
+
+        def _coerce(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                return float(str(value).strip())
+            except (TypeError, ValueError):
+                return None
+
+        self.meta = {}
+        for vid in self.ids:
+            vid_meta: Dict[str, Any] = {}
+            rows = self.df.loc[self.df["video_id"] == vid]
+            if rows.empty:
+                continue
+            row = rows.iloc[0]
+            if "fps" in row:
+                vid_meta["fps"] = _coerce(row["fps"])
+            if "duration" in row:
+                vid_meta["duration"] = _coerce(row["duration"])
+            if "frame_count" in row:
+                vid_meta["frame_count"] = _coerce(row["frame_count"])
+            self.meta[vid] = vid_meta
 
     def __len__(self) -> int:  # pragma: no cover - simple
         return len(self.ids)
@@ -161,12 +196,19 @@ class LsaTMultiStream(Dataset):
         hl_frames = self._list_frames(self.hand_l_dir, vid)
         hr_frames = self._list_frames(self.hand_r_dir, vid)
 
-        T0 = max(len(face_frames), len(hl_frames), len(hr_frames))
-        T_valid = min(max(T0, 0), self.T)
-        idxs = self._sample_indices(T0)
+        stream_lengths = {
+            "face": len(face_frames),
+            "hand_l": len(hl_frames),
+            "hand_r": len(hr_frames),
+        }
 
         pose_path = os.path.join(self.pose_dir, f"{vid}.npz")
         pose = self._load_pose(pose_path)
+        pose_length = pose.shape[0] if hasattr(pose, "shape") else 0
+        stream_lengths["pose"] = pose_length
+
+        T0 = max(stream_lengths.values()) if stream_lengths else 0
+        idxs = self._sample_indices(T0)
 
         def safe_get(frames: List[str], j: int) -> Optional[str]:
             if not frames:
@@ -207,11 +249,12 @@ class LsaTMultiStream(Dataset):
         hand_r = torch.stack(hr_list, dim=0)
 
         pose_t, pose_mask = self._sample_pose(pose)
+        effective_length = self._effective_length(stream_lengths)
 
         pad_mask = torch.zeros(self.T, dtype=torch.bool)
-        if T_valid > 0:
-            pad_mask[:T_valid] = True
-        length = torch.tensor(T_valid, dtype=torch.long)
+        if effective_length > 0:
+            pad_mask[:effective_length] = True
+        length = torch.tensor(effective_length, dtype=torch.long)
         miss_mask_hl = torch.tensor(miss_hl, dtype=torch.bool)
         miss_mask_hr = torch.tensor(miss_hr, dtype=torch.bool)
 
@@ -222,7 +265,7 @@ class LsaTMultiStream(Dataset):
         hand_l = (hand_l - mean) / std
         hand_r = (hand_r - mean) / std
 
-        if random.random() < self.flip_prob:
+        if self.enable_flip and self.flip_prob > 0 and random.random() < self.flip_prob:
             face = torch.flip(face, dims=[3])
             new_hand_l = torch.flip(hand_r, dims=[3])
             new_hand_r = torch.flip(hand_l, dims=[3])
@@ -230,6 +273,15 @@ class LsaTMultiStream(Dataset):
             miss_mask_hl, miss_mask_hr = miss_mask_hr, miss_mask_hl
             pose_t = self._flip_pose_tensor(pose_t)
             pose_mask = self._flip_pose_mask(pose_mask)
+
+        quality = self._build_quality_report(
+            vid,
+            face_frames=face_frames,
+            hand_l_frames=hl_frames,
+            hand_r_frames=hr_frames,
+            pose_frames=pose,
+            effective_length=effective_length,
+        )
 
         return SampleItem(
             face=face,
@@ -241,6 +293,7 @@ class LsaTMultiStream(Dataset):
             length=length,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            quality=quality,
             text=text,
             video_id=vid,
         )
@@ -327,6 +380,145 @@ class LsaTMultiStream(Dataset):
             (15, 16),
         ]
 
+    def _effective_length(self, lengths: Dict[str, int]) -> int:
+        positives = [v for v in lengths.values() if v > 0]
+        if not positives:
+            return 0
+        return min(min(positives), self.T)
+
+    def _frame_indices(self, frames: List[str]) -> List[int]:
+        indices: List[int] = []
+        for path in frames:
+            name = os.path.basename(path)
+            stem, _ = os.path.splitext(name)
+            if "_f" in stem:
+                try:
+                    idx = int(stem.split("_f", 1)[1])
+                except ValueError:
+                    continue
+                indices.append(idx)
+        return sorted(indices)
+
+    def _detect_missing_indices(self, indices: List[int]) -> List[int]:
+        if not indices:
+            return []
+        expected = range(indices[0], indices[-1] + 1)
+        idx_set = set(indices)
+        return [i for i in expected if i not in idx_set]
+
+    def _build_quality_report(
+        self,
+        vid: str,
+        *,
+        face_frames: List[str],
+        hand_l_frames: List[str],
+        hand_r_frames: List[str],
+        pose_frames: Any,
+        effective_length: int,
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "video_id": vid,
+            "effective_length": effective_length,
+            "missing_frames": {},
+            "fps": None,
+            "issues": [],
+        }
+
+        streams = {
+            "face": face_frames,
+            "hand_l": hand_l_frames,
+            "hand_r": hand_r_frames,
+        }
+
+        meta = self.meta.get(vid, {})
+        expected_total = None
+        if meta:
+            expected_total = meta.get("frame_count")
+        if expected_total is None:
+            expected_total = max(len(face_frames), len(hand_l_frames), len(hand_r_frames), effective_length)
+        expected_total = int(expected_total) if expected_total is not None else None
+
+        for name, frames in streams.items():
+            indices = self._frame_indices(frames)
+            missing = self._detect_missing_indices(indices)
+            if missing:
+                report["missing_frames"][name] = {
+                    "count": len(missing),
+                    "indices": missing,
+                    "available": len(indices),
+                    "expected": len(indices) + len(missing),
+                }
+            if expected_total is not None and len(indices) < expected_total:
+                deficit = expected_total - len(indices)
+                entry = report["missing_frames"].setdefault(
+                    name,
+                    {
+                        "count": 0,
+                        "indices": [],
+                        "available": len(indices),
+                        "expected": expected_total,
+                    },
+                )
+                entry["count"] += deficit
+                entry["expected"] = expected_total
+
+        pose_len = pose_frames.shape[0] if hasattr(pose_frames, "shape") else 0
+        if pose_len <= 0:
+            report["missing_frames"]["pose"] = {
+                "count": 1,
+                "indices": "all",
+                "available": 0,
+                "expected": effective_length,
+            }
+
+        expected_fps = meta.get("fps") if meta else None
+        duration = meta.get("duration") if meta else None
+        frame_count = meta.get("frame_count") if meta else None
+
+        actual_frames = max([len(face_frames), len(hand_l_frames), len(hand_r_frames), pose_len, effective_length])
+        actual_fps = None
+        if duration and duration > 0:
+            actual_fps = actual_frames / float(duration)
+
+        if expected_fps is None and frame_count and duration:
+            expected_fps = frame_count / float(duration)
+
+        fps_info: Optional[Dict[str, Any]] = None
+        if expected_fps is not None or actual_fps is not None:
+            diff = None
+            ok = True
+            if expected_fps is not None and actual_fps is not None:
+                diff = abs(actual_fps - expected_fps)
+                ok = diff <= self.fps_tolerance
+            fps_info = {
+                "expected": expected_fps,
+                "actual": actual_fps,
+                "diff": diff,
+                "ok": ok,
+            }
+        report["fps"] = fps_info
+
+        if self.quality_checks:
+            issues: List[str] = []
+            if report["missing_frames"]:
+                issues.append(
+                    f"Frames faltantes detectados en {vid}: "
+                    + ", ".join(f"{k} ({v['count']})" for k, v in report["missing_frames"].items())
+                )
+            if fps_info and fps_info["expected"] and fps_info["actual"] and not fps_info["ok"]:
+                issues.append(
+                    f"FPS fuera de tolerancia para {vid}: esperado {fps_info['expected']}, "
+                    f"observado {fps_info['actual']:.2f}"
+                )
+            if issues:
+                report["issues"].extend(issues)
+                message = "; ".join(issues)
+                if self.quality_strict:
+                    raise ValueError(message)
+                warnings.warn(message)
+
+        return report
+
 
 def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
     batch_list = list(batch)
@@ -346,6 +538,7 @@ def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
         "lengths": stack_attr("length"),
         "miss_mask_hl": stack_attr("miss_mask_hl"),
         "miss_mask_hr": stack_attr("miss_mask_hr"),
+        "quality": [sample.quality for sample in batch_list],
         "texts": [sample.text for sample in batch_list],
         "video_ids": [sample.video_id for sample in batch_list],
     }
