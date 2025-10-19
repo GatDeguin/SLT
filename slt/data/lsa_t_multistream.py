@@ -216,6 +216,14 @@ class LsaTMultiStream(Dataset):
         hand_l = (hand_l - mean) / std
         hand_r = (hand_r - mean) / std
 
+        if random.random() < self.flip_prob:
+            face = torch.flip(face, dims=[3])
+            new_hand_l = torch.flip(hand_r, dims=[3])
+            new_hand_r = torch.flip(hand_l, dims=[3])
+            hand_l, hand_r = new_hand_l, new_hand_r
+            miss_mask_hl, miss_mask_hr = miss_mask_hr, miss_mask_hl
+            pose_t = self._flip_pose_tensor(pose_t)
+
         return SampleItem(
             face=face,
             hand_l=hand_l,
@@ -251,6 +259,36 @@ class LsaTMultiStream(Dataset):
             idxs_p = self._sample_indices(T0p)
             pose_s = pose[idxs_p]
         return torch.from_numpy(pose_s.astype("float32"))
+
+    def _flip_pose_tensor(self, pose: torch.Tensor) -> torch.Tensor:
+        """Devuelve ``pose`` reflejada horizontalmente, intercambiando lados."""
+
+        if pose.numel() == 0:
+            return pose
+
+        flipped = pose.clone()
+        T, pose_dim = flipped.shape
+        reshaped = flipped.view(T, -1, 3)
+        lkp_count = reshaped.shape[1]
+
+        reshaped[:, :, 0] = 1.0 - reshaped[:, :, 0]
+
+        swap_pairs = [
+            (1, 4),
+            (2, 5),
+            (3, 6),
+            (7, 8),
+            (9, 10),
+            (11, 12),
+            (13, 14),
+            (15, 16),
+        ]
+
+        for left_idx, right_idx in swap_pairs:
+            if left_idx < lkp_count and right_idx < lkp_count:
+                reshaped[:, [left_idx, right_idx]] = reshaped[:, [right_idx, left_idx]]
+
+        return reshaped.view(T, pose_dim)
 
 
 def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
