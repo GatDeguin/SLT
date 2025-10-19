@@ -66,7 +66,14 @@ def _call_model(model: nn.Module, inputs: Inputs) -> torch.Tensor:
 
 def _count_items(targets: Any) -> int:
     if isinstance(targets, torch.Tensor):
-        return targets.shape[0] if targets.dim() > 0 else 1
+        if targets.dim() == 0:
+            return 1
+        if targets.dtype in {torch.int64, torch.int32, torch.long} and targets.dim() > 1:
+            valid = targets.ne(-100)
+            count = int(valid.sum().item())
+            if count > 0:
+                return count
+        return targets.shape[0]
     if isinstance(targets, (list, tuple)):
         return len(targets)
     if hasattr(targets, "__len__"):

@@ -9,9 +9,8 @@ unas pocas épocas para verificar la integración de los componentes stub.
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,9 +18,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .data import LsaTMultiStream, collate_fn
-from .models import MultiStreamEncoder, TextDecoderStub, ViTConfig
+from transformers import PreTrainedTokenizerBase
+
+from .models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
 from .training.loops import eval_epoch, train_epoch
 from .utils.general import set_seed
+from .utils.text import create_tokenizer, encode_batch
 
 
 class _DemoModel(nn.Module):
@@ -35,7 +37,10 @@ class _DemoModel(nn.Module):
         projector_dim: int = 256,
         d_model: int = 512,
         pose_landmarks: int = 13,
-        vocab_size: int = 32_000,
+        tokenizer: PreTrainedTokenizerBase,
+        decoder_layers: int = 2,
+        decoder_heads: int = 8,
+        decoder_dropout: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -54,7 +59,22 @@ class _DemoModel(nn.Module):
             positional_num_positions=sequence_length,
             temporal_kwargs=temporal_kwargs,
         )
-        self.decoder = TextDecoderStub(d_model=d_model, vocab_size=vocab_size)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if not vocab_size:
+            vocab_size = len(tokenizer)
+        self.decoder = TextSeq2SeqDecoder(
+            d_model=d_model,
+            vocab_size=int(vocab_size),
+            num_layers=decoder_layers,
+            num_heads=decoder_heads,
+            dropout=decoder_dropout,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
 
     def forward(
         self,
@@ -66,6 +86,9 @@ class _DemoModel(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         encoded = self.encoder(
             face,
@@ -76,30 +99,33 @@ class _DemoModel(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
         )
-        decoder_mask = None
-        if pad_mask is not None:
-            decoder_mask = ~pad_mask.to(torch.bool)
-        return self.decoder(encoded, padding_mask=decoder_mask)
+        if encoder_attention_mask is None and pad_mask is not None:
+            encoder_attention_mask = pad_mask.to(torch.long)
+        return self.decoder(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+        )
 
 
-def _texts_to_targets(texts: Iterable[str], vocab_size: int) -> torch.Tensor:
-    """Genera etiquetas deterministas a partir de los textos del dataset."""
+def _build_collate(tokenizer: PreTrainedTokenizerBase, *, max_length: int):
+    """Crea una función ``collate_fn`` que incluye etiquetas tokenizadas."""
 
-    targets = []
-    for text in texts:
-        normalized = text.strip().lower()
-        digest = hashlib.sha1(normalized.encode("utf-8")).digest()
-        targets.append(int.from_bytes(digest[:8], "big") % vocab_size)
-    if not targets:
-        raise ValueError("El batch de textos no puede estar vacío.")
-    return torch.tensor(targets, dtype=torch.long)
-
-
-def _build_collate(vocab_size: int):
-    """Crea una función ``collate_fn`` compatible con los bucles de entrenamiento."""
-
-    def _collate(batch):
+    def _collate(batch: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         merged = collate_fn(batch)
+        tokenized = encode_batch(
+            tokenizer,
+            merged["texts"],
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+        )
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+
         inputs: Dict[str, torch.Tensor] = {
             "face": merged["face"],
             "hand_l": merged["hand_l"],
@@ -108,9 +134,12 @@ def _build_collate(vocab_size: int):
             "pad_mask": merged["pad_mask"],
             "miss_mask_hl": merged["miss_mask_hl"],
             "miss_mask_hr": merged["miss_mask_hr"],
+            "labels": labels,
+            "decoder_attention_mask": attention_mask,
+            "encoder_attention_mask": merged["pad_mask"].to(torch.long),
         }
-        targets = _texts_to_targets(merged["texts"], vocab_size)
-        return {"inputs": inputs, "targets": targets}
+
+        return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
 
     return _collate
 
@@ -122,9 +151,10 @@ def _create_loader(
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
-    vocab_size: int,
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
 ) -> DataLoader:
-    collate = _build_collate(vocab_size)
+    collate = _build_collate(tokenizer, max_length=max_length)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -164,7 +194,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true", help="Deshabilita pinned memory en los loaders")
     parser.add_argument("--device", type=str, default="auto", help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)")
     parser.add_argument("--seed", type=int, default=1234, help="Semilla aleatoria")
-    parser.add_argument("--vocab-size", type=int, default=32_000, help="Tamaño del vocabulario del decoder stub")
+    parser.add_argument("--tokenizer", type=str, required=True, help="Identificador o ruta a un tokenizer de HuggingFace")
+    parser.add_argument(
+        "--max-target-length",
+        type=int,
+        default=64,
+        help="Longitud máxima de las secuencias de texto tokenizadas",
+    )
+    parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=2,
+        help="Capas del decoder seq2seq utilizado durante la demo",
+    )
+    parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=8,
+        help="Número de cabezas de atención en el decoder seq2seq",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout aplicado dentro del decoder seq2seq",
+    )
     parser.add_argument("--no-amp", action="store_true", help="Desactiva AMP incluso si hay GPU disponible")
     return parser.parse_args()
 
@@ -198,13 +252,16 @@ def main() -> None:
         img_size=args.image_size,
     )
 
+    tokenizer = create_tokenizer(args.tokenizer)
+
     train_loader = _create_loader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
-        vocab_size=args.vocab_size,
+        tokenizer=tokenizer,
+        max_length=args.max_target_length,
     )
     val_loader = _create_loader(
         val_dataset,
@@ -212,13 +269,17 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
-        vocab_size=args.vocab_size,
+        tokenizer=tokenizer,
+        max_length=args.max_target_length,
     )
 
     model = _DemoModel(
         image_size=args.image_size,
         sequence_length=args.sequence_length,
-        vocab_size=args.vocab_size,
+        tokenizer=tokenizer,
+        decoder_layers=args.decoder_layers,
+        decoder_heads=args.decoder_heads,
+        decoder_dropout=args.decoder_dropout,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -229,8 +290,18 @@ def main() -> None:
         scaler = torch.cuda.amp.GradScaler()
         autocast_dtype = torch.float16
 
-    def _loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(logits, targets, label_smoothing=0.1)
+    def _loss_fn(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if hasattr(outputs, "logits"):
+            logits = outputs.logits
+        else:
+            logits = outputs
+        vocab = logits.size(-1)
+        return F.cross_entropy(
+            logits.view(-1, vocab),
+            targets.view(-1),
+            ignore_index=-100,
+            label_smoothing=0.1,
+        )
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
 

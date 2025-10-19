@@ -14,7 +14,10 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
-from slt.models import MultiStreamEncoder, TextDecoderStub, ViTConfig
+from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
+from slt.utils.text import create_tokenizer, decode
+
+from transformers import PreTrainedTokenizerBase
 
 
 @dataclass
@@ -31,14 +34,16 @@ class ModelConfig:
     temporal_layers: int = 6
     temporal_dim_feedforward: int = 2048
     temporal_dropout: float = 0.1
-    vocab_size: int = 32_000
     sequence_length: int = 128
+    decoder_layers: int = 2
+    decoder_heads: int = 8
+    decoder_dropout: float = 0.1
 
 
 class MultiStreamClassifier(nn.Module):
     """Ensamble encoder/decoder utilizado tanto en entrenamiento como en inferencia."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
         super().__init__()
 
         vit_config = ViTConfig(image_size=config.image_size)
@@ -59,7 +64,22 @@ class MultiStreamClassifier(nn.Module):
             fusion_dropout=config.fusion_dropout,
             temporal_kwargs=temporal_kwargs,
         )
-        self.decoder = TextDecoderStub(d_model=config.d_model, vocab_size=config.vocab_size)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if not vocab_size:
+            vocab_size = len(tokenizer)
+        self.decoder = TextSeq2SeqDecoder(
+            d_model=config.d_model,
+            vocab_size=int(vocab_size),
+            num_layers=config.decoder_layers,
+            num_heads=config.decoder_heads,
+            dropout=config.decoder_dropout,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
 
     def forward(
         self,
@@ -71,6 +91,9 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         encoded = self.encoder(
             face,
@@ -81,10 +104,44 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
         )
-        decoder_mask = None
-        if pad_mask is not None:
-            decoder_mask = ~pad_mask.to(torch.bool)
-        return self.decoder(encoded, padding_mask=decoder_mask)
+        if encoder_attention_mask is None and pad_mask is not None:
+            encoder_attention_mask = pad_mask.to(torch.long)
+        return self.decoder(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+        )
+
+    def generate(
+        self,
+        *,
+        face: torch.Tensor,
+        hand_l: torch.Tensor,
+        hand_r: torch.Tensor,
+        pose: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+        miss_mask_hl: Optional[torch.Tensor] = None,
+        miss_mask_hr: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        **generation_kwargs,
+    ) -> torch.LongTensor:
+        encoded = self.encoder(
+            face,
+            hand_l,
+            hand_r,
+            pose,
+            pad_mask=pad_mask,
+            miss_mask_hl=miss_mask_hl,
+            miss_mask_hr=miss_mask_hr,
+        )
+        if encoder_attention_mask is None and pad_mask is not None:
+            encoder_attention_mask = pad_mask.to(torch.long)
+        return self.decoder.generate(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            **generation_kwargs,
+        )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -121,8 +178,37 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Dimensión del feedforward en el codificador temporal",
     )
     parser.add_argument("--temporal-dropout", type=float, default=0.1, help="Dropout del codificador temporal")
-    parser.add_argument("--vocab-size", type=int, default=32_000, help="Tamaño del vocabulario del stub")
     parser.add_argument("--sequence-length", type=int, default=128, help="Cantidad de frames muestreados por video")
+    parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=2,
+        help="Capas del decoder seq2seq",
+    )
+    parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=8,
+        help="Cabezas de atención del decoder seq2seq",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout interno del decoder seq2seq",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        required=True,
+        help="Identificador o ruta de un tokenizer de HuggingFace",
+    )
+    parser.add_argument(
+        "--max-target-length",
+        type=int,
+        default=128,
+        help="Longitud máxima utilizada al generar predicciones",
+    )
 
     parser.add_argument("--log-level", default="INFO", help="Nivel de logging (INFO, DEBUG, ...)")
 
@@ -157,7 +243,7 @@ def _select_device(identifier: str) -> torch.device:
     return device
 
 
-def _build_model(args: argparse.Namespace) -> MultiStreamClassifier:
+def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -> MultiStreamClassifier:
     config = ModelConfig(
         image_size=args.image_size,
         projector_dim=args.projector_dim,
@@ -169,10 +255,12 @@ def _build_model(args: argparse.Namespace) -> MultiStreamClassifier:
         temporal_layers=args.temporal_layers,
         temporal_dim_feedforward=args.temporal_dim_feedforward,
         temporal_dropout=args.temporal_dropout,
-        vocab_size=args.vocab_size,
         sequence_length=args.sequence_length,
+        decoder_layers=args.decoder_layers,
+        decoder_heads=args.decoder_heads,
+        decoder_dropout=args.decoder_dropout,
     )
-    return MultiStreamClassifier(config)
+    return MultiStreamClassifier(config, tokenizer)
 
 
 def _load_checkpoint(model: nn.Module, path: Path, device: torch.device) -> None:
@@ -210,19 +298,28 @@ def _create_dataloader(args: argparse.Namespace) -> DataLoader:
 
 def _prepare_inputs(batch: dict, device: torch.device) -> dict:
     tensor_keys = ["face", "hand_l", "hand_r", "pose", "pad_mask", "miss_mask_hl", "miss_mask_hr"]
-    return {key: batch[key].to(device) for key in tensor_keys}
+    inputs = {key: batch[key].to(device) for key in tensor_keys}
+    inputs["encoder_attention_mask"] = batch["pad_mask"].to(device=device, dtype=torch.long)
+    return inputs
 
 
-def _predict(model: MultiStreamClassifier, loader: DataLoader, device: torch.device) -> List[Tuple[str, str]]:
+def _predict(
+    model: MultiStreamClassifier,
+    loader: DataLoader,
+    device: torch.device,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    max_length: int,
+) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = []
     model.eval()
     with torch.inference_mode():
         for batch in loader:
             inputs = _prepare_inputs(batch, device)
-            logits = model(**inputs)
-            predictions = torch.argmax(logits, dim=-1).cpu().tolist()
-            for video_id, pred in zip(batch["video_ids"], predictions):
-                results.append((video_id, f"token_{pred}"))
+            sequences = model.generate(**inputs, max_length=max_length, num_beams=1)
+            decoded = decode(tokenizer, sequences)
+            for video_id, text in zip(batch["video_ids"], decoded):
+                results.append((video_id, text))
     return results
 
 
@@ -245,11 +342,18 @@ def run(argv: Optional[Sequence[str]] = None) -> List[Tuple[str, str]]:
     _validate_inputs(args)
     device = _select_device(args.device)
 
+    tokenizer = create_tokenizer(args.tokenizer)
     loader = _create_dataloader(args)
-    model = _build_model(args).to(device)
+    model = _build_model(args, tokenizer).to(device)
     _load_checkpoint(model, args.checkpoint, device)
 
-    predictions = _predict(model, loader, device)
+    predictions = _predict(
+        model,
+        loader,
+        device,
+        tokenizer,
+        max_length=args.max_target_length,
+    )
     _write_csv(args.output_csv, predictions)
     logging.info("Predicciones guardadas en %s", args.output_csv)
     return predictions

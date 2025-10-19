@@ -2,31 +2,33 @@
 """Command line entry-point to train the multi-stream SLT stub model.
 
 The script wires together the reusable components from :mod:`slt` to
-instantiate the dataset, encoder/decoder pair and the optimisation loop.  It is
-geared towards experimentation and intentionally keeps the dependency surface
-minimal so that it can run in environments where only the Python standard
-library and PyTorch are available.
+instantiate the dataset, encoder/decoder pair and the optimisation loop.
+Tokenizer and decoder functionality rely on HuggingFace ``transformers`` so the
+package must be installed alongside PyTorch.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
-from slt.models import MultiStreamEncoder, TextDecoderStub, ViTConfig
+from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
 from slt.training.loops import eval_epoch, train_epoch
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
+from slt.utils.text import create_tokenizer, encode_batch
+
+from transformers import PreTrainedTokenizerBase
 
 try:  # pragma: no cover - TensorBoard is an optional dependency.
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
@@ -48,8 +50,10 @@ class ModelConfig:
     temporal_layers: int = 6
     temporal_dim_feedforward: int = 2048
     temporal_dropout: float = 0.1
-    vocab_size: int = 32_000
     sequence_length: int = 128
+    decoder_layers: int = 2
+    decoder_heads: int = 8
+    decoder_dropout: float = 0.1
 
 
 @dataclass
@@ -85,12 +89,14 @@ class DataConfig:
     precision: str = "amp"
     tensorboard: Optional[Path] = None
     pin_memory: bool = True
+    tokenizer: str = ""
+    max_target_length: int = 64
 
 
 class MultiStreamClassifier(nn.Module):
     """Convenience wrapper around the encoder/decoder pair."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
         super().__init__()
 
         vit_config = ViTConfig(image_size=config.image_size)
@@ -111,7 +117,22 @@ class MultiStreamClassifier(nn.Module):
             fusion_dropout=config.fusion_dropout,
             temporal_kwargs=temporal_kwargs,
         )
-        self.decoder = TextDecoderStub(d_model=config.d_model, vocab_size=config.vocab_size)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if not vocab_size:
+            vocab_size = len(tokenizer)
+        self.decoder = TextSeq2SeqDecoder(
+            d_model=config.d_model,
+            vocab_size=int(vocab_size),
+            num_layers=config.decoder_layers,
+            num_heads=config.decoder_heads,
+            dropout=config.decoder_dropout,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
 
     def forward(
         self,
@@ -123,6 +144,9 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         encoded = self.encoder(
             face,
@@ -133,10 +157,44 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
         )
-        decoder_mask = None
-        if pad_mask is not None:
-            decoder_mask = (~pad_mask.to(torch.bool))
-        return self.decoder(encoded, padding_mask=decoder_mask)
+        if encoder_attention_mask is None and pad_mask is not None:
+            encoder_attention_mask = pad_mask.to(torch.long)
+        return self.decoder(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+        )
+
+    def generate(
+        self,
+        *,
+        face: torch.Tensor,
+        hand_l: torch.Tensor,
+        hand_r: torch.Tensor,
+        pose: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+        miss_mask_hl: Optional[torch.Tensor] = None,
+        miss_mask_hr: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        **generation_kwargs: Any,
+    ) -> torch.LongTensor:
+        encoded = self.encoder(
+            face,
+            hand_l,
+            hand_r,
+            pose,
+            pad_mask=pad_mask,
+            miss_mask_hl=miss_mask_hl,
+            miss_mask_hr=miss_mask_hr,
+        )
+        if encoder_attention_mask is None and pad_mask is not None:
+            encoder_attention_mask = pad_mask.to(torch.long)
+        return self.decoder.generate(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            **generation_kwargs,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,7 +246,36 @@ def parse_args() -> argparse.Namespace:
         help="Feed-forward dimension inside the temporal encoder",
     )
     parser.add_argument("--temporal-dropout", type=float, default=0.1, help="Dropout used by the temporal encoder")
-    parser.add_argument("--vocab-size", type=int, default=32_000, help="Size of the decoder output vocabulary")
+    parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=2,
+        help="Number of layers in the seq2seq decoder",
+    )
+    parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in the seq2seq decoder",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability inside the seq2seq decoder",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        required=True,
+        help="HuggingFace tokenizer identifier or local path",
+    )
+    parser.add_argument(
+        "--max-target-length",
+        type=int,
+        default=128,
+        help="Maximum length of the tokenised target sequences",
+    )
 
     # Optimiser arguments
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
@@ -232,6 +319,8 @@ def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, Op
         precision=args.precision,
         tensorboard=args.tensorboard,
         pin_memory=not args.no_pin_memory,
+        tokenizer=args.tokenizer,
+        max_target_length=args.max_target_length,
     )
 
     model = ModelConfig(
@@ -245,8 +334,10 @@ def build_configs(args: argparse.Namespace) -> tuple[DataConfig, ModelConfig, Op
         temporal_layers=args.temporal_layers,
         temporal_dim_feedforward=args.temporal_dim_feedforward,
         temporal_dropout=args.temporal_dropout,
-        vocab_size=args.vocab_size,
         sequence_length=args.sequence_length,
+        decoder_layers=args.decoder_layers,
+        decoder_heads=args.decoder_heads,
+        decoder_dropout=args.decoder_dropout,
     )
 
     scheduler_choice = args.scheduler.lower()
@@ -292,22 +383,26 @@ def _validate_paths(config: DataConfig) -> None:
     config.work_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _texts_to_targets(texts: Iterable[str], vocab_size: int) -> torch.Tensor:
-    targets = []
-    for text in texts:
-        normalized = text.strip().lower()
-        digest = hashlib.sha1(normalized.encode("utf-8")).digest()
-        value = int.from_bytes(digest[:8], "big") % vocab_size
-        targets.append(value)
-    if not targets:
-        raise ValueError("Received an empty batch when building targets")
-    return torch.tensor(targets, dtype=torch.long)
-
-
-def _build_collate(vocab_size: int) -> Callable[[Iterable[Dict[str, torch.Tensor]]], Dict[str, torch.Tensor]]:
+def _build_collate(
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    max_length: int,
+) -> Callable[[Iterable[Dict[str, torch.Tensor]]], Dict[str, torch.Tensor]]:
     def _collate(batch: Iterable[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         merged = collate_fn(batch)
-        inputs = {
+        tokenized = encode_batch(
+            tokenizer,
+            merged["texts"],
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+        )
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+
+        inputs: Dict[str, torch.Tensor] = {
             "face": merged["face"],
             "hand_l": merged["hand_l"],
             "hand_r": merged["hand_r"],
@@ -315,9 +410,11 @@ def _build_collate(vocab_size: int) -> Callable[[Iterable[Dict[str, torch.Tensor
             "pad_mask": merged["pad_mask"],
             "miss_mask_hl": merged["miss_mask_hl"],
             "miss_mask_hr": merged["miss_mask_hr"],
+            "labels": labels,
+            "decoder_attention_mask": attention_mask,
+            "encoder_attention_mask": merged["pad_mask"].to(torch.long),
         }
-        targets = _texts_to_targets(merged["texts"], vocab_size)
-        return {"inputs": inputs, "targets": targets}
+        return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
 
     return _collate
 
@@ -329,9 +426,10 @@ def _create_dataloader(
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
-    vocab_size: int,
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
 ) -> DataLoader:
-    collate = _build_collate(vocab_size)
+    collate = _build_collate(tokenizer, max_length=max_length)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -385,6 +483,8 @@ def main() -> None:
         logging.warning("CUDA requested but not available. Falling back to CPU.")
         device = torch.device("cpu")
 
+    tokenizer = create_tokenizer(data_config.tokenizer)
+
     train_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),
         hand_l_dir=str(data_config.hand_left_dir),
@@ -415,7 +515,8 @@ def main() -> None:
         shuffle=True,
         num_workers=data_config.num_workers,
         pin_memory=data_config.pin_memory,
-        vocab_size=model_config.vocab_size,
+        tokenizer=tokenizer,
+        max_length=data_config.max_target_length,
     )
     val_loader = _create_dataloader(
         val_dataset,
@@ -423,10 +524,11 @@ def main() -> None:
         shuffle=False,
         num_workers=data_config.num_workers,
         pin_memory=data_config.pin_memory,
-        vocab_size=model_config.vocab_size,
+        tokenizer=tokenizer,
+        max_length=data_config.max_target_length,
     )
 
-    model = MultiStreamClassifier(model_config).to(device)
+    model = MultiStreamClassifier(model_config, tokenizer).to(device)
     optimizer = create_optimizer(
         model.parameters(),
         {
@@ -456,11 +558,24 @@ def main() -> None:
                 },
             )
 
-    try:
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=optim_config.label_smoothing)
-    except TypeError:  # pragma: no cover - older PyTorch versions may not support label smoothing.
-        logging.warning("Label smoothing unsupported in this PyTorch version. Falling back to default loss.")
-        loss_fn = nn.CrossEntropyLoss()
+    def _loss_fn(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        vocab = logits.size(-1)
+        try:
+            return F.cross_entropy(
+                logits.view(-1, vocab),
+                targets.view(-1),
+                ignore_index=-100,
+                label_smoothing=optim_config.label_smoothing,
+            )
+        except TypeError:  # pragma: no cover - fallback when label smoothing unsupported
+            logging.warning(
+                "Label smoothing unsupported in this PyTorch version. Falling back to default loss.")
+            return F.cross_entropy(
+                logits.view(-1, vocab),
+                targets.view(-1),
+                ignore_index=-100,
+            )
 
     use_amp = data_config.precision == "amp" and device.type == "cuda" and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -485,11 +600,11 @@ def main() -> None:
             model,
             train_loader,
             optimizer,
-            loss_fn,
+            _loss_fn,
             device=device,
             scaler=scaler,
         )
-        val_loss = eval_epoch(model, val_loader, loss_fn, device=device)
+        val_loss = eval_epoch(model, val_loader, _loss_fn, device=device)
 
         logging.info(
             "Epoch %d/%d - train_loss=%.4f - val_loss=%.4f",
