@@ -580,7 +580,7 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
     total = 0.0
     steps = 0
     skipped = 0
-    scaler = torch.amp.GradScaler('cuda', enabled=(amp and device.startswith("cuda") and torch.cuda.is_available()))
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.startswith("cuda") and torch.cuda.is_available()))
     pbar = tqdm(ld_train, desc='[Train]')
     for xs, lens, y_pad, key_pad, _ in pbar:
         xs = xs.to(device)
