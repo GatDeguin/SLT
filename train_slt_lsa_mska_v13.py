@@ -579,6 +579,7 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
     model.train()
     total = 0.0
     steps = 0
+    skipped = 0
     scaler = torch.amp.GradScaler('cuda', enabled=(amp and device.startswith("cuda") and torch.cuda.is_available()))
     pbar = tqdm(ld_train, desc='[Train]')
     for xs, lens, y_pad, key_pad, _ in pbar:
@@ -589,6 +590,12 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
         with torch.amp.autocast('cuda', enabled=(amp and device.startswith("cuda") and torch.cuda.is_available())):
             out = model(xs, lens, y_pad, key_pad)
             loss = out.loss
+
+        if not torch.isfinite(loss):
+            skipped += 1
+            plog(f"[WARN] Paso omitido: loss no finito (valor={float(loss.detach().cpu())}).")
+            opt.zero_grad(set_to_none=True)
+            continue
 
         scaler.scale(loss).backward()
         if grad_clip is not None and grad_clip > 0:
@@ -604,9 +611,15 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
 
         total += float(loss.detach().cpu().item())
         steps += 1
-        pbar.set_postfix({'loss': f"{total/steps:.4f}"})
+        pbar.set_postfix({'loss': f"{total/steps:.4f}", 'skipped': skipped})
 
-    return total / max(1, steps)
+    if steps == 0:
+        return float('nan')
+
+    if skipped > 0:
+        plog(f"[INFO] Batches omitidos por loss no finito: {skipped}")
+
+    return total / steps
 
 @torch.no_grad()
 def validate_bleu(model: KP2Text, ld_val, tok, device='cuda', beam=5, max_len=64):
