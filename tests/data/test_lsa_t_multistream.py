@@ -57,7 +57,7 @@ def synthetic_dataset(tmp_path: Path) -> dict:
 
 
 def test_sample_item_structure(synthetic_dataset: dict) -> None:
-    ds = LsaTMultiStream(T=4, img_size=32, **synthetic_dataset)
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
     assert len(ds) == 1
 
     random.seed(0)
@@ -67,6 +67,8 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
     assert sample.hand_l.shape == (4, 3, 32, 32)
     assert sample.hand_r.shape == (4, 3, 32, 32)
     assert sample.pose.shape == (4, 39)
+    assert sample.pose_conf_mask.shape == (4, 13)
+    assert sample.pose_conf_mask.dtype == torch.bool
     assert sample.pad_mask.dtype == torch.bool
     assert torch.equal(sample.pad_mask, torch.ones(4, dtype=torch.bool))
     assert sample.length.dtype == torch.long
@@ -78,13 +80,15 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
 
 
 def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
-    ds = LsaTMultiStream(T=4, img_size=32, **synthetic_dataset)
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
     random.seed(1)
     batch = [ds[0], ds[0]]
     data = collate_fn(batch)
 
     assert data["face"].shape == (2, 4, 3, 32, 32)
     assert data["pose"].shape == (2, 4, 39)
+    assert data["pose_conf_mask"].shape == (2, 4, 13)
+    assert data["pose_conf_mask"].dtype == torch.bool
     assert data["pad_mask"].dtype == torch.bool
     assert torch.equal(data["lengths"], torch.tensor([4, 4], dtype=torch.long))
     assert data["texts"] == ["hola mundo", "hola mundo"]
@@ -131,6 +135,7 @@ def test_cli_collate_propagates_masks_and_lengths(synthetic_dataset: dict) -> No
     assert torch.equal(inputs["pad_mask"], sample.pad_mask.unsqueeze(0))
     assert torch.equal(inputs["encoder_attention_mask"], sample.pad_mask.unsqueeze(0).to(torch.long))
     assert torch.equal(inputs["lengths"], sample.length.unsqueeze(0))
+    assert torch.equal(inputs["pose_conf_mask"], sample.pose_conf_mask.unsqueeze(0))
 
 
 def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
@@ -150,3 +155,45 @@ def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
 
     expected_pose = ds_flip._flip_pose_tensor(sample_no.pose)
     assert torch.allclose(sample_flip.pose, expected_pose)
+
+
+def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:
+    pose_path = Path(synthetic_dataset["pose_dir"]) / "vid001.npz"
+
+    low_conf_pose = np.zeros((3, 3 * 13), dtype="float32")
+    # Frame 0: first landmark below threshold, second above
+    low_conf_pose[0, 0:3] = [0.2, 0.3, 0.1]
+    low_conf_pose[0, 3:6] = [0.4, 0.5, 0.8]
+    # Frame 1: both above threshold
+    low_conf_pose[1, 0:3] = [0.6, 0.7, 0.6]
+    low_conf_pose[1, 3:6] = [0.8, 0.2, 0.9]
+    # Frame 2: first below, second above
+    low_conf_pose[2, 0:3] = [0.9, 0.1, 0.2]
+    low_conf_pose[2, 3:6] = [0.3, 0.4, 0.95]
+
+    np.savez(pose_path, pose=low_conf_pose)
+
+    ds = LsaTMultiStream(T=3, img_size=32, min_conf=0.5, flip_prob=0.0, **synthetic_dataset)
+    random.seed(0)
+    sample = ds[0]
+
+    pose = sample.pose.view(3, 13, 3)
+    mask = sample.pose_conf_mask
+
+    # Frame 0: first landmark filtered, coordinates zeroed but confidence preserved
+    assert torch.allclose(pose[0, 0, :2], torch.zeros(2))
+    assert pytest.approx(pose[0, 0, 2].item()) == 0.1
+    assert mask[0, 0].item() is False
+    assert torch.allclose(pose[0, 1, :2], torch.tensor([0.4, 0.5]))
+    assert pytest.approx(pose[0, 1, 2].item()) == 0.8
+    assert mask[0, 1].item() is True
+
+    # Frame 1: both valid
+    assert mask[1, 0].item() is True
+    assert mask[1, 1].item() is True
+    assert torch.allclose(pose[1, 0, :2], torch.tensor([0.6, 0.7]))
+
+    # Frame 2: first invalid again, second valid
+    assert mask[2, 0].item() is False
+    assert mask[2, 1].item() is True
+    assert torch.allclose(pose[2, 1, :2], torch.tensor([0.3, 0.4]))

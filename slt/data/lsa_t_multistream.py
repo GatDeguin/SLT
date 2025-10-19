@@ -39,6 +39,7 @@ class SampleItem:
     hand_l: torch.Tensor
     hand_r: torch.Tensor
     pose: torch.Tensor
+    pose_conf_mask: torch.Tensor
     pad_mask: torch.Tensor
     length: torch.Tensor
     miss_mask_hl: torch.Tensor
@@ -205,7 +206,7 @@ class LsaTMultiStream(Dataset):
         hand_l = torch.stack(hl_list, dim=0)
         hand_r = torch.stack(hr_list, dim=0)
 
-        pose_t = self._sample_pose(pose)
+        pose_t, pose_mask = self._sample_pose(pose)
 
         pad_mask = torch.zeros(self.T, dtype=torch.bool)
         if T_valid > 0:
@@ -228,12 +229,14 @@ class LsaTMultiStream(Dataset):
             hand_l, hand_r = new_hand_l, new_hand_r
             miss_mask_hl, miss_mask_hr = miss_mask_hr, miss_mask_hl
             pose_t = self._flip_pose_tensor(pose_t)
+            pose_mask = self._flip_pose_mask(pose_mask)
 
         return SampleItem(
             face=face,
             hand_l=hand_l,
             hand_r=hand_r,
             pose=pose_t,
+            pose_conf_mask=pose_mask,
             pad_mask=pad_mask,
             length=length,
             miss_mask_hl=miss_mask_hl,
@@ -256,7 +259,7 @@ class LsaTMultiStream(Dataset):
                 return np.zeros((1, 3 * self.lkp_count), dtype="float32")
             return pose
 
-    def _sample_pose(self, pose: Any) -> torch.Tensor:
+    def _sample_pose(self, pose: Any) -> tuple[torch.Tensor, torch.Tensor]:
         np = self._np
         T0p = pose.shape[0]
         if T0p <= 0:
@@ -264,7 +267,15 @@ class LsaTMultiStream(Dataset):
         else:
             idxs_p = self._sample_indices(T0p)
             pose_s = pose[idxs_p]
-        return torch.from_numpy(pose_s.astype("float32"))
+        pose_s = pose_s.astype("float32", copy=False)
+        pose_s = pose_s.reshape(self.T, self.lkp_count, 3)
+        conf = pose_s[:, :, 2]
+        mask = conf >= self.min_conf
+        pose_s[:, :, :2] *= mask[..., None].astype("float32")
+        pose_s = pose_s.reshape(self.T, 3 * self.lkp_count)
+        pose_tensor = torch.from_numpy(pose_s)
+        mask_tensor = torch.from_numpy(mask.astype("bool"))
+        return pose_tensor, mask_tensor
 
     def _flip_pose_tensor(self, pose: torch.Tensor) -> torch.Tensor:
         """Devuelve ``pose`` reflejada horizontalmente, intercambiando lados."""
@@ -279,7 +290,33 @@ class LsaTMultiStream(Dataset):
 
         reshaped[:, :, 0] = 1.0 - reshaped[:, :, 0]
 
-        swap_pairs = [
+        for left_idx, right_idx in self._pose_swap_pairs(lkp_count):
+            if left_idx < lkp_count and right_idx < lkp_count:
+                reshaped[:, [left_idx, right_idx]] = reshaped[:, [right_idx, left_idx]]
+
+        return reshaped.view(T, pose_dim)
+
+    def _flip_pose_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """Refleja la máscara de confianza de la pose."""
+
+        if mask.numel() == 0:
+            return mask
+
+        flipped = mask.clone()
+        T, lkp_count = flipped.shape
+
+        for left_idx, right_idx in self._pose_swap_pairs(lkp_count):
+            if left_idx < lkp_count and right_idx < lkp_count:
+                flipped[:, [left_idx, right_idx]] = flipped[:, [right_idx, left_idx]]
+
+        return flipped
+
+    @staticmethod
+    def _pose_swap_pairs(lkp_count: int) -> List[tuple[int, int]]:
+        """Pares de landmarks que deben intercambiarse al reflejar."""
+
+        del lkp_count  # solo para mantener la firma uniforme
+        return [
             (1, 4),
             (2, 5),
             (3, 6),
@@ -289,12 +326,6 @@ class LsaTMultiStream(Dataset):
             (13, 14),
             (15, 16),
         ]
-
-        for left_idx, right_idx in swap_pairs:
-            if left_idx < lkp_count and right_idx < lkp_count:
-                reshaped[:, [left_idx, right_idx]] = reshaped[:, [right_idx, left_idx]]
-
-        return reshaped.view(T, pose_dim)
 
 
 def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
@@ -310,6 +341,7 @@ def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
         "hand_l": stack_attr("hand_l"),
         "hand_r": stack_attr("hand_r"),
         "pose": stack_attr("pose"),
+        "pose_conf_mask": stack_attr("pose_conf_mask"),
         "pad_mask": stack_attr("pad_mask"),
         "lengths": stack_attr("length"),
         "miss_mask_hl": stack_attr("miss_mask_hl"),
