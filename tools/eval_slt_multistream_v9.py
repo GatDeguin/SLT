@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Evalúa el stub multi-stream generando predicciones ficticias en CSV."""
 
-from __future__ import annotations
-
 import argparse
 import csv
 import logging

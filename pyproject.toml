@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slt"
+version = "0.1.0"
+description = "Componentes stub y utilidades para experimentos de traducción de lengua de señas."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "SLT contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "opencv-python>=4.8",
+    "Pillow>=9.4",
+    "tqdm>=4.66",
+    "transformers>=4.36",
+]
+
+[project.optional-dependencies]
+media = [
+    "mediapipe>=0.10",
+]
+metrics = [
+    "sacrebleu>=2.3",
+]
+export = [
+    "onnx>=1.16",
+]
+
+[project.scripts]
+slt-demo = "slt.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["slt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

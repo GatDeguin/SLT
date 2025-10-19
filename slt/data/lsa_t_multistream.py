@@ -28,7 +28,7 @@ def _get_numpy():  # pragma: no cover - función sencilla
 
 
 def _get_pil_image():  # pragma: no cover - función sencilla
-    return _lazy_import("PIL.Image").Image
+    return _lazy_import("PIL.Image")
 
 
 @dataclass
