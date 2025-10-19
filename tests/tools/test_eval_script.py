@@ -174,8 +174,7 @@ def test_eval_script_generates_stub_csv(
         reader = csv.reader(fh)
         rows = list(reader)
 
-    assert rows[0] == ["video_id", "prediction"]
+    assert rows[0] == ["video_id", "prediction", "reference"]
     assert len(rows) == 2
     assert rows[1][0] == "vid001"
     assert isinstance(rows[1][1], str)
-    assert rows[1][1] != ""

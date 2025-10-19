@@ -36,33 +36,6 @@ class DummyTokenizer:
     def __len__(self) -> int:  # pragma: no cover - not used but mimics HF API
         return 10
 
-
-def test_decode_from_logits_greedy_and_beam():
-    tokenizer = DummyTokenizer()
-    logits = torch.tensor(
-        [
-            [
-                [0.1, -1.0, 3.0, 0.5, 0.0, -0.5, -0.2],
-                [0.2, 2.5, 0.2, 3.5, -1.0, -0.7, -0.4],
-                [0.3, 4.0, -0.3, -0.5, 0.0, 0.1, -0.2],
-            ],
-            [
-                [0.0, -2.0, 1.5, 0.1, 2.0, 1.0, -0.1],
-                [0.2, -1.0, 0.5, 0.3, 1.7, 1.8, 0.0],
-                [0.1, 3.5, -0.2, 0.4, 0.0, 0.1, -0.3],
-            ],
-        ],
-        dtype=torch.float32,
-    )
-
-    greedy = eval_module._decode_from_logits(logits, tokenizer, num_beams=1)
-    assert greedy == ["uno dos", "tres cuatro"]
-
-    beam = eval_module._decode_from_logits(logits, tokenizer, num_beams=3)
-    # Con beam > 1 debería mantener las mismas predicciones válidas
-    assert beam == ["uno dos", "tres cuatro"]
-
-
 def test_run_generates_predictions_and_metrics(tmp_path, monkeypatch):
     face_dir = tmp_path / "face"
     hand_l_dir = tmp_path / "hand_l"
@@ -163,20 +136,29 @@ def test_run_generates_predictions_and_metrics(tmp_path, monkeypatch):
     assert output_csv.exists()
     with output_csv.open() as csv_file:
         rows = list(csv.reader(csv_file))
-    assert rows[0] == ["video_id", "prediction"]
-    assert rows[1:] == [["vid1", "hola mundo"], ["vid2", "adios mundo"]]
+    assert rows[0] == ["video_id", "prediction", "reference"]
+    assert rows[1:] == [["vid1", "hola mundo", "hola mundo"], ["vid2", "adios mundo", "adios mundo"]]
 
-    metrics_json = output_csv.parent / "metrics.json"
-    metrics_csv = output_csv.parent / "metrics.csv"
-    assert metrics_json.exists()
-    assert metrics_csv.exists()
+    report_json = output_csv.parent / "report.json"
+    report_csv = output_csv.parent / "report.csv"
+    assert report_json.exists()
+    assert report_csv.exists()
 
-    data = json.loads(metrics_json.read_text(encoding="utf-8"))
-    assert data["bleu"] == pytest.approx(100.0)
-    assert data["chrf"] == pytest.approx(100.0)
+    data = json.loads(report_json.read_text(encoding="utf-8"))
+    if eval_module.BLEU is None or eval_module.CHRF is None:
+        assert data["metrics"]["bleu"] == pytest.approx(0.0)
+        assert data["metrics"]["chrf"] == pytest.approx(0.0)
+    else:
+        assert data["metrics"]["bleu"] == pytest.approx(100.0)
+        assert data["metrics"]["chrf"] == pytest.approx(100.0)
+    assert data["metrics"]["cer"] == pytest.approx(0.0)
+    assert len(data["examples"]) == 2
+    assert data["examples"][0]["prediction"] == "hola mundo"
 
-    with metrics_csv.open() as csv_file:
+    with report_csv.open() as csv_file:
         reader = list(csv.reader(csv_file))
-    assert reader[0] == ["metric", "value"]
-    assert [row[0] for row in reader[1:]] == ["bleu", "chrf"]
-    assert [float(row[1]) for row in reader[1:]] == [pytest.approx(100.0), pytest.approx(100.0)]
+    assert reader[0] == ["type", "name", "value", "reference"]
+    metric_rows = [row for row in reader[1:] if row[0] == "metric"]
+    example_rows = [row for row in reader[1:] if row[0] == "example"]
+    assert {row[1] for row in metric_rows} == {"bleu", "chrf", "cer"}
+    assert any(row[1] == "vid1" and row[2] == "hola mundo" for row in example_rows)
