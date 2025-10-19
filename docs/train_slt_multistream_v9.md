@@ -2,9 +2,9 @@
 
 El script `tools/train_slt_multistream_v9.py` entrena el stub multi-stream
 incluido en el paquete `slt`, conectando el dataset `LsaTMultiStream`, el
-codificador `MultiStreamEncoder` y el decodificador ligero `TextDecoderStub`.
-Permite registrar métricas básicas, guardar checkpoints y activar, de forma
-opcional, un hook de TensorBoard.
+codificador `MultiStreamEncoder` y un decodificador seq2seq basado en
+HuggingFace (`TextSeq2SeqDecoder`). Permite registrar métricas básicas, guardar
+checkpoints y activar, de forma opcional, un hook de TensorBoard.
 
 ## Requisitos de entrada
 
@@ -61,7 +61,9 @@ facilitar la reproducibilidad.
 | `--projector-dim`, `--d-model` | Dimensiones internas del encoder. |
 | `--pose-landmarks` | Cantidad de puntos de pose (se asume `3 * landmarks` canales). |
 | `--temporal-*` | Hiperparámetros del transformer temporal. |
-| `--vocab-size` | Salida del `TextDecoderStub`. |
+| `--decoder-layers`, `--decoder-heads`, `--decoder-dropout` | Arquitectura del decoder seq2seq. |
+| `--tokenizer` | Identificador o ruta a un tokenizer de HuggingFace. |
+| `--max-target-length` | Longitud máxima de las secuencias tokenizadas. |
 
 ### Optimización
 
@@ -79,5 +81,6 @@ facilitar la reproducibilidad.
   establezca `--device cpu`.
 * Si se solicita TensorBoard y la librería no está instalada se imprimirá un
   aviso, continuando sin logging adicional.
-* Los textos del dataset se transforman en etiquetas enteras mediante un hash
-  determinista, lo que permite ejecutar el stub sin un tokenizador externo.
+* Los textos del dataset se tokenizan con el tokenizer indicado por
+  `--tokenizer`. Las etiquetas utilizan `-100` en posiciones de padding para
+  ser ignoradas por la pérdida.

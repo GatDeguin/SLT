@@ -7,7 +7,7 @@ import torch
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from slt.models.temporal import TemporalEncoder, TextDecoderStub
+from slt.models.temporal import TemporalEncoder, TextSeq2SeqDecoder
 
 
 def test_temporal_encoder_output_shape():
@@ -33,21 +33,28 @@ def test_temporal_encoder_respects_padding_mask():
     torch.testing.assert_close(masked_output[:, :2, :], truncated_output, rtol=1e-4, atol=1e-4)
 
 
-def test_text_decoder_stub_masked_mean():
-    decoder = TextDecoderStub(d_model=4, vocab_size=10)
-
-    enc_out = torch.tensor(
-        [
-            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
-            [[2.0, 4.0, 6.0, 8.0], [0.0, 0.0, 0.0, 0.0]],
-        ]
+def test_text_seq2seq_decoder_forward_shapes():
+    decoder = TextSeq2SeqDecoder(
+        d_model=16,
+        vocab_size=32,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        pad_token_id=0,
+        eos_token_id=1,
     )
-    padding_mask = torch.tensor([[False, False], [False, True]])
 
-    logits = decoder(enc_out, padding_mask=padding_mask)
+    enc_out = torch.randn(2, 3, 16)
+    encoder_mask = torch.ones(2, 3, dtype=torch.long)
+    labels = torch.tensor([[1, 2, 3, 4], [5, 6, 7, -100]])
+    decoder_mask = (labels != -100).long()
 
-    # First sequence averages both steps, second ignores the padded second step
-    expected_means = torch.tensor([[3.0, 4.0, 5.0, 6.0], [2.0, 4.0, 6.0, 8.0]])
-    expected_logits = decoder.lm_head(expected_means)
+    outputs = decoder(
+        enc_out,
+        encoder_attention_mask=encoder_mask,
+        labels=labels,
+        decoder_attention_mask=decoder_mask,
+    )
 
-    torch.testing.assert_close(logits, expected_logits)
+    assert outputs.logits.shape == (2, labels.shape[1], 32)
+    assert outputs.loss is not None

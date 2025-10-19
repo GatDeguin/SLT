@@ -55,10 +55,10 @@ por modelos de producción:
 2. **Encoder multi-stream**: `slt/models/multistream.py` centraliza la lógica
    de fusión y temporales. Sustituye sus dependencias por las variantes reales
    y ajusta la máscara de manos si cuentas con detección de frames perdidos.
-3. **Decoder textual**: `slt/models/temporal.py` implementa `TextDecoderStub`.
-   Reemplázalo por tu modelo seq2seq (p. ej. mBART) y modifica el *collate*
-   en `slt/__main__.py` para utilizar etiquetas tokenizadas en lugar del hash
-   determinista.
+3. **Decoder textual**: `slt/models/temporal.py` implementa
+   `TextSeq2SeqDecoder`, una envoltura sobre modelos seq2seq de HuggingFace.
+   Ajusta la configuración (tokenizer, arquitectura, longitud máxima) para
+   cargar tu modelo de producción o inicializar pesos pre-entrenados.
 
 Una vez actualizados estos módulos, la demo servirá como punto de partida para
 un pipeline de entrenamiento completo con pesos reales.

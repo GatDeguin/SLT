@@ -2,28 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torch import Tensor, nn
+from transformers import AutoModelForSeq2SeqLM, PretrainedConfig, T5Config, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 
 
 class TemporalEncoder(nn.Module):
-    """Thin wrapper around :class:`torch.nn.TransformerEncoder`.
-
-    Parameters
-    ----------
-    d_model:
-        Embedding dimension of the sequence tokens.
-    nhead:
-        Number of attention heads.
-    nlayers:
-        Number of encoder layers stacked.
-    dim_feedforward:
-        Dimension of the feedforward network within each encoder layer.
-    dropout:
-        Dropout probability applied inside the encoder layers.
-    """
+    """Thin wrapper around :class:`torch.nn.TransformerEncoder`."""
 
     def __init__(
         self,
@@ -49,49 +37,136 @@ class TemporalEncoder(nn.Module):
         sequence: Tensor,
         src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Encode the temporal sequence.
-
-        Parameters
-        ----------
-        sequence:
-            Input tensor of shape ``(batch, time, d_model)``.
-        src_key_padding_mask:
-            Optional boolean mask of shape ``(batch, time)`` where ``True``
-            indicates padded (ignored) positions.
-        """
+        """Encode the temporal sequence."""
 
         return self.encoder(sequence, src_key_padding_mask=src_key_padding_mask)
 
 
-class TextDecoderStub(nn.Module):
-    """Minimal decoder that aggregates encoder outputs.
+class TextSeq2SeqDecoder(nn.Module):
+    """Seq2seq decoder backed by :mod:`transformers` models."""
 
-    The stub averages encoder hidden states over the temporal dimension and
-    projects the resulting representation to a vocabulary-sized logits tensor.
-    An optional padding mask can be provided to ignore padded positions when
-    computing the mean.
-    """
-
-    def __init__(self, d_model: int = 512, vocab_size: int = 32_000) -> None:
+    def __init__(
+        self,
+        *,
+        d_model: int = 512,
+        vocab_size: int = 32_000,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        pad_token_id: int = 0,
+        eos_token_id: int = 1,
+        pretrained_model_name_or_path: Optional[str] = None,
+        config: Optional[PretrainedConfig] = None,
+        config_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__()
-        self.lm_head = nn.Linear(d_model, vocab_size)
+
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads for the decoder configuration.")
+
+        self.model = self._build_model(
+            d_model=d_model,
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            config=config,
+            config_kwargs=config_kwargs or {},
+        )
+
+    @staticmethod
+    def _build_model(
+        *,
+        d_model: int,
+        vocab_size: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+        pad_token_id: int,
+        eos_token_id: int,
+        pretrained_model_name_or_path: Optional[str],
+        config: Optional[PretrainedConfig],
+        config_kwargs: Dict[str, Any],
+    ) -> nn.Module:
+        if config is not None:
+            return AutoModelForSeq2SeqLM.from_config(config)
+
+        if pretrained_model_name_or_path is not None:
+            model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_model_name_or_path)
+            hidden_size = getattr(model.config, "d_model", None)
+            if hidden_size is not None and hidden_size != d_model:
+                raise ValueError(
+                    "Loaded model hidden size does not match encoder dimensionality: "
+                    f"expected {d_model}, got {hidden_size}."
+                )
+            return model
+
+        default_config: Dict[str, Any] = {
+            "vocab_size": vocab_size,
+            "d_model": d_model,
+            "d_kv": d_model // num_heads,
+            "d_ff": config_kwargs.pop("d_ff", d_model * 4),
+            "num_layers": num_layers,
+            "num_decoder_layers": config_kwargs.pop("num_decoder_layers", num_layers),
+            "num_heads": num_heads,
+            "dropout_rate": dropout,
+            "layer_norm_epsilon": config_kwargs.pop("layer_norm_epsilon", 1e-6),
+            "initializer_factor": config_kwargs.pop("initializer_factor", 1.0),
+            "pad_token_id": pad_token_id,
+            "eos_token_id": eos_token_id,
+            "decoder_start_token_id": config_kwargs.pop("decoder_start_token_id", pad_token_id),
+        }
+        default_config.update(config_kwargs)
+        t5_config = T5Config(**default_config)
+        return T5ForConditionalGeneration(t5_config)
+
+    @property
+    def config(self) -> PretrainedConfig:  # pragma: no cover - simple property
+        return self.model.config
 
     def forward(
         self,
-        enc_out: Tensor,
-        padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
-        """Project the temporal average of ``enc_out`` into vocabulary logits."""
+        encoder_hidden_states: Tensor,
+        *,
+        encoder_attention_mask: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        decoder_attention_mask: Optional[Tensor] = None,
+        **model_kwargs: Any,
+    ) -> Seq2SeqLMOutput:
+        """Forward pass delegating to the underlying HF model."""
 
-        if padding_mask is None:
-            pooled = enc_out.mean(dim=1)
-        else:
-            if padding_mask.dtype != torch.bool:
-                padding_mask = padding_mask.to(torch.bool)
-            valid_mask = ~padding_mask
-            weights = valid_mask.unsqueeze(-1)
-            summed = (enc_out * weights).sum(dim=1)
-            counts = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            pooled = summed / counts
+        attention_mask = self._prepare_attention_mask(encoder_attention_mask)
+        return self.model(
+            encoder_outputs=BaseModelOutput(last_hidden_state=encoder_hidden_states),
+            attention_mask=attention_mask,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+            **model_kwargs,
+        )
 
-        return self.lm_head(pooled)
+    def generate(
+        self,
+        encoder_hidden_states: Tensor,
+        *,
+        encoder_attention_mask: Optional[Tensor] = None,
+        **generation_kwargs: Any,
+    ) -> torch.LongTensor:
+        """Generate sequences conditioned on the encoder hidden states."""
+
+        attention_mask = self._prepare_attention_mask(encoder_attention_mask)
+        return self.model.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=encoder_hidden_states),
+            attention_mask=attention_mask,
+            **generation_kwargs,
+        )
+
+    @staticmethod
+    def _prepare_attention_mask(mask: Optional[Tensor]) -> Optional[Tensor]:
+        if mask is None:
+            return None
+        if mask.dtype == torch.bool:
+            return mask.to(dtype=torch.long)
+        return mask

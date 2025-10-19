@@ -3,8 +3,8 @@
 
 This script captures frames from a webcam, extracts crops for the face and
 hands using MediaPipe and feeds a temporal window to the :class:`MultiStreamSLT`
-model. The decoder is a placeholder implemented via :class:`TextDecoderStub` and
-therefore the textual output only represents token identifiers.
+model. The decoder is a lightweight seq2seq module and the textual output still
+represents placeholder token identifiers.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ try:  # pragma: no cover - optional dependency for the demo.
 except Exception:  # pragma: no cover - MediaPipe is optional.
     mp = None  # type: ignore
 
-from slt.models import MultiStreamEncoder, TextDecoderStub, ViTConfig
+from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
 
 
 @dataclass
@@ -41,6 +41,10 @@ class DemoConfig:
     temporal_dim_feedforward: int = 2048
     temporal_dropout: float = 0.1
     vocab_size: int = 32_000
+    decoder_layers: int = 1
+    decoder_heads: int = 4
+    decoder_dropout: float = 0.0
+    max_tokens: int = 8
 
 
 class MultiStreamSLT(torch.nn.Module):
@@ -65,7 +69,16 @@ class MultiStreamSLT(torch.nn.Module):
             positional_num_positions=config.sequence_length,
             temporal_kwargs=temporal_kwargs,
         )
-        self.decoder = TextDecoderStub(d_model=config.d_model, vocab_size=config.vocab_size)
+        self.max_tokens = config.max_tokens
+        self.decoder = TextSeq2SeqDecoder(
+            d_model=config.d_model,
+            vocab_size=config.vocab_size,
+            num_layers=config.decoder_layers,
+            num_heads=config.decoder_heads,
+            dropout=config.decoder_dropout,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
 
     def forward(
         self,
@@ -77,7 +90,7 @@ class MultiStreamSLT(torch.nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> torch.LongTensor:
         encoded = self.encoder(
             face,
             hand_l,
@@ -87,10 +100,13 @@ class MultiStreamSLT(torch.nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
         )
-        decoder_mask = None
-        if pad_mask is not None:
-            decoder_mask = ~pad_mask.to(torch.bool)
-        return self.decoder(encoded, padding_mask=decoder_mask)
+        encoder_attention_mask = pad_mask.to(torch.long) if pad_mask is not None else None
+        return self.decoder.generate(
+            encoded,
+            encoder_attention_mask=encoder_attention_mask,
+            max_length=self.max_tokens,
+            num_beams=1,
+        )
 
 
 class TemporalBuffer:
@@ -243,11 +259,17 @@ def extract_pose_vector(result: object, count: int) -> torch.Tensor:
     return torch.from_numpy(pose.reshape(-1))
 
 
-def decode_logits_stub(logits: torch.Tensor) -> str:
-    """Placeholder decoding that maps the argmax token to a label string."""
+def decode_token_ids_stub(sequences: torch.Tensor) -> str:
+    """Placeholder decoding that maps generated token IDs to a label string."""
 
-    token_id = int(torch.argmax(logits, dim=-1).item())
-    return f"<token_{token_id}>"
+    if sequences.dim() == 2:
+        seq = sequences[0]
+    else:
+        seq = sequences
+    for token_id in seq.tolist():
+        if token_id not in (0,):
+            return f"<token_{int(token_id)}>"
+    return "<token_0>"
 
 
 def run_demo(args: argparse.Namespace) -> None:
@@ -357,7 +379,7 @@ def run_demo(args: argparse.Namespace) -> None:
                 inputs = buffer.as_model_inputs(device)
                 if inputs is not None:
                     with torch.no_grad():
-                        logits = model(
+                        sequences = model(
                             face=inputs["face"],
                             hand_l=inputs["hand_l"],
                             hand_r=inputs["hand_r"],
@@ -366,7 +388,7 @@ def run_demo(args: argparse.Namespace) -> None:
                             miss_mask_hl=inputs["miss_mask_hl"],
                             miss_mask_hr=inputs["miss_mask_hr"],
                         )
-                    decoded = decode_logits_stub(logits)
+                    decoded = decode_token_ids_stub(sequences)
                     cv2.putText(
                         frame,
                         decoded,

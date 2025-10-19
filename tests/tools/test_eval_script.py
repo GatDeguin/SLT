@@ -9,6 +9,8 @@ from PIL import Image  # type: ignore
 
 np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
+tokenizers = pytest.importorskip("tokenizers")
+transformers = pytest.importorskip("transformers")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,6 +55,27 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     }
 
 
+@pytest.fixture()
+def tiny_tokenizer_dir(tmp_path: Path) -> Path:
+    save_dir = tmp_path / "tokenizer"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel({"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "hola": 4, "mundo": 5}, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer_path = save_dir / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+
+    hf_tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_file=str(tokenizer_path),
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+    )
+    hf_tokenizer.save_pretrained(save_dir)
+    return save_dir
+
+
 def _load_eval_module():
     module_path = PROJECT_ROOT / "tools" / "eval_slt_multistream_v9.py"
     spec = importlib.util.spec_from_file_location("eval_slt_multistream_v9", module_path)
@@ -62,7 +85,9 @@ def _load_eval_module():
     return module
 
 
-def test_eval_script_generates_stub_csv(tmp_path: Path, synthetic_dataset: dict) -> None:
+def test_eval_script_generates_stub_csv(
+    tmp_path: Path, synthetic_dataset: dict, tiny_tokenizer_dir: Path
+) -> None:
     module = _load_eval_module()
 
     config = module.ModelConfig(
@@ -76,10 +101,13 @@ def test_eval_script_generates_stub_csv(tmp_path: Path, synthetic_dataset: dict)
         temporal_layers=1,
         temporal_dim_feedforward=128,
         temporal_dropout=0.0,
-        vocab_size=16,
         sequence_length=4,
+        decoder_layers=1,
+        decoder_heads=2,
+        decoder_dropout=0.0,
     )
-    model = module.MultiStreamClassifier(config)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir))
+    model = module.MultiStreamClassifier(config, tokenizer)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save({"model_state": model.state_dict()}, checkpoint_path)
@@ -119,10 +147,18 @@ def test_eval_script_generates_stub_csv(tmp_path: Path, synthetic_dataset: dict)
         "128",
         "--temporal-dropout",
         "0.0",
-        "--vocab-size",
-        "16",
         "--sequence-length",
         "4",
+        "--decoder-layers",
+        "1",
+        "--decoder-heads",
+        "2",
+        "--decoder-dropout",
+        "0.0",
+        "--tokenizer",
+        str(tiny_tokenizer_dir),
+        "--max-target-length",
+        "6",
         "--batch-size",
         "1",
         "--device",
@@ -141,4 +177,5 @@ def test_eval_script_generates_stub_csv(tmp_path: Path, synthetic_dataset: dict)
     assert rows[0] == ["video_id", "prediction"]
     assert len(rows) == 2
     assert rows[1][0] == "vid001"
-    assert rows[1][1].startswith("token_")
+    assert isinstance(rows[1][1], str)
+    assert rows[1][1] != ""
