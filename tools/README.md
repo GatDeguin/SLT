@@ -15,3 +15,8 @@ paquete y `mediapipe` se declara como extra opcional bajo el grupo
 otras utilidades que dependen de los detectores de MediaPipe. El extra
 `export` instala `onnx`, necesario para generar modelos en formato ONNX con
 `export_onnx_encoder_v9.py`.
+
+## Demos y pruebas offline
+
+- `demo_realtime_multistream.py` depende de MediaPipe para la detección de rostro/manos/pose y de una GPU con CUDA para alcanzar FPS en tiempo real (puede ejecutarse en CPU con menor rendimiento). Admite modelos TorchScript y ONNX exportados desde el pipeline de entrenamiento y opcionalmente un tokenizador de HuggingFace para decodificar texto.
+- `test_realtime_pipeline.py` reutiliza el mismo pipeline sobre videos pregrabados. Puede generar un video anotado (`--output`) y resulta útil para depurar cambios sin requerir una cámara física.
