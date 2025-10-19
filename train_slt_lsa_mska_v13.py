@@ -426,9 +426,27 @@ class KP2Text(nn.Module):
         key_pad: (B,T) True=pad
         """
         mem = self.encode(x, key_pad)  # (B,T,d_model)
+
+        # Hugging Face espera labels con pads marcados como -100 para ignorarlos
+        # en el cálculo de la loss. Mantener los pads como ids válidos provocaba
+        # que CrossEntropyLoss recibiera secuencias sin tokens válidos (todo pad)
+        # y devolviera NaN, lo que disparaba la lógica de "skipped steps" en el
+        # loop de entrenamiento. Al reemplazar los pads por -100 evitamos esa
+        # ruta numéricamente inestable y conservamos los ids originales para
+        # las métricas porque operamos sobre una copia.
+        labels = y_pad
+        pad_id = getattr(self.tok, 'pad_token_id', None)
+        if pad_id is not None:
+            labels = labels.masked_fill(labels == pad_id, -100)
+
+        # También informamos al decoder qué posiciones del encoder son válidas
+        # para que no atienda sobre padding inútil.
+        enc_mask = (~key_pad).to(mem.device, dtype=torch.long)
+
         out = self.decoder(
             encoder_outputs=BaseModelOutput(last_hidden_state=mem),
-            labels=y_pad,
+            encoder_attention_mask=enc_mask,
+            labels=labels,
         )
         return out
 
