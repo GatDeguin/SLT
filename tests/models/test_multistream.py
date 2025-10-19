@@ -115,6 +115,105 @@ def test_missing_hand_masks_trigger_hook() -> None:
         assert mask.shape == (batch, time)
 
 
+def test_missing_hand_frames_affect_only_masked_positions() -> None:
+    config = _tiny_vit_config()
+    model = MultiStreamEncoder(
+        backbone_config=config,
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+
+    dim = 6
+
+    def fake_encode(self, backbone, stream):
+        return stream
+
+    model._encode_backbone = types.MethodType(fake_encode, model)
+
+    class Identity(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    class ZeroProjector(torch.nn.Module):
+        def __init__(self, dim: int) -> None:
+            super().__init__()
+            self.dim = dim
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            shape = x.shape[:-1] + (self.dim,)
+            return torch.zeros(shape, dtype=x.dtype, device=x.device)
+
+    class DummyFusion(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.received_masks = []
+
+        def forward(self, *streams, mask=None):
+            self.received_masks.append(mask)
+            total = torch.zeros_like(streams[0])
+            for stream in streams:
+                total = total + stream
+            return total
+
+    class TemporalIdentity(torch.nn.Module):
+        def forward(self, sequence, src_key_padding_mask=None):
+            return sequence
+
+    model.face_projector = ZeroProjector(dim)
+    model.hand_left_projector = Identity()
+    model.hand_right_projector = Identity()
+    model.pose_projector = ZeroProjector(dim)
+    model.fusion = DummyFusion()
+    model.positional = Identity()
+    model.temporal = TemporalIdentity()
+
+    batch, time = 1, 4
+    face = torch.zeros(batch, time, dim)
+    hand_l = torch.randn(batch, time, dim)
+    hand_r = torch.randn(batch, time, dim)
+    pose = torch.zeros(batch, time, 39)
+
+    baseline = model(
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        pad_mask=None,
+        miss_mask_hl=None,
+        miss_mask_hr=None,
+    )
+
+    miss_hl = torch.tensor([[True, False, False, False]])
+    miss_hr = torch.tensor([[False, False, True, False]])
+
+    masked = model(
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        pad_mask=None,
+        miss_mask_hl=miss_hl,
+        miss_mask_hr=miss_hr,
+    )
+
+    combined_mask = miss_hl | miss_hr
+
+    assert model._last_combined_hand_mask is not None
+    assert torch.equal(model._last_combined_hand_mask, combined_mask)
+    assert model.fusion.received_masks[-1] is not None
+    assert torch.equal(model.fusion.received_masks[-1], combined_mask)
+
+    delta = torch.abs(masked - baseline)
+    unchanged = combined_mask.logical_not().unsqueeze(-1).expand_as(delta)
+    changed = combined_mask.unsqueeze(-1).expand_as(delta)
+
+    assert torch.all(delta[unchanged] < 1e-6)
+    assert torch.any(delta[changed] > 1e-6)
+
+
 def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
     config = _tiny_vit_config()
 
