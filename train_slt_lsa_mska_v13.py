@@ -445,7 +445,7 @@ class KP2Text(nn.Module):
 
         out = self.decoder(
             encoder_outputs=BaseModelOutput(last_hidden_state=mem),
-            encoder_attention_mask=enc_mask,
+            attention_mask=enc_mask,
             labels=labels,
         )
         return out
