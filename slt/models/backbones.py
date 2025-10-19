@@ -2,11 +2,178 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
+
+try:  # pragma: no cover - optional dependency.
+    from huggingface_hub import hf_hub_download  # type: ignore
+except Exception:  # pragma: no cover - the dependency is optional.
+    hf_hub_download = None  # type: ignore
+
+
+BackboneFreeze = Union[bool, Iterable[str]]
+
+
+def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
+    """Freeze parameters in ``module`` based on ``freeze`` specification."""
+
+    if isinstance(freeze, bool):
+        if not freeze:
+            return
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+        return
+
+    prefixes = tuple(freeze)
+    if not prefixes:
+        return
+    for name, parameter in module.named_parameters():
+        if name.startswith(prefixes):
+            parameter.requires_grad_(False)
+
+
+def _load_checkpoint(checkpoint: object, backbone: nn.Module) -> None:
+    """Load a checkpoint into ``backbone`` supporting common formats."""
+
+    if isinstance(checkpoint, nn.Module):
+        state_dict = checkpoint.state_dict()
+    elif isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint  # type: ignore[assignment]
+    else:
+        raise TypeError(
+            "Unsupported checkpoint type. Expected an nn.Module or state_dict dictionary."
+        )
+
+    missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        warnings.warn(
+            "Checkpoint loading reported missing or unexpected keys. "
+            f"Missing keys: {missing}; unexpected keys: {unexpected}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
+    """Parse a ``load_dinov2_backbone`` specification string."""
+
+    if "::" in spec:
+        source, remainder = spec.split("::", 1)
+    else:
+        source, remainder = "torchhub", spec
+    source = source.lower()
+
+    if source == "torchhub":
+        parts = [part for part in remainder.split(":") if part]
+        if not parts:
+            raise ValueError("Torch Hub specification must include a model name")
+        if len(parts) == 1:
+            repo = "facebookresearch/dinov2"
+            model = parts[0]
+        elif len(parts) == 2:
+            repo, model = parts
+        else:
+            raise ValueError(
+                "Torch Hub specification must follow 'repo:model' format; "
+                f"received {remainder!r}"
+            )
+        return source, {"repo": repo, "model": model}
+
+    if source in {"hf", "huggingface"}:
+        parts = [part for part in remainder.split(":") if part]
+        if not parts:
+            raise ValueError(
+                "HuggingFace specification must provide at least the repository id"
+            )
+        if len(parts) == 1:
+            repo_id = parts[0]
+            filename = "pytorch_model.bin"
+            model = "dinov2_vits14"
+        elif len(parts) == 2:
+            repo_id, filename = parts
+            model = "dinov2_vits14"
+        elif len(parts) == 3:
+            repo_id, filename, model = parts
+        else:
+            raise ValueError(
+                "HuggingFace specification must follow 'repo_id:filename:model' format"
+            )
+        return "hf", {"repo_id": repo_id, "filename": filename, "model": model}
+
+    if source in {"file", "local"}:
+        if not remainder:
+            raise ValueError("File specification must include a checkpoint path")
+        if ":" in remainder:
+            path, model = remainder.split(":", 1)
+        else:
+            path = remainder
+            model = "dinov2_vits14"
+        return "file", {"path": path, "model": model}
+
+    raise ValueError(
+        "Backbone specification must start with 'torchhub::', 'hf::' or 'file::'."
+    )
+
+
+def load_dinov2_backbone(
+    spec: str,
+    *,
+    freeze: BackboneFreeze = False,
+    map_location: Optional[Union[str, torch.device]] = None,
+    trust_repo: bool = True,
+) -> nn.Module:
+    """Load a DINOv2 backbone from Torch Hub, HuggingFace or local checkpoints."""
+
+    source, parsed = _parse_backbone_spec(spec)
+
+    if source == "torchhub":
+        repo = parsed["repo"]
+        model = parsed["model"]
+        backbone = torch.hub.load(repo, model, pretrained=True, trust_repo=trust_repo)
+        _apply_freeze(backbone, freeze)
+        return backbone
+
+    if source == "hf":
+        if hf_hub_download is None:
+            raise ImportError(
+                "huggingface_hub must be installed to download checkpoints from HuggingFace"
+            )
+        repo_id = parsed["repo_id"]
+        filename = parsed["filename"]
+        model = parsed["model"]
+        checkpoint_path = hf_hub_download(repo_id, filename)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
+        backbone = torch.hub.load(
+            "facebookresearch/dinov2", model, pretrained=False, trust_repo=trust_repo
+        )
+        _load_checkpoint(checkpoint, backbone)
+        _apply_freeze(backbone, freeze)
+        return backbone
+
+    if source == "file":
+        checkpoint_path = Path(parsed["path"]).expanduser().resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
+        backbone = torch.hub.load(
+            "facebookresearch/dinov2",
+            parsed["model"],
+            pretrained=False,
+            trust_repo=trust_repo,
+        )
+        _load_checkpoint(checkpoint, backbone)
+        _apply_freeze(backbone, freeze)
+        return backbone
+
+    raise RuntimeError(f"Unsupported backbone source: {source}")
 
 
 @dataclass

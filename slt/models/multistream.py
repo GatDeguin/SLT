@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import torch
 from torch import Tensor
@@ -29,15 +29,23 @@ class MultiStreamEncoder(torch.nn.Module):
         fusion_dropout: float = 0.0,
         fusion_bias: bool = True,
         temporal_kwargs: Optional[Dict[str, Any]] = None,
+        backbones: Optional[Mapping[str, torch.nn.Module]] = None,
     ) -> None:
         super().__init__()
         temporal_kwargs = temporal_kwargs or {}
 
-        self.face_backbone = ViTSmallPatch16(backbone_config)
-        self.hand_backbone_left = ViTSmallPatch16(backbone_config)
-        self.hand_backbone_right = ViTSmallPatch16(backbone_config)
+        backbones = backbones or {}
+        self.face_backbone = self._resolve_backbone(
+            backbones, "face", backbone_config
+        )
+        self.hand_backbone_left = self._resolve_backbone(
+            backbones, "hand_left", backbone_config
+        )
+        self.hand_backbone_right = self._resolve_backbone(
+            backbones, "hand_right", backbone_config
+        )
 
-        backbone_dim = self.face_backbone.config.embed_dim
+        backbone_dim = self._infer_backbone_dim(self.face_backbone)
 
         self.face_projector = StreamProjector(
             backbone_dim, projector_dim, dropout=projector_dropout
@@ -93,7 +101,7 @@ class MultiStreamEncoder(torch.nn.Module):
         return encoded
 
     @staticmethod
-    def _encode_backbone(backbone: ViTSmallPatch16, stream: Tensor) -> Tensor:
+    def _encode_backbone(backbone: torch.nn.Module, stream: Tensor) -> Tensor:
         if stream.dim() != 5:
             raise ValueError(
                 "Backbone inputs must have shape (batch, time, channels, height, width)."
@@ -128,6 +136,29 @@ class MultiStreamEncoder(torch.nn.Module):
         self, features: Tensor, mask: Tensor, *, stream: str
     ) -> Tensor:  # pragma: no cover - extension hook
         return features
+
+    @staticmethod
+    def _resolve_backbone(
+        backbones: Mapping[str, torch.nn.Module],
+        stream: str,
+        config: Optional[ViTConfig],
+    ) -> torch.nn.Module:
+        backbone = backbones.get(stream)
+        if backbone is None:
+            backbone = ViTSmallPatch16(config)
+        if hasattr(backbone, "as_backbone") and callable(backbone.as_backbone):
+            backbone = backbone.as_backbone()  # type: ignore[assignment]
+        return backbone
+
+    @staticmethod
+    def _infer_backbone_dim(backbone: torch.nn.Module) -> int:
+        if hasattr(backbone, "config") and hasattr(backbone.config, "embed_dim"):
+            return int(backbone.config.embed_dim)
+        if hasattr(backbone, "embed_dim"):
+            return int(getattr(backbone, "embed_dim"))
+        if hasattr(backbone, "num_features"):
+            return int(getattr(backbone, "num_features"))
+        raise AttributeError("Unable to infer backbone embedding dimension")
 
     @staticmethod
     def _ensure_pose_shape(pose: Tensor) -> Tensor:
