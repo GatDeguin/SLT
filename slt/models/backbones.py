@@ -5,7 +5,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -15,8 +15,15 @@ try:  # pragma: no cover - optional dependency.
 except Exception:  # pragma: no cover - the dependency is optional.
     hf_hub_download = None  # type: ignore
 
+try:  # pragma: no cover - optional dependency.
+    from torchvision.models import get_model as tv_get_model  # type: ignore
+    from torchvision.models import get_model_weights as tv_get_model_weights  # type: ignore
+except Exception:  # pragma: no cover - optional dependency.
+    tv_get_model = None  # type: ignore
+    tv_get_model_weights = None  # type: ignore
 
-BackboneFreeze = Union[bool, Iterable[str]]
+
+BackboneFreeze = Union[bool, int, str, Iterable[str]]
 
 
 def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
@@ -29,6 +36,36 @@ def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
             parameter.requires_grad_(False)
         return
 
+    if isinstance(freeze, int):
+        _freeze_first_blocks(module, freeze)
+        return
+
+    if isinstance(freeze, str):
+        directives = [part.strip() for part in freeze.replace(";", ",").split(",") if part.strip()]
+        if not directives:
+            return
+        for directive in directives:
+            if directive.lower() in {"all", "full", "backbone"}:
+                _apply_freeze(module, True)
+                continue
+            if directive.lower() in {"embed", "patch", "patch_embed"}:
+                _freeze_patch_embed(module)
+                continue
+            if directive.lower() in {"head", "classifier"}:
+                _freeze_head(module)
+                continue
+            if directive.startswith("blocks[:") and directive.endswith("]"):
+                count_str = directive[len("blocks[:") : -1]
+                try:
+                    count = int(count_str)
+                except ValueError as exc:  # pragma: no cover - defensive.
+                    raise ValueError(f"Invalid block freeze specification: {directive!r}") from exc
+                _freeze_first_blocks(module, count)
+                continue
+            # Fallback to prefix-based freezing for unknown directives.
+            _apply_freeze(module, [directive])
+        return
+
     prefixes = tuple(freeze)
     if not prefixes:
         return
@@ -37,20 +74,69 @@ def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
             parameter.requires_grad_(False)
 
 
-def _load_checkpoint(checkpoint: object, backbone: nn.Module) -> None:
+def _freeze_first_blocks(module: nn.Module, count: int) -> None:
+    if count <= 0:
+        return
+    blocks = getattr(module, "blocks", None)
+    if blocks is None:
+        raise AttributeError(
+            "Backbone does not expose a 'blocks' attribute required for block freezing"
+        )
+    frozen = 0
+    for block in blocks:
+        if frozen >= count:
+            break
+        for parameter in block.parameters():
+            parameter.requires_grad_(False)
+        frozen += 1
+
+
+def _freeze_patch_embed(module: nn.Module) -> None:
+    for attr in ("patch_embed", "patch_embedding", "stem"):
+        submodule = getattr(module, attr, None)
+        if isinstance(submodule, nn.Module):
+            for parameter in submodule.parameters():
+                parameter.requires_grad_(False)
+        elif isinstance(submodule, Tensor):
+            submodule.requires_grad_(False)
+    for attr in ("pos_embed", "position_embedding", "cls_token", "class_token"):
+        value = getattr(module, attr, None)
+        if isinstance(value, nn.Parameter):
+            value.requires_grad_(False)
+
+
+def _freeze_head(module: nn.Module) -> None:
+    for attr in ("head", "mlp_head", "linear_head", "classifier"):
+        head_module = getattr(module, attr, None)
+        if isinstance(head_module, nn.Module):
+            for parameter in head_module.parameters():
+                parameter.requires_grad_(False)
+
+
+def _load_checkpoint(
+    checkpoint: object,
+    backbone: nn.Module,
+    *,
+    convert: Optional[callable] = None,
+) -> None:
     """Load a checkpoint into ``backbone`` supporting common formats."""
 
     if isinstance(checkpoint, nn.Module):
         state_dict = checkpoint.state_dict()
-    elif isinstance(checkpoint, dict):
-        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+    elif isinstance(checkpoint, Mapping):
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], Mapping):
             state_dict = checkpoint["state_dict"]
+        elif "model" in checkpoint and isinstance(checkpoint["model"], Mapping):
+            state_dict = checkpoint["model"]
         else:
             state_dict = checkpoint  # type: ignore[assignment]
     else:
         raise TypeError(
             "Unsupported checkpoint type. Expected an nn.Module or state_dict dictionary."
         )
+
+    if convert is not None:
+        state_dict = convert(state_dict)
 
     missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
@@ -62,30 +148,51 @@ def _load_checkpoint(checkpoint: object, backbone: nn.Module) -> None:
         )
 
 
+def _convert_dinov2_state_dict(state_dict: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
+    """Convert HuggingFace/local checkpoints to ``torchvision`` naming."""
+
+    converted: dict[str, Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in ("model.", "module.", "state_dict.", "backbone."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        if new_key.startswith("encoder."):
+            new_key = new_key[len("encoder.") :]
+        if new_key.startswith("linear_head."):
+            new_key = "head." + new_key[len("linear_head.") :]
+        if new_key.startswith("head.head."):
+            new_key = new_key[len("head.") :]
+        if new_key.startswith("trunk."):
+            new_key = new_key[len("trunk.") :]
+        converted[new_key] = value
+    return converted
+
+
 def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
     """Parse a ``load_dinov2_backbone`` specification string."""
 
     if "::" in spec:
         source, remainder = spec.split("::", 1)
     else:
-        source, remainder = "torchhub", spec
+        source, remainder = "torchvision", spec
     source = source.lower()
 
-    if source == "torchhub":
+    if source in {"torchhub", "torchvision", "tv"}:
         parts = [part for part in remainder.split(":") if part]
         if not parts:
-            raise ValueError("Torch Hub specification must include a model name")
+            raise ValueError("Torchvision specification must include a model name")
+        model = parts[0]
         if len(parts) == 1:
-            repo = "facebookresearch/dinov2"
-            model = parts[0]
+            weight = "default"
         elif len(parts) == 2:
-            repo, model = parts
+            weight = parts[1]
         else:
             raise ValueError(
-                "Torch Hub specification must follow 'repo:model' format; "
+                "Torchvision specification must follow 'model' or 'model:weights' format; "
                 f"received {remainder!r}"
             )
-        return source, {"repo": repo, "model": model}
+        return "torchvision", {"model": model, "weights": weight}
 
     if source in {"hf", "huggingface"}:
         parts = [part for part in remainder.split(":") if part]
@@ -134,10 +241,20 @@ def load_dinov2_backbone(
 
     source, parsed = _parse_backbone_spec(spec)
 
-    if source == "torchhub":
-        repo = parsed["repo"]
-        model = parsed["model"]
-        backbone = torch.hub.load(repo, model, pretrained=True, trust_repo=trust_repo)
+    if source == "torchvision":
+        if tv_get_model is None or tv_get_model_weights is None:
+            raise ImportError(
+                "torchvision>=0.16 is required to load DINOv2 backbones via the torchvision API"
+            )
+        model_name = parsed["model"]
+        weights_spec = parsed.get("weights", "default")
+        weights = _resolve_torchvision_weights(model_name, weights_spec)
+        try:
+            backbone = tv_get_model(model_name, weights=weights)
+        except Exception as exc:  # pragma: no cover - defensive.
+            raise RuntimeError(
+                f"Unable to instantiate torchvision model '{model_name}': {exc}"
+            ) from exc
         _apply_freeze(backbone, freeze)
         return backbone
 
@@ -151,10 +268,8 @@ def load_dinov2_backbone(
         model = parsed["model"]
         checkpoint_path = hf_hub_download(repo_id, filename)
         checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        backbone = torch.hub.load(
-            "facebookresearch/dinov2", model, pretrained=False, trust_repo=trust_repo
-        )
-        _load_checkpoint(checkpoint, backbone)
+        backbone = _build_torchvision_model(model)
+        _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
         _apply_freeze(backbone, freeze)
         return backbone
 
@@ -163,17 +278,52 @@ def load_dinov2_backbone(
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        backbone = torch.hub.load(
-            "facebookresearch/dinov2",
-            parsed["model"],
-            pretrained=False,
-            trust_repo=trust_repo,
-        )
-        _load_checkpoint(checkpoint, backbone)
+        backbone = _build_torchvision_model(parsed["model"])
+        _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
         _apply_freeze(backbone, freeze)
         return backbone
 
     raise RuntimeError(f"Unsupported backbone source: {source}")
+
+
+def _resolve_torchvision_weights(model_name: str, spec: str | None) -> Optional[object]:
+    if tv_get_model_weights is None:
+        return None
+    if spec is None or spec.lower() in {"", "none", "random"}:
+        return None
+    try:
+        weights_enum = tv_get_model_weights(model_name)
+    except Exception as exc:  # pragma: no cover - defensive.
+        raise RuntimeError(
+            f"Unable to retrieve torchvision weights for '{model_name}': {exc}"
+        ) from exc
+
+    if spec.lower() in {"default", "pretrained"}:
+        return getattr(weights_enum, "DEFAULT", None)
+
+    candidate = spec.upper()
+    if not candidate.endswith("_V1") and candidate not in weights_enum.__dict__:
+        alt = f"{candidate}_V1"
+        if hasattr(weights_enum, alt):
+            candidate = alt
+
+    if hasattr(weights_enum, candidate):
+        return getattr(weights_enum, candidate)
+
+    raise ValueError(f"Unknown weight specification '{spec}' for model '{model_name}'")
+
+
+def _build_torchvision_model(model_name: str) -> nn.Module:
+    if tv_get_model is None:
+        raise ImportError(
+            "torchvision>=0.16 is required to instantiate DINOv2 models from checkpoints"
+        )
+    try:
+        return tv_get_model(model_name, weights=None)
+    except Exception as exc:  # pragma: no cover - defensive.
+        raise RuntimeError(
+            f"Unable to instantiate torchvision model '{model_name}' without weights: {exc}"
+        ) from exc
 
 
 @dataclass

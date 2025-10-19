@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import inspect
-
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+import warnings
+from collections import defaultdict
+from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -71,6 +72,10 @@ class MultiStreamEncoder(torch.nn.Module):
         self.positional = PositionalEncodingLearned(positional_num_positions, d_model)
         self.temporal = TemporalEncoder(d_model=d_model, **temporal_kwargs)
         self._last_combined_hand_mask: Optional[Tensor] = None
+        self._last_padding_mask: Optional[Tensor] = None
+        self._observers: DefaultDict[str, list[Callable[[str, Tensor], None]]] = defaultdict(list)
+
+        self._auto_configure_components()
 
     def forward(
         self,
@@ -85,6 +90,7 @@ class MultiStreamEncoder(torch.nn.Module):
         """Encode multi-stream inputs returning a temporal sequence tensor."""
 
         face_feats = self._encode_backbone(self.face_backbone, face)
+        self._emit("face.backbone", face_feats)
         hand_l_feats = self._encode_backbone(self.hand_backbone_left, hand_l)
         hand_r_feats = self._encode_backbone(self.hand_backbone_right, hand_r)
 
@@ -94,23 +100,130 @@ class MultiStreamEncoder(torch.nn.Module):
         hand_r_feats, hand_r_mask = self._apply_missing_mask(
             hand_r_feats, miss_mask_hr, stream="hand_right"
         )
+        self._emit("hand.left.backbone", hand_l_feats)
+        self._emit("hand.right.backbone", hand_r_feats)
 
         face_proj = self.face_projector(face_feats)
         hand_l_proj = self.hand_left_projector(hand_l_feats)
         hand_r_proj = self.hand_right_projector(hand_r_feats)
         pose_proj = self.pose_projector(self._ensure_pose_shape(pose))
+        self._emit("pose.projector", pose_proj)
 
         combined_hand_mask = self._combine_missing_masks(hand_l_mask, hand_r_mask)
         self._last_combined_hand_mask = combined_hand_mask
+        if combined_hand_mask is not None:
+            self._emit("hand.mask", combined_hand_mask.to(torch.float32))
 
         fused = self._call_fusion(
             (face_proj, hand_l_proj, hand_r_proj, pose_proj), combined_hand_mask
         )
+        self._emit("fusion.output", fused)
         fused = self.positional(fused)
 
         src_key_padding_mask = self._convert_padding_mask(pad_mask)
+        self._last_padding_mask = src_key_padding_mask
+        if src_key_padding_mask is not None:
+            self._emit("pad.mask", src_key_padding_mask.to(torch.float32))
         encoded = self.temporal(fused, src_key_padding_mask=src_key_padding_mask)
+        self._emit("temporal.output", encoded)
         return encoded
+
+    # ------------------------------------------------------------------
+    # Observer API
+    # ------------------------------------------------------------------
+    def register_observer(self, name: str, hook: Callable[[str, Tensor], None]) -> None:
+        """Register an observer that receives telemetry for ``name``."""
+
+        self._observers[name].append(hook)
+
+    def remove_observer(self, name: str, hook: Callable[[str, Tensor], None]) -> None:
+        """Remove a previously registered observer."""
+
+        hooks = self._observers.get(name)
+        if not hooks:
+            return
+        try:
+            hooks.remove(hook)
+        except ValueError:  # pragma: no cover - defensive.
+            return
+        if not hooks:
+            self._observers.pop(name, None)
+
+    def clear_observers(self, name: Optional[str] = None) -> None:
+        """Remove observers globally or for ``name``."""
+
+        if name is None:
+            self._observers.clear()
+        else:
+            self._observers.pop(name, None)
+
+    @property
+    def last_combined_hand_mask(self) -> Optional[Tensor]:
+        """Return the most recent combined hand mask."""
+
+        return self._last_combined_hand_mask
+
+    @property
+    def last_padding_mask(self) -> Optional[Tensor]:
+        """Return the most recent padding mask used during attention."""
+
+        return self._last_padding_mask
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _emit(self, name: str, tensor: Tensor) -> None:
+        hooks = self._observers.get(name)
+        if not hooks:
+            return
+        for hook in list(hooks):
+            try:
+                hook(name, tensor)
+            except Exception as exc:  # pragma: no cover - telemetry hooks shouldn't raise
+                warnings.warn(
+                    f"Observer for '{name}' raised an exception: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+    def _auto_configure_components(self) -> None:
+        projector_context = (
+            (self.face_projector, self.face_backbone),
+            (self.hand_left_projector, self.hand_backbone_left),
+            (self.hand_right_projector, self.hand_backbone_right),
+            (self.pose_projector, None),
+        )
+        for module, backbone in projector_context:
+            self._maybe_install_dinov2(module, backbone)
+        self._maybe_install_dinov2(self.fusion, None)
+        self._maybe_install_dinov2(self.positional, self.face_backbone)
+
+    def _maybe_install_dinov2(
+        self, module: torch.nn.Module, backbone: Optional[torch.nn.Module]
+    ) -> None:
+        if not hasattr(module, "replace_with_dinov2"):
+            return
+        replace = getattr(module, "replace_with_dinov2")
+        if not callable(replace):
+            return
+        signature = inspect.signature(replace)  # type: ignore[arg-type]
+        kwargs: Dict[str, Any] = {}
+        if "backbone" in signature.parameters and backbone is None:
+            return
+        if "backbone" in signature.parameters and backbone is not None:
+            kwargs["backbone"] = backbone
+        try:
+            replace(**kwargs)
+        except TypeError:
+            # The implementation might expect additional arguments (e.g. variant).
+            # In that case we silently skip auto-configuration and rely on manual wiring.
+            return
+        except (RuntimeError, ImportError, ValueError) as exc:
+            warnings.warn(
+                f"Unable to configure {module.__class__.__name__} with DINOv2 weights: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     @staticmethod
     def _encode_backbone(backbone: torch.nn.Module, stream: Tensor) -> Tensor:
@@ -188,7 +301,13 @@ class MultiStreamEncoder(torch.nn.Module):
                 mask = mask.to(device=target_device)
             if self._fusion_accepts_mask():
                 return self.fusion(*streams, mask=mask)
-        return self.fusion(*streams)
+        fused = self.fusion(*streams)
+        if mask is not None and not self._fusion_accepts_mask():
+            mask_bool = mask.to(device=fused.device, dtype=torch.bool)
+            while mask_bool.dim() < fused.dim():
+                mask_bool = mask_bool.unsqueeze(-1)
+            fused = fused.masked_fill(mask_bool, 0)
+        return fused
 
     def _fusion_accepts_mask(self) -> bool:
         forward = self.fusion.forward  # type: ignore[assignment]
@@ -238,4 +357,8 @@ class MultiStreamEncoder(torch.nn.Module):
         if mask is None:
             return None
         mask_bool = mask.to(dtype=torch.bool)
+        while mask_bool.dim() < 2:
+            mask_bool = mask_bool.unsqueeze(0)
+        if mask_bool.dim() > 2:
+            mask_bool = mask_bool.view(mask_bool.shape[0], -1)
         return ~mask_bool
