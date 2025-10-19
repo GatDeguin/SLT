@@ -84,3 +84,22 @@ facilitar la reproducibilidad.
 * Los textos del dataset se tokenizan con el tokenizer indicado por
   `--tokenizer`. Las etiquetas utilizan `-100` en posiciones de padding para
   ser ignoradas por la pérdida.
+
+## Evaluación y despliegue
+
+Tras entrenar el modelo, evalúa el checkpoint con `tools/eval_slt_multistream_v9.py`
+para obtener métricas de pérdida, CER y BLEU:
+
+```bash
+python tools/eval_slt_multistream_v9.py \
+  --checkpoint work_dirs/multistream_v9/best.pt \
+  --face-dir data/rois/face \
+  --metadata-csv data/lsa_t/subs.csv \
+  --index data/lsa_t/index/test.csv \
+  --tokenizer hf-internal-testing/tiny-random-T5
+```
+
+Para desplegar únicamente el encoder, genera artefactos ONNX/TorchScript con
+`tools/export_onnx_encoder_v9.py` y valida el resultado en `tools/demo_realtime_multistream.py`
+o `tools/test_realtime_pipeline.py`. Estos pasos están automatizados en los tests
+(`tests/test_export.py`) y en el flujo de CI descrito en el `README.md`.

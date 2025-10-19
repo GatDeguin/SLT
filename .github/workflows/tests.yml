@@ -1,4 +1,4 @@
-name: Tests
+name: CI
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  pytest:
+  quality:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -22,5 +22,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-dev.txt
+      - name: Ruff lint
+        run: ruff check .
+      - name: Black formatting check
+        run: black --check .
+      - name: Type checking
+        run: mypy .
       - name: Run tests
         run: pytest --cov=slt --cov-report=term-missing
+      - name: Export smoke test
+        run: python -m pytest tests/test_export.py::test_main_export_generates_onnx_and_torchscript
