@@ -62,3 +62,11 @@ por modelos de producción:
 
 Una vez actualizados estos módulos, la demo servirá como punto de partida para
 un pipeline de entrenamiento completo con pesos reales.
+
+## Preentrenamiento con DINO/iBOT
+
+Los scripts `tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py`
+permiten generar pesos auto-supervisados compatibles con
+`load_dinov2_backbone`. Consulta la guía en `docs/pretraining.md` para conocer
+las opciones disponibles (DINO/iBOT, *multi-crop*, *EMA*, exportación de
+backbones) y cómo integrarlos con `MultiStreamEncoder`.

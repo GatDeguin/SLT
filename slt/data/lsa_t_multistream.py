@@ -384,6 +384,11 @@ class LsaTMultiStream(Dataset):
         positives = [v for v in lengths.values() if v > 0]
         if not positives:
             return 0
+        if any(v == 0 for v in lengths.values()):
+            face_length = lengths.get("face", 0)
+            if face_length > 0:
+                return min(face_length, self.T)
+            return min(max(positives), self.T)
         return min(min(positives), self.T)
 
     def _frame_indices(self, frames: List[str]) -> List[int]:
