@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 import torch
+from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
 
@@ -159,6 +160,8 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
             output_names=["encoded"],
             dynamic_axes=dynamic_axes,
             opset_version=args.opset,
+            fallback=True,
+            operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
         )
 
 

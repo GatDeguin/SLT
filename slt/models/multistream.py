@@ -67,7 +67,6 @@ class MultiStreamEncoder(torch.nn.Module):
         hand_l: Tensor,
         hand_r: Tensor,
         pose: Tensor,
-        *,
         pad_mask: Optional[Tensor] = None,
         miss_mask_hl: Optional[Tensor] = None,
         miss_mask_hr: Optional[Tensor] = None,
