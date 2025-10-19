@@ -682,6 +682,8 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
         y_pad = y_pad.to(device)
         key_pad = key_pad.to(device)
 
+        did_backward = False
+
         with _autocast_context(device_type=device_type, use_amp=use_amp):
             out = model(xs, lens, y_pad, key_pad)
             loss = out.loss
@@ -690,10 +692,10 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
             skipped += 1
             plog(f"[WARN] Paso omitido: loss no finito (valor={float(loss.detach().cpu())}).")
             opt.zero_grad(set_to_none=True)
-            scaler.update()
             continue
 
         scaler.scale(loss).backward()
+        did_backward = True
 
         # Desescalar siempre antes de inspeccionar gradientes
         scaler.unscale_(opt)
@@ -724,7 +726,8 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
                 msg = "gradientes no finitos detectados"
             plog(f"[WARN] Paso omitido: {msg}.")
             opt.zero_grad(set_to_none=True)
-            scaler.update()
+            if did_backward:
+                scaler.update()
             continue
 
         prev_step = getattr(opt, '_step_count', 0)
