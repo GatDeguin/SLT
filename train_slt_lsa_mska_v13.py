@@ -23,6 +23,7 @@ import os, re, math, json, argparse, random, warnings
 from functools import partial
 import os.path as osp
 from typing import List, Tuple, Dict, Optional
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -575,6 +576,58 @@ def prepare_rows(csv_path: str, csv_delim: str, kp_map: Dict[str, str], fps: flo
 # Entrenamiento / Validación
 # ---------------------------
 
+class _NullGradScaler:
+    """Minimal GradScaler compatible shim used when AMP is disabled."""
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, opt):
+        opt.step()
+
+    def update(self):
+        pass
+
+    def unscale_(self, opt):
+        pass
+
+
+def _create_grad_scaler(device_type: str, use_amp: bool):
+    if not use_amp:
+        return _NullGradScaler()
+
+    # Prefer the new torch.amp API when available.
+    grad_scaler = None
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        try:
+            grad_scaler = torch.amp.GradScaler(device_type=device_type, enabled=True)
+        except TypeError:
+            grad_scaler = torch.amp.GradScaler(enabled=True)
+
+    if grad_scaler is None and device_type == 'cuda' and hasattr(torch.cuda, 'amp'):
+        scaler_cls = getattr(torch.cuda.amp, 'GradScaler', None)
+        if scaler_cls is not None:
+            grad_scaler = scaler_cls(enabled=True)
+
+    return grad_scaler if grad_scaler is not None else _NullGradScaler()
+
+
+def _autocast_context(device_type: str, use_amp: bool):
+    if not use_amp:
+        return nullcontext()
+
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        try:
+            return torch.amp.autocast(device_type=device_type)
+        except TypeError:
+            return torch.amp.autocast()
+
+    if device_type == 'cuda' and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+        return torch.cuda.amp.autocast()
+
+    return nullcontext()
+
+
 def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_clip=1.0, amp=True):
     model.train()
     total = 0.0
@@ -582,14 +635,14 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
     skipped = 0
     device_type = 'cuda' if device.startswith('cuda') and torch.cuda.is_available() else 'cpu'
     use_amp = amp and device_type == 'cuda'
-    scaler = torch.amp.GradScaler(device_type=device_type, enabled=use_amp)
+    scaler = _create_grad_scaler(device_type=device_type, use_amp=use_amp)
     pbar = tqdm(ld_train, desc='[Train]')
     for xs, lens, y_pad, key_pad, _ in pbar:
         xs = xs.to(device)
         y_pad = y_pad.to(device)
         key_pad = key_pad.to(device)
 
-        with torch.amp.autocast(device_type, enabled=use_amp):
+        with _autocast_context(device_type=device_type, use_amp=use_amp):
             out = model(xs, lens, y_pad, key_pad)
             loss = out.loss
 
