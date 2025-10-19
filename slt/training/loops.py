@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Iterable, MutableMapping, Optional, Sequ
 
 import torch
 from torch import nn
+from torch.nn.utils import clip_grad_norm_
 
 try:  # pragma: no cover - CUDA may be unavailable in CI
     from torch.cuda.amp import GradScaler, autocast  # type: ignore
@@ -81,6 +82,38 @@ def _count_items(targets: Any) -> int:
     return 1
 
 
+def clip_gradients(
+    optimizer: torch.optim.Optimizer,
+    max_norm: Optional[float],
+    *,
+    scaler: Optional["GradScaler"] = None,
+    parameters: Optional[Iterable[torch.Tensor]] = None,
+    norm_type: Union[float, int] = 2.0,
+) -> Optional[torch.Tensor]:
+    """Clip gradients to the provided ``max_norm`` if specified.
+
+    When ``scaler`` is provided and enabled, the gradients are first unscaled to
+    ensure clipping operates on the true values. The function returns the total
+    norm as reported by :func:`torch.nn.utils.clip_grad_norm_` when clipping is
+    performed, otherwise ``None``.
+    """
+
+    if max_norm is None or max_norm <= 0:
+        return None
+
+    if parameters is None:
+        parameters = (p for group in optimizer.param_groups for p in group["params"])
+
+    grads = [p for p in parameters if p is not None and p.requires_grad]
+    if not grads:
+        return None
+
+    if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
+        scaler.unscale_(optimizer)
+
+    return clip_grad_norm_(grads, max_norm, norm_type=norm_type)
+
+
 def train_epoch(
     model: nn.Module,
     loader: Iterable[Batch],
@@ -90,6 +123,8 @@ def train_epoch(
     device: Union[str, torch.device] = "cuda",
     scaler: Optional["GradScaler"] = None,
     autocast_dtype: Optional[torch.dtype] = torch.float16,
+    grad_clip_norm: Optional[float] = None,
+    grad_clip_norm_type: Union[float, int] = 2.0,
 ) -> float:
     """Run a single training epoch and return the average loss."""
 
@@ -111,12 +146,26 @@ def train_epoch(
                 outputs = _call_model(model, inputs)
                 loss = loss_fn(outputs, targets)
             scaler.scale(loss).backward()  # type: ignore[arg-type]
+            clip_gradients(
+                optimizer,
+                grad_clip_norm,
+                scaler=scaler,
+                parameters=model.parameters(),
+                norm_type=grad_clip_norm_type,
+            )
             scaler.step(optimizer)  # type: ignore[arg-type]
             scaler.update()  # type: ignore[arg-type]
         else:
             outputs = _call_model(model, inputs)
             loss = loss_fn(outputs, targets)
             loss.backward()
+            clip_gradients(
+                optimizer,
+                grad_clip_norm,
+                scaler=None,
+                parameters=model.parameters(),
+                norm_type=grad_clip_norm_type,
+            )
             optimizer.step()
 
         batch_items = _count_items(targets)
