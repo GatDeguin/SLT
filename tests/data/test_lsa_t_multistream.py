@@ -85,3 +85,22 @@ def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
     assert data["pad_mask"].dtype == torch.bool
     assert data["texts"] == ["hola mundo", "hola mundo"]
     assert data["video_ids"] == ["vid001", "vid001"]
+
+
+def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
+    ds_no_flip = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    ds_flip = LsaTMultiStream(T=4, img_size=32, flip_prob=1.0, **synthetic_dataset)
+
+    random.seed(42)
+    sample_no = ds_no_flip[0]
+    random.seed(42)
+    sample_flip = ds_flip[0]
+
+    assert torch.allclose(sample_flip.face, torch.flip(sample_no.face, dims=[3]))
+    assert torch.allclose(sample_flip.hand_l, torch.flip(sample_no.hand_r, dims=[3]))
+    assert torch.allclose(sample_flip.hand_r, torch.flip(sample_no.hand_l, dims=[3]))
+    assert torch.equal(sample_flip.miss_mask_hl, sample_no.miss_mask_hr)
+    assert torch.equal(sample_flip.miss_mask_hr, sample_no.miss_mask_hl)
+
+    expected_pose = ds_flip._flip_pose_tensor(sample_no.pose)
+    assert torch.allclose(sample_flip.pose, expected_pose)
