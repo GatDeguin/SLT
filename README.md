@@ -8,6 +8,12 @@ incluidos en el paquete.
 
 ## Requisitos de datos
 
+## Requisitos de entorno
+
+- GPU con soporte CUDA recomendada para inferencia en tiempo real (el código también puede ejecutarse en CPU con menor FPS).
+- MediaPipe (`pip install .[media]`) para la detección de rostro, manos y pose.
+- `onnxruntime` opcional (`pip install .[export]`) si deseas cargar modelos exportados en formato ONNX.
+
 La demostración espera la misma estructura de carpetas generada por el script
 `extract_rois_v2.py`:
 
@@ -62,6 +68,14 @@ por modelos de producción:
 
 Una vez actualizados estos módulos, la demo servirá como punto de partida para
 un pipeline de entrenamiento completo con pesos reales.
+
+## Demos en tiempo real y pruebas offline
+
+Los scripts en `tools/` permiten ejecutar el encoder/decoder entrenado sobre secuencias capturadas en vivo o videos pregrabados:
+- `tools/demo_realtime_multistream.py`: captura desde cámara web, realiza el tracking de rostro/manos con MediaPipe y muestra la traducción en un overlay de OpenCV.
+- `tools/test_realtime_pipeline.py`: procesa un archivo de video y opcionalmente genera un MP4 anotado para depurar el pipeline sin cámara.
+
+Ambos scripts aceptan modelos TorchScript u ONNX exportados desde el pipeline de entrenamiento y, si se proporciona un tokenizador de HuggingFace (`--tokenizer`), decodifican el texto completo en consola y en el overlay.
 
 ## Preentrenamiento con DINO/iBOT
 

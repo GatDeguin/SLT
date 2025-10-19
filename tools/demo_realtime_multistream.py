@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
-"""Real-time demo for the multi-stream SLT stub model.
-
-This script captures frames from a webcam, extracts crops for the face and
-hands using MediaPipe and feeds a temporal window to the :class:`MultiStreamSLT`
-model. The decoder is a lightweight seq2seq module and the textual output still
-represents placeholder token identifiers.
-"""
+"""Demo en tiempo real para el modelo multi-stream de SLT."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 
-try:  # pragma: no cover - optional dependency for the demo.
+try:  # pragma: no cover - dependencia opcional para la demo
     import mediapipe as mp
-except Exception:  # pragma: no cover - MediaPipe is optional.
-    mp = None  # type: ignore
+except Exception:  # pragma: no cover - MediaPipe es opcional
+    mp = None  # type: ignore[assignment]
 
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
+from slt.runtime import FrameDetections, HolisticFrameProcessor, TemporalBuffer
+from slt.utils.text import create_tokenizer, decode
 
 
 @dataclass
 class DemoConfig:
-    """Hyper-parameters used by the demo application."""
+    """Hyper-parámetros usados por la demo."""
 
     image_size: int = 224
     sequence_length: int = 32
@@ -45,10 +41,11 @@ class DemoConfig:
     decoder_heads: int = 4
     decoder_dropout: float = 0.0
     max_tokens: int = 8
+    beam_size: int = 1
 
 
 class MultiStreamSLT(torch.nn.Module):
-    """Thin wrapper combining the encoder and the placeholder decoder."""
+    """Wrapper que combina encoder y decoder stub."""
 
     def __init__(self, config: DemoConfig) -> None:
         super().__init__()
@@ -69,7 +66,6 @@ class MultiStreamSLT(torch.nn.Module):
             positional_num_positions=config.sequence_length,
             temporal_kwargs=temporal_kwargs,
         )
-        self.max_tokens = config.max_tokens
         self.decoder = TextSeq2SeqDecoder(
             d_model=config.d_model,
             vocab_size=config.vocab_size,
@@ -79,6 +75,8 @@ class MultiStreamSLT(torch.nn.Module):
             pad_token_id=0,
             eos_token_id=1,
         )
+        self.max_tokens = config.max_tokens
+        self.beam_size = config.beam_size
 
     def forward(
         self,
@@ -91,6 +89,28 @@ class MultiStreamSLT(torch.nn.Module):
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
     ) -> torch.LongTensor:
+        return self.generate(
+            face=face,
+            hand_l=hand_l,
+            hand_r=hand_r,
+            pose=pose,
+            pad_mask=pad_mask,
+            miss_mask_hl=miss_mask_hl,
+            miss_mask_hr=miss_mask_hr,
+        )
+
+    def generate(
+        self,
+        *,
+        face: torch.Tensor,
+        hand_l: torch.Tensor,
+        hand_r: torch.Tensor,
+        pose: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+        miss_mask_hl: Optional[torch.Tensor] = None,
+        miss_mask_hr: Optional[torch.Tensor] = None,
+        **generation_kwargs,
+    ) -> torch.LongTensor:
         encoded = self.encoder(
             face,
             hand_l,
@@ -101,166 +121,115 @@ class MultiStreamSLT(torch.nn.Module):
             miss_mask_hr=miss_mask_hr,
         )
         encoder_attention_mask = pad_mask.to(torch.long) if pad_mask is not None else None
+        max_length = generation_kwargs.pop("max_length", self.max_tokens)
+        num_beams = generation_kwargs.pop("num_beams", self.beam_size)
         return self.decoder.generate(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
-            max_length=self.max_tokens,
-            num_beams=1,
+            max_length=max_length,
+            num_beams=num_beams,
+            **generation_kwargs,
         )
 
 
-class TemporalBuffer:
-    """Maintains a temporal window of preprocessed frames for each stream."""
+class ModelRunner:
+    """Manejador de modelos TorchScript/ONNX para la demo."""
 
-    def __init__(self, config: DemoConfig) -> None:
-        self.config = config
-        self.maxlen = config.sequence_length
-        self.face: Deque[torch.Tensor] = deque(maxlen=self.maxlen)
-        self.hand_l: Deque[torch.Tensor] = deque(maxlen=self.maxlen)
-        self.hand_r: Deque[torch.Tensor] = deque(maxlen=self.maxlen)
-        self.pose: Deque[torch.Tensor] = deque(maxlen=self.maxlen)
-        self.miss_hl: Deque[bool] = deque(maxlen=self.maxlen)
-        self.miss_hr: Deque[bool] = deque(maxlen=self.maxlen)
-
-    def append(
+    def __init__(
         self,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
         *,
-        miss_left: bool,
-        miss_right: bool,
+        config: DemoConfig,
+        device: torch.device,
+        model_path: Optional[Path],
+        model_format: str,
+        max_tokens: int,
+        beam_size: int,
+        onnx_provider: Optional[str] = None,
     ) -> None:
-        self.face.append(face)
-        self.hand_l.append(hand_l)
-        self.hand_r.append(hand_r)
-        self.pose.append(pose)
-        self.miss_hl.append(miss_left)
-        self.miss_hr.append(miss_right)
+        self.device = device
+        self.max_tokens = max_tokens
+        self.beam_size = beam_size
 
-    def _pad_stream(self, stream: Deque[torch.Tensor]) -> torch.Tensor:
-        if stream:
-            stacked = torch.stack(list(stream), dim=0)
+        resolved_format = infer_model_format(model_path, model_format)
+        self.backend = "torch" if resolved_format in {"stub", "torchscript"} else "onnx"
+
+        if resolved_format == "stub":
+            self.model = MultiStreamSLT(config).to(device)
+            self.model.eval()
+            self.generate_method = self.model.generate
+        elif resolved_format == "torchscript":
+            if model_path is None:
+                raise ValueError("--model es obligatorio cuando se utiliza TorchScript")
+            self.model = torch.jit.load(str(model_path), map_location=device)
+            self.model.eval()
+            self.generate_method = getattr(self.model, "generate", None)
+        elif resolved_format == "onnx":
+            if model_path is None:
+                raise ValueError("--model es obligatorio para modelos ONNX")
+            try:
+                import onnxruntime as ort
+            except ImportError as exc:  # pragma: no cover - dependencia opcional
+                raise RuntimeError(
+                    "onnxruntime no está disponible. Instala el extra 'export' o la librería manualmente."
+                ) from exc
+
+            providers = None
+            if onnx_provider:
+                providers = [onnx_provider]
+            else:
+                if device.type == "cuda":
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                else:
+                    providers = ["CPUExecutionProvider"]
+            self.session = ort.InferenceSession(str(model_path), providers=providers)
+            self.input_names = [inp.name for inp in self.session.get_inputs()]
+            self.generate_method = None
+        else:  # pragma: no cover - formato inesperado
+            raise ValueError(f"Formato de modelo no soportado: {resolved_format}")
+
+    def __call__(self, inputs: Dict[str, torch.Tensor | np.ndarray]) -> torch.LongTensor:
+        if self.backend == "onnx":
+            ort_inputs = {}
+            for name in self.input_names:
+                if name not in inputs:
+                    raise KeyError(f"El modelo ONNX espera la entrada '{name}'")
+                value = inputs[name]
+                if isinstance(value, torch.Tensor):
+                    array = value.detach().cpu().numpy()
+                else:
+                    array = value
+                if array.dtype == np.bool_:
+                    ort_inputs[name] = array
+                else:
+                    ort_inputs[name] = array.astype(np.float32, copy=False)
+            outputs = self.session.run(None, ort_inputs)
+            return torch.from_numpy(outputs[0])
+
+        tensor_inputs = {}
+        for key, value in inputs.items():
+            tensor_inputs[key] = value if isinstance(value, torch.Tensor) else torch.from_numpy(value).to(self.device)
+
+        if self.generate_method is not None:
+            try:
+                output = self.generate_method(
+                    **tensor_inputs,
+                    max_length=self.max_tokens,
+                    num_beams=self.beam_size,
+                )
+            except TypeError:
+                output = self.generate_method(**tensor_inputs)  # type: ignore[misc]
         else:
-            stacked = torch.zeros(
-                (0, 3, self.config.image_size, self.config.image_size), dtype=torch.float32
-            )
+            output = self.model(**tensor_inputs)
 
-        if stacked.shape[0] == self.maxlen:
-            return stacked
-
-        pad_frames = self.maxlen - stacked.shape[0]
-        if stacked.shape[0] == 0:
-            pad_tensor = torch.zeros(
-                (pad_frames, 3, self.config.image_size, self.config.image_size), dtype=torch.float32
-            )
-            return pad_tensor
-
-        padding = torch.zeros(
-            (pad_frames, *stacked.shape[1:]), dtype=stacked.dtype, device=stacked.device
-        )
-        return torch.cat([stacked, padding], dim=0)
-
-    def _pad_pose(self, stream: Deque[torch.Tensor]) -> torch.Tensor:
-        if stream:
-            stacked = torch.stack(list(stream), dim=0)
-        else:
-            stacked = torch.zeros((0, 3 * self.config.pose_landmarks), dtype=torch.float32)
-        if stacked.shape[0] == self.maxlen:
-            return stacked
-        pad_frames = self.maxlen - stacked.shape[0]
-        if stacked.shape[0] == 0:
-            return torch.zeros((pad_frames, 3 * self.config.pose_landmarks), dtype=torch.float32)
-        padding = torch.zeros((pad_frames, stacked.shape[1]), dtype=stacked.dtype, device=stacked.device)
-        return torch.cat([stacked, padding], dim=0)
-
-    def as_model_inputs(self, device: torch.device) -> Optional[Dict[str, torch.Tensor]]:
-        if not self.face:
-            return None
-
-        face = self._pad_stream(self.face).unsqueeze(0).to(device)
-        hand_l = self._pad_stream(self.hand_l).unsqueeze(0).to(device)
-        hand_r = self._pad_stream(self.hand_r).unsqueeze(0).to(device)
-        pose = self._pad_pose(self.pose).unsqueeze(0).to(device)
-
-        pad_mask = torch.zeros(self.maxlen, dtype=torch.bool)
-        miss_mask_hl = torch.zeros(self.maxlen, dtype=torch.bool)
-        miss_mask_hr = torch.zeros(self.maxlen, dtype=torch.bool)
-
-        valid_len = len(self.face)
-        if valid_len > 0:
-            pad_mask[:valid_len] = True
-        if self.miss_hl:
-            miss_mask_hl[: valid_len] = torch.tensor(list(self.miss_hl), dtype=torch.bool)
-        if self.miss_hr:
-            miss_mask_hr[: valid_len] = torch.tensor(list(self.miss_hr), dtype=torch.bool)
-
-        return {
-            "face": face,
-            "hand_l": hand_l,
-            "hand_r": hand_r,
-            "pose": pose,
-            "pad_mask": pad_mask.unsqueeze(0).to(device),
-            "miss_mask_hl": miss_mask_hl.unsqueeze(0).to(device),
-            "miss_mask_hr": miss_mask_hr.unsqueeze(0).to(device),
-        }
-
-
-def expand_clamp_bbox(x: int, y: int, w: int, h: int, scale: float, width: int, height: int) -> Tuple[int, int, int, int]:
-    """Expand a bounding box around ``(x, y, w, h)`` and clamp to image bounds."""
-
-    cx, cy = x + w / 2.0, y + h / 2.0
-    w2, h2 = w * scale, h * scale
-    x1 = int(max(0, cx - w2 / 2.0))
-    y1 = int(max(0, cy - h2 / 2.0))
-    x2 = int(min(width, cx + w2 / 2.0))
-    y2 = int(min(height, cy + h2 / 2.0))
-    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
-
-
-def crop_square(image: np.ndarray, x: int, y: int, w: int, h: int, out_size: int) -> np.ndarray:
-    """Extract a square crop centred on the bounding box."""
-
-    height, width = image.shape[:2]
-    side = max(w, h)
-    cx, cy = x + w // 2, y + h // 2
-    x1 = max(0, cx - side // 2)
-    y1 = max(0, cy - side // 2)
-    x2 = min(width, x1 + side)
-    y2 = min(height, y1 + side)
-    crop = image[y1:y2, x1:x2]
-    if crop.size == 0:
-        return np.zeros((out_size, out_size, 3), dtype=image.dtype)
-    return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
-
-
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
-
-
-def preprocess_crop(crop: np.ndarray) -> torch.Tensor:
-    """Convert a BGR crop into a normalized CHW tensor."""
-
-    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(crop_rgb.transpose(2, 0, 1)).float() / 255.0
-    return (tensor - IMAGENET_MEAN) / IMAGENET_STD
-
-
-def extract_pose_vector(result: object, count: int) -> torch.Tensor:
-    """Return a flattened pose vector with ``count`` landmarks."""
-
-    pose = np.zeros((count, 3), dtype=np.float32)
-    if result.pose_landmarks:
-        for idx, landmark in enumerate(result.pose_landmarks.landmark[:count]):
-            pose[idx, 0] = landmark.x
-            pose[idx, 1] = landmark.y
-            pose[idx, 2] = landmark.visibility
-    return torch.from_numpy(pose.reshape(-1))
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, (list, tuple)) and output:
+            return torch.as_tensor(output[0])
+        raise RuntimeError("El modelo TorchScript devolvió una salida inesperada")
 
 
 def decode_token_ids_stub(sequences: torch.Tensor) -> str:
-    """Placeholder decoding that maps generated token IDs to a label string."""
+    """Decodificador placeholder que expone los IDs generados."""
 
     if sequences.dim() == 2:
         seq = sequences[0]
@@ -272,26 +241,127 @@ def decode_token_ids_stub(sequences: torch.Tensor) -> str:
     return "<token_0>"
 
 
+def decode_sequences(sequences: torch.Tensor, tokenizer) -> str:
+    if tokenizer is None:
+        return decode_token_ids_stub(sequences)
+    texts = decode(tokenizer, sequences, skip_special_tokens=True)
+    return texts[0] if texts else ""
+
+
+def draw_overlays(frame: np.ndarray, boxes: Dict[str, Optional[Tuple[int, int, int, int]]], detections: FrameDetections, text: str) -> None:
+    colors = {
+        "face": (0, 255, 0),
+        "hand_l": (255, 0, 0),
+        "hand_r": (0, 0, 255),
+    }
+    for key, bbox in boxes.items():
+        if not bbox:
+            continue
+        x, y, w, h = bbox
+        color = colors.get(key, (0, 255, 255))
+        thickness = 3 if getattr(detections, key, False) else 1
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+    if text:
+        height = frame.shape[0]
+        cv2.putText(
+            frame,
+            text,
+            (10, height - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def build_tokenizer(args: argparse.Namespace):
+    if not getattr(args, "tokenizer", None):
+        return None
+    return create_tokenizer(args.tokenizer, revision=getattr(args, "tokenizer_revision", None))
+
+
+def infer_model_format(model_path: Optional[Path], model_format: str) -> str:
+    if model_format != "auto":
+        return model_format
+    if model_path is None:
+        return "stub"
+    suffix = model_path.suffix.lower()
+    if suffix in {".pt", ".pth", ".ts"}:
+        return "torchscript"
+    if suffix == ".onnx":
+        return "onnx"
+    raise ValueError("No se pudo inferir el formato del modelo. Usa --model-format explícitamente.")
+
+
+def add_model_cli_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", type=Path, help="Ruta al modelo TorchScript/ONNX exportado", default=None)
+    parser.add_argument(
+        "--model-format",
+        choices=("auto", "stub", "torchscript", "onnx"),
+        default="auto",
+        help="Formato del modelo especificado en --model",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Longitud máxima para generación autoregresiva",
+    )
+    parser.add_argument("--beam-size", type=int, default=1, help="Número de beams para la búsqueda autoregresiva")
+    parser.add_argument(
+        "--onnx-provider",
+        type=str,
+        default=None,
+        help="Proveedor preferido de ejecución para onnxruntime (por ejemplo CUDAExecutionProvider)",
+    )
+    parser.add_argument("--tokenizer", type=str, help="Nombre o ruta del tokenizador HuggingFace", default=None)
+    parser.add_argument("--tokenizer-revision", type=str, help="Revisión del tokenizador (tag/commit)", default=None)
+
+
 def run_demo(args: argparse.Namespace) -> None:
     if mp is None:
         raise RuntimeError(
             "MediaPipe no está disponible. Instala el paquete 'mediapipe' para ejecutar la demo."
         )
 
-    config = DemoConfig(sequence_length=args.sequence_length, pose_landmarks=args.pose_landmarks)
+    config = DemoConfig(
+        sequence_length=args.sequence_length,
+        pose_landmarks=args.pose_landmarks,
+    )
+    if args.max_tokens:
+        config.max_tokens = args.max_tokens
+    config.beam_size = args.beam_size
     device = torch.device(args.device)
 
-    model = MultiStreamSLT(config).to(device)
-    model.eval()
+    tokenizer = build_tokenizer(args)
 
-    buffer = TemporalBuffer(config)
+    runner = ModelRunner(
+        config=config,
+        device=device,
+        model_path=args.model,
+        model_format=args.model_format,
+        max_tokens=config.max_tokens,
+        beam_size=config.beam_size,
+        onnx_provider=args.onnx_provider,
+    )
+
+    buffer = TemporalBuffer(config.sequence_length, config.image_size, config.pose_landmarks)
+    processor = HolisticFrameProcessor(
+        image_size=config.image_size,
+        pose_landmarks=config.pose_landmarks,
+        bbox_scale=args.bbox_scale,
+        smoothing=args.smoothing,
+        max_misses=args.max_misses,
+    )
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir la cámara con índice {args.camera}")
 
     window_name = "MultiStream SLT Demo"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if not args.no_window:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
     hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2)
@@ -307,6 +377,7 @@ def run_demo(args: argparse.Namespace) -> None:
             for ctx in contexts:
                 ctx.close()
 
+    last_text = ""
     with closing_all(mediapipe_contexts):
         try:
             while True:
@@ -314,96 +385,47 @@ def run_demo(args: argparse.Namespace) -> None:
                 if not ok:
                     break
 
-                height, width = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 face_result = face_mesh.process(rgb)
                 hands_result = hands.process(rgb)
                 pose_result = pose.process(rgb)
 
-                face_crop = np.zeros((config.image_size, config.image_size, 3), dtype=frame.dtype)
-                if face_result.multi_face_landmarks:
-                    face_landmarks = face_result.multi_face_landmarks[0]
-                    xs = [int(landmark.x * width) for landmark in face_landmarks.landmark]
-                    ys = [int(landmark.y * height) for landmark in face_landmarks.landmark]
-                    x1 = max(0, min(xs))
-                    y1 = max(0, min(ys))
-                    x2 = min(width, max(xs))
-                    y2 = min(height, max(ys))
-                    x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
-                    face_crop = crop_square(frame, x, y, w, h, config.image_size)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-                left_crop = np.zeros_like(face_crop)
-                right_crop = np.zeros_like(face_crop)
-                left_detected = False
-                right_detected = False
-                if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
-                    for landmarks, handedness in zip(
-                        hands_result.multi_hand_landmarks, hands_result.multi_handedness
-                    ):
-                        xs = [int(l.x * width) for l in landmarks.landmark]
-                        ys = [int(l.y * height) for l in landmarks.landmark]
-                        x1 = max(0, min(xs))
-                        y1 = max(0, min(ys))
-                        x2 = min(width, max(xs))
-                        y2 = min(height, max(ys))
-                        x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
-                        crop = crop_square(frame, x, y, w, h, config.image_size)
-                        label = handedness.classification[0].label.lower()
-                        if label.startswith("left"):
-                            left_crop = crop
-                            left_detected = True
-                            color = (255, 0, 0)
-                        else:
-                            right_crop = crop
-                            right_detected = True
-                            color = (0, 0, 255)
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-                pose_vec = extract_pose_vector(pose_result, config.pose_landmarks)
-
-                face_tensor = preprocess_crop(face_crop)
-                hand_l_tensor = preprocess_crop(left_crop)
-                hand_r_tensor = preprocess_crop(right_crop)
+                face_tensor, hand_l_tensor, hand_r_tensor, pose_tensor, detections, boxes = processor.process(
+                    frame,
+                    face_result=face_result,
+                    hands_result=hands_result,
+                    pose_result=pose_result,
+                )
 
                 buffer.append(
                     face_tensor,
                     hand_l_tensor,
                     hand_r_tensor,
-                    pose_vec,
-                    miss_left=left_detected,
-                    miss_right=right_detected,
+                    pose_tensor,
+                    detected_left=detections.hand_l,
+                    detected_right=detections.hand_r,
                 )
 
-                inputs = buffer.as_model_inputs(device)
+                inputs = buffer.as_model_inputs(device, backend=runner.backend)
                 if inputs is not None:
                     with torch.no_grad():
-                        sequences = model(
-                            face=inputs["face"],
-                            hand_l=inputs["hand_l"],
-                            hand_r=inputs["hand_r"],
-                            pose=inputs["pose"],
-                            pad_mask=inputs["pad_mask"],
-                            miss_mask_hl=inputs["miss_mask_hl"],
-                            miss_mask_hr=inputs["miss_mask_hr"],
-                        )
-                    decoded = decode_token_ids_stub(sequences)
-                    cv2.putText(
-                        frame,
-                        decoded,
-                        (10, height - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                        sequences = runner(inputs)
+                    text = decode_sequences(sequences, tokenizer)
+                    if text and text != last_text:
+                        print(text)
+                        last_text = text
+                else:
+                    text = last_text
 
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    break
+                if not args.no_window:
+                    draw_overlays(frame, boxes, detections, last_text)
+                    cv2.imshow(window_name, frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        break
+            if args.no_window and last_text:
+                print(last_text)
         finally:
             cap.release()
             cv2.destroyAllWindows()
@@ -425,6 +447,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=13,
         help="Cantidad de landmarks de pose a considerar (MediaPipe Holistic)",
     )
+    parser.add_argument("--bbox-scale", type=float, default=1.2, help="Factor de expansión del bounding box")
+    parser.add_argument("--smoothing", type=float, default=0.4, help="Factor de suavizado para el tracking de ROI")
+    parser.add_argument("--max-misses", type=int, default=5, help="Cantidad de frames sin detección antes de descartar la ROI")
+    parser.add_argument("--no-window", action="store_true", help="Ejecuta la demo sin mostrar overlay de OpenCV")
+
+    add_model_cli_arguments(parser)
     return parser.parse_args(argv)
 
 
