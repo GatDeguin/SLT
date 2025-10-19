@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Export the multi-stream encoder stub to ONNX format."""
+"""Export the multi-stream encoder stub and heads to ONNX/TorchScript."""
 
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.onnx import OperatorExportTypes
@@ -17,7 +17,8 @@ from slt.models import MultiStreamEncoder, ViTConfig
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to the PyTorch checkpoint")
-    parser.add_argument("--out", type=Path, required=True, help="Destination ONNX file")
+    parser.add_argument("--onnx", type=Path, help="Destination ONNX file")
+    parser.add_argument("--torchscript", type=Path, help="Destination TorchScript file")
     parser.add_argument("--image-size", type=int, default=224, help="Input image resolution expected by the ViT backbones")
     parser.add_argument("--projector-dim", type=int, default=256, help="Dimensionality of the per-stream projectors")
     parser.add_argument("--d-model", type=int, default=512, help="Temporal encoder embedding dimension")
@@ -37,6 +38,74 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu", help="Torch device identifier used during export")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     return parser.parse_args(argv)
+
+
+class EncoderExportModule(torch.nn.Module):
+    """Wrapper exposing the encoder output and intermediate heads."""
+
+    def __init__(self, encoder: MultiStreamEncoder) -> None:
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(
+        self,
+        face: torch.Tensor,
+        hand_l: torch.Tensor,
+        hand_r: torch.Tensor,
+        pose: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+        miss_mask_hl: Optional[torch.Tensor] = None,
+        miss_mask_hr: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        face_feats = self.encoder._encode_backbone(self.encoder.face_backbone, face)
+        hand_l_feats = self.encoder._encode_backbone(self.encoder.hand_backbone_left, hand_l)
+        hand_r_feats = self.encoder._encode_backbone(self.encoder.hand_backbone_right, hand_r)
+
+        hand_l_feats, hand_l_mask = self.encoder._apply_missing_mask(
+            hand_l_feats, miss_mask_hl, stream="hand_left"
+        )
+        hand_r_feats, hand_r_mask = self.encoder._apply_missing_mask(
+            hand_r_feats, miss_mask_hr, stream="hand_right"
+        )
+
+        face_proj = self.encoder.face_projector(face_feats)
+        hand_l_proj = self.encoder.hand_left_projector(hand_l_feats)
+        hand_r_proj = self.encoder.hand_right_projector(hand_r_feats)
+        pose_proj = self.encoder.pose_projector(self.encoder._ensure_pose_shape(pose))
+
+        combined_hand_mask = self.encoder._combine_missing_masks(hand_l_mask, hand_r_mask)
+        fused = self.encoder._call_fusion(
+            (face_proj, hand_l_proj, hand_r_proj, pose_proj), combined_hand_mask
+        )
+        fused = self.encoder.positional(fused)
+
+        src_key_padding_mask = self.encoder._convert_padding_mask(pad_mask)
+        encoded = self.encoder.temporal(
+            fused, src_key_padding_mask=src_key_padding_mask
+        )
+
+        device = encoded.device
+        batch, seq_len = encoded.shape[:2]
+
+        if combined_hand_mask is None:
+            combined_hand_mask = torch.zeros(batch, seq_len, device=device, dtype=torch.float32)
+        else:
+            combined_hand_mask = combined_hand_mask.to(device=device, dtype=torch.float32)
+
+        if src_key_padding_mask is None:
+            padding_mask = torch.zeros(batch, seq_len, device=device, dtype=torch.float32)
+        else:
+            padding_mask = src_key_padding_mask.to(device=device, dtype=torch.float32)
+
+        return (
+            encoded,
+            face_proj,
+            hand_l_proj,
+            hand_r_proj,
+            pose_proj,
+            combined_hand_mask,
+            padding_mask,
+        )
 
 
 def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
@@ -119,13 +188,14 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
     if device.type.startswith("cuda") and not torch.cuda.is_available():
         device = torch.device("cpu")
 
+    if args.onnx is None and args.torchscript is None:
+        raise ValueError("At least one output (--onnx or --torchscript) must be provided")
+
     encoder = _build_encoder(args).to(device)
     _load_encoder_weights(args.checkpoint, encoder)
     encoder.eval()
 
-    out_path = args.out
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+    export_module = EncoderExportModule(encoder).to(device)
     inputs = _dummy_inputs(args, device)
     positional_args = inputs[:4]
     keyword_args = {
@@ -134,35 +204,65 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
         "miss_mask_hr": inputs[6],
     }
 
-    dynamic_axes = {
-        "face": {1: "T"},
-        "hand_l": {1: "T"},
-        "hand_r": {1: "T"},
-        "pose": {1: "T"},
-        "pad_mask": {1: "T"},
-    }
+    if args.onnx is not None:
+        args.onnx.parent.mkdir(parents=True, exist_ok=True)
+        dynamic_axes = {
+            "face": {1: "T"},
+            "hand_l": {1: "T"},
+            "hand_r": {1: "T"},
+            "pose": {1: "T"},
+            "pad_mask": {1: "T"},
+            "miss_mask_hl": {1: "T"},
+            "miss_mask_hr": {1: "T"},
+            "encoded": {1: "T"},
+            "face_head": {1: "T"},
+            "hand_left_head": {1: "T"},
+            "hand_right_head": {1: "T"},
+            "pose_head": {1: "T"},
+            "hand_mask": {1: "T"},
+            "padding_mask": {1: "T"},
+        }
+        with torch.no_grad():
+            torch.onnx.export(
+                export_module,
+                positional_args,
+                args.onnx,
+                kwargs=keyword_args,
+                input_names=[
+                    "face",
+                    "hand_l",
+                    "hand_r",
+                    "pose",
+                    "pad_mask",
+                    "miss_mask_hl",
+                    "miss_mask_hr",
+                ],
+                output_names=[
+                    "encoded",
+                    "face_head",
+                    "hand_left_head",
+                    "hand_right_head",
+                    "pose_head",
+                    "hand_mask",
+                    "padding_mask",
+                ],
+                dynamic_axes=dynamic_axes,
+                opset_version=args.opset,
+                fallback=True,
+                operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
+            )
 
-    with torch.no_grad():
-        torch.onnx.export(
-            encoder,
-            positional_args,
-            out_path,
-            kwargs=keyword_args,
-            input_names=[
-                "face",
-                "hand_l",
-                "hand_r",
-                "pose",
-                "pad_mask",
-                "miss_mask_hl",
-                "miss_mask_hr",
-            ],
-            output_names=["encoded"],
-            dynamic_axes=dynamic_axes,
-            opset_version=args.opset,
-            fallback=True,
-            operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
-        )
+    if args.torchscript is not None:
+        args.torchscript.parent.mkdir(parents=True, exist_ok=True)
+        with torch.no_grad():
+            traced = torch.jit.trace(
+                export_module,
+                positional_args,
+                check_trace=False,
+                strict=False,
+                example_kwarg_inputs=keyword_args,
+            )
+        traced.save(str(args.torchscript))
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

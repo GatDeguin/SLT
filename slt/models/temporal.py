@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Type
 
 import torch
 from torch import Tensor, nn
@@ -58,11 +58,16 @@ class TextSeq2SeqDecoder(nn.Module):
         pretrained_model_name_or_path: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
         config_kwargs: Optional[Dict[str, Any]] = None,
+        auto_model_cls: Type[AutoModelForSeq2SeqLM] = AutoModelForSeq2SeqLM,
+        tie_embeddings: bool = True,
+        half_precision: bool = False,
     ) -> None:
         super().__init__()
 
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads for the decoder configuration.")
+
+        config_kwargs = dict(config_kwargs or {})
 
         self.model = self._build_model(
             d_model=d_model,
@@ -74,8 +79,15 @@ class TextSeq2SeqDecoder(nn.Module):
             eos_token_id=eos_token_id,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             config=config,
-            config_kwargs=config_kwargs or {},
+            config_kwargs=config_kwargs,
+            auto_model_cls=auto_model_cls,
         )
+
+        if tie_embeddings:
+            self._tie_embeddings()
+
+        if half_precision:
+            self.model = self.model.to(dtype=torch.float16)
 
     @staticmethod
     def _build_model(
@@ -90,12 +102,13 @@ class TextSeq2SeqDecoder(nn.Module):
         pretrained_model_name_or_path: Optional[str],
         config: Optional[PretrainedConfig],
         config_kwargs: Dict[str, Any],
+        auto_model_cls: Type[AutoModelForSeq2SeqLM],
     ) -> nn.Module:
         if config is not None:
-            return AutoModelForSeq2SeqLM.from_config(config)
+            return auto_model_cls.from_config(config)
 
         if pretrained_model_name_or_path is not None:
-            model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_model_name_or_path)
+            model = auto_model_cls.from_pretrained(pretrained_model_name_or_path)
             hidden_size = getattr(model.config, "d_model", None)
             if hidden_size is not None and hidden_size != d_model:
                 raise ValueError(
@@ -121,7 +134,23 @@ class TextSeq2SeqDecoder(nn.Module):
         }
         default_config.update(config_kwargs)
         t5_config = T5Config(**default_config)
-        return T5ForConditionalGeneration(t5_config)
+        if issubclass(auto_model_cls, T5ForConditionalGeneration):
+            return auto_model_cls(t5_config)
+        return auto_model_cls.from_config(t5_config)
+
+    def _tie_embeddings(self) -> None:
+        tie_fn = getattr(self.model, "tie_weights", None)
+        if callable(tie_fn):  # pragma: no cover - depends on model implementation
+            tie_fn()
+            return
+
+        input_embeddings = getattr(self.model, "get_input_embeddings", None)
+        output_embeddings = getattr(self.model, "get_output_embeddings", None)
+        if callable(input_embeddings) and callable(output_embeddings):
+            in_emb = input_embeddings()
+            out_emb = output_embeddings()
+            if in_emb is not None and out_emb is not None:
+                out_emb.weight = in_emb.weight
 
     @property
     def config(self) -> PretrainedConfig:  # pragma: no cover - simple property
