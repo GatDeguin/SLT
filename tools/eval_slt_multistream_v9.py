@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Evalúa el stub multi-stream generando predicciones ficticias en CSV."""
+"""Evalúa el modelo multi-stream generando predicciones y métricas."""
 
 import argparse
 import csv
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +13,28 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.nn import functional as F
 
 from slt.data import LsaTMultiStream, collate_fn
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
 from slt.utils.text import create_tokenizer, decode
 
 from transformers import PreTrainedTokenizerBase
+
+try:  # pragma: no cover - import opcional
+    from sacrebleu.metrics import BLEU, CHRF
+except ImportError:  # pragma: no cover - fallback para entornos sin extra
+    BLEU = None  # type: ignore[assignment]
+    CHRF = None  # type: ignore[assignment]
+
+
+@dataclass
+class PredictionItem:
+    """Predicción textual asociada a un video."""
+
+    video_id: str
+    prediction: str
+    reference: str
 
 
 @dataclass
@@ -210,6 +227,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Longitud máxima utilizada al generar predicciones",
     )
 
+    parser.add_argument("--num-beams", type=int, default=1, help="Cantidad de beams para la decodificación")
+
     parser.add_argument("--log-level", default="INFO", help="Nivel de logging (INFO, DEBUG, ...)")
 
     return parser.parse_args(argv)
@@ -303,6 +322,94 @@ def _prepare_inputs(batch: dict, device: torch.device) -> dict:
     return inputs
 
 
+def _clean_token_sequences(
+    sequences: Iterable[Sequence[int]],
+    *,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> List[List[int]]:
+    cleaned: List[List[int]] = []
+    for seq in sequences:
+        tokens: List[int] = []
+        for token in seq:
+            if token == eos_token_id:
+                break
+            if token == pad_token_id:
+                continue
+            tokens.append(int(token))
+        cleaned.append(tokens)
+    return cleaned
+
+
+def _beam_search_from_logits(
+    logits: torch.Tensor,
+    *,
+    num_beams: int,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> List[List[int]]:
+    if logits.dim() != 3:
+        raise ValueError("Se esperaban logits de dimensión (batch, seq_len, vocab_size).")
+
+    batch_size, seq_len, vocab_size = logits.shape
+    log_probs = F.log_softmax(logits, dim=-1)
+    sequences: List[List[int]] = []
+
+    for b in range(batch_size):
+        beams: List[Tuple[List[int], float, bool]] = [([], 0.0, False)]
+        for step in range(seq_len):
+            step_scores = log_probs[b, step]
+            k = min(num_beams, vocab_size)
+            topk = torch.topk(step_scores, k=k)
+            candidates: List[Tuple[List[int], float, bool]] = []
+            for seq, score, finished in beams:
+                if finished:
+                    candidates.append((seq, score, finished))
+                    continue
+                for token, value in zip(topk.indices.tolist(), topk.values.tolist()):
+                    new_seq = seq + [int(token)]
+                    done = token == eos_token_id
+                    candidates.append((new_seq, score + float(value), done))
+            candidates.sort(key=lambda item: item[1], reverse=True)
+            beams = candidates[:num_beams]
+            if all(done for _, _, done in beams):
+                break
+        best_seq = beams[0][0] if beams else []
+        sequences.append(best_seq)
+    return _clean_token_sequences(sequences, pad_token_id=pad_token_id, eos_token_id=eos_token_id)
+
+
+def _decode_from_logits(
+    logits: torch.Tensor,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    num_beams: int = 1,
+    pad_token_id: Optional[int] = None,
+    eos_token_id: Optional[int] = None,
+) -> List[str]:
+    if logits.dim() != 3:
+        raise ValueError("Los logits deben tener forma (batch, seq_len, vocab).")
+
+    pad_id = pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_id = eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+
+    if num_beams > 1:
+        sequences = _beam_search_from_logits(
+            logits,
+            num_beams=num_beams,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+    else:
+        token_ids = torch.argmax(logits, dim=-1)
+        sequences = _clean_token_sequences(token_ids.tolist(), pad_token_id=pad_id, eos_token_id=eos_id)
+    return decode(tokenizer, sequences)
+
+
 def _predict(
     model: MultiStreamClassifier,
     loader: DataLoader,
@@ -310,33 +417,80 @@ def _predict(
     tokenizer: PreTrainedTokenizerBase,
     *,
     max_length: int,
-) -> List[Tuple[str, str]]:
-    results: List[Tuple[str, str]] = []
+    num_beams: int,
+) -> List[PredictionItem]:
+    results: List[PredictionItem] = []
     model.eval()
     with torch.inference_mode():
         for batch in loader:
             inputs = _prepare_inputs(batch, device)
-            sequences = model.generate(**inputs, max_length=max_length, num_beams=1)
-            decoded = decode(tokenizer, sequences)
-            for video_id, text in zip(batch["video_ids"], decoded):
-                results.append((video_id, text))
+            generation_kwargs = {
+                "max_length": max_length,
+                "num_beams": max(1, num_beams),
+                "early_stopping": num_beams > 1,
+            }
+            sequences = model.generate(**inputs, **generation_kwargs)
+            if hasattr(sequences, "sequences"):
+                sequences_tensor = sequences.sequences  # type: ignore[attr-defined]
+            else:
+                sequences_tensor = sequences
+            decoded = decode(tokenizer, sequences_tensor)
+            references = batch.get("texts") or [""] * len(decoded)
+            for video_id, text, ref in zip(batch["video_ids"], decoded, references):
+                results.append(PredictionItem(video_id=video_id, prediction=text, reference=ref))
     return results
 
 
-def _write_csv(path: Path, rows: Iterable[Tuple[str, str]]) -> None:
+def _write_csv(path: Path, rows: Iterable[PredictionItem]) -> None:
     temp_file = None
     with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)) as tmp:
         writer = csv.writer(tmp)
         writer.writerow(["video_id", "prediction"])
         for row in rows:
-            writer.writerow(row)
+            writer.writerow([row.video_id, row.prediction])
         temp_file = Path(tmp.name)
     if temp_file is None:
         raise RuntimeError("No se pudo escribir el archivo temporal de predicciones")
     temp_file.replace(path)
 
 
-def run(argv: Optional[Sequence[str]] = None) -> List[Tuple[str, str]]:
+def _compute_metrics(references: Sequence[str], predictions: Sequence[str]) -> Tuple[float, float]:
+    if not references or not predictions:
+        return 0.0, 0.0
+    if BLEU is None or CHRF is None:
+        logging.warning("sacrebleu no disponible, las métricas BLEU/ChrF se devolverán en 0.0")
+        return 0.0, 0.0
+    bleu_metric = BLEU(tokenize="13a")
+    chrf_metric = CHRF()
+    bleu_score = bleu_metric.corpus_score(predictions, [references]).score
+    chrf_score = chrf_metric.corpus_score(predictions, [references]).score
+    return float(bleu_score), float(chrf_score)
+
+
+def _write_metrics(output_dir: Path, *, bleu: float, chrf: float) -> None:
+    metrics = {"bleu": float(bleu), "chrf": float(chrf)}
+
+    json_tmp: Optional[Path] = None
+    with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(output_dir)) as tmp:
+        json.dump(metrics, tmp, ensure_ascii=False, indent=2)
+        json_tmp = Path(tmp.name)
+    if json_tmp is None:
+        raise RuntimeError("No se pudo escribir el archivo JSON de métricas")
+    json_tmp.replace(output_dir / "metrics.json")
+
+    csv_tmp: Optional[Path] = None
+    with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(output_dir)) as tmp:
+        writer = csv.writer(tmp)
+        writer.writerow(["metric", "value"])
+        for key in sorted(metrics):
+            writer.writerow([key, metrics[key]])
+        csv_tmp = Path(tmp.name)
+    if csv_tmp is None:
+        raise RuntimeError("No se pudo escribir el archivo CSV de métricas")
+    csv_tmp.replace(output_dir / "metrics.csv")
+
+
+def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     args = parse_args(argv)
     _setup_logging(args.log_level)
     _validate_inputs(args)
@@ -353,9 +507,15 @@ def run(argv: Optional[Sequence[str]] = None) -> List[Tuple[str, str]]:
         device,
         tokenizer,
         max_length=args.max_target_length,
+        num_beams=args.num_beams,
     )
     _write_csv(args.output_csv, predictions)
+    references = [item.reference for item in predictions]
+    texts = [item.prediction for item in predictions]
+    bleu, chrf = _compute_metrics(references, texts)
+    _write_metrics(args.output_csv.parent, bleu=bleu, chrf=chrf)
     logging.info("Predicciones guardadas en %s", args.output_csv)
+    logging.info("Métricas - BLEU: %.2f, ChrF: %.2f", bleu, chrf)
     return predictions
 
 
