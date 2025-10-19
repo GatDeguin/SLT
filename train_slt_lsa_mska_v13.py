@@ -580,14 +580,16 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
     total = 0.0
     steps = 0
     skipped = 0
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.startswith("cuda") and torch.cuda.is_available()))
+    device_type = 'cuda' if device.startswith('cuda') and torch.cuda.is_available() else 'cpu'
+    use_amp = amp and device_type == 'cuda'
+    scaler = torch.amp.GradScaler(device_type=device_type, enabled=use_amp)
     pbar = tqdm(ld_train, desc='[Train]')
     for xs, lens, y_pad, key_pad, _ in pbar:
         xs = xs.to(device)
         y_pad = y_pad.to(device)
         key_pad = key_pad.to(device)
 
-        with torch.amp.autocast('cuda', enabled=(amp and device.startswith("cuda") and torch.cuda.is_available())):
+        with torch.amp.autocast(device_type, enabled=use_amp):
             out = model(xs, lens, y_pad, key_pad)
             loss = out.loss
 
@@ -625,6 +627,7 @@ def train_one_epoch(model: KP2Text, opt, sched, ld_train, device='cuda', grad_cl
 def validate_bleu(model: KP2Text, ld_val, tok, device='cuda', beam=5, max_len=64):
     model.eval()
     refs, hyps = [], []
+    records = []
     for xs, lens, y_pad, key_pad, bases in tqdm(ld_val, desc='[Val]'):
         xs = xs.to(device)
         key_pad = key_pad.to(device)
@@ -633,6 +636,7 @@ def validate_bleu(model: KP2Text, ld_val, tok, device='cuda', beam=5, max_len=64
         texts = tok.batch_decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
         # refs: decodificar labels (y_pad) sin pads
         for i in range(y_pad.size(0)):
+            base = str(bases[i])
             y = y_pad[i].tolist()
             # remove pad and leading language code if present
             y = [t for t in y if t != tok.pad_token_id]
@@ -641,13 +645,31 @@ def validate_bleu(model: KP2Text, ld_val, tok, device='cuda', beam=5, max_len=64
                 lang_ids = set(tok.lang_code_to_id.values())
                 if y[0] in lang_ids:
                     y = y[1:]
-            ref = tok.decode(y, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            refs.append(ref.strip())
-        for h in texts:
-            hyps.append(h.strip())
+            ref = tok.decode(y, skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
+            hyp = texts[i].strip() if i < len(texts) else ''
+            refs.append(ref)
+            hyps.append(hyp)
+            records.append({'base': base, 'reference': ref, 'prediction': hyp})
 
     bleu = compute_bleu(refs, hyps) if len(refs) > 0 else 0.0
-    return bleu, refs, hyps
+    return bleu, refs, hyps, records
+
+
+def save_validation_predictions(work_dir: str, epoch: int, bleu: float, records: List[Dict[str, str]]) -> Optional[str]:
+    if len(records) == 0:
+        return None
+    log_path = osp.join(work_dir, f'val_epoch_{epoch:03d}_preds.jsonl')
+    with open(log_path, 'w', encoding='utf-8') as f:
+        for rec in records:
+            row = {
+                'epoch': epoch,
+                'bleu': bleu,
+                'base': rec.get('base', ''),
+                'reference': rec.get('reference', ''),
+                'prediction': rec.get('prediction', ''),
+            }
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+    return log_path
 
 def make_dataloaders(train_ds, val_ds, pad_id, args):
     collate = partial(collate_batch, pad_id=pad_id)
@@ -788,8 +810,11 @@ def main():
         tr_loss = train_one_epoch(model, opt, sched, train_ld, device=device, grad_clip=1.0, amp=True)
         plog(f"[Train] loss={tr_loss:.4f}")
 
-        bleu, _, _ = validate_bleu(model, val_ld, tok, device=device, beam=args.beam, max_len=args.max_gen_len)
+        bleu, _, _, val_records = validate_bleu(model, val_ld, tok, device=device, beam=args.beam, max_len=args.max_gen_len)
         plog(f"[Val] BLEU={bleu:.2f}")
+        log_path = save_validation_predictions(args.work_dir, epoch, bleu, val_records)
+        if log_path:
+            plog(f"[Val] Predicciones guardadas en: {log_path}")
 
         if bleu > best_bleu:
             best_bleu = bleu
