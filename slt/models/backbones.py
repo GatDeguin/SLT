@@ -5,7 +5,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Iterable, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -148,6 +148,20 @@ def _load_checkpoint(
         )
 
 
+def _extract_stub_config(checkpoint: object) -> Optional[dict[str, Any]]:
+    if not isinstance(checkpoint, Mapping):
+        return None
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    backbone_meta = metadata.get("backbone")
+    if not isinstance(backbone_meta, Mapping):
+        return None
+    valid_keys = set(ViTConfig.__dataclass_fields__.keys())
+    config = {key: backbone_meta[key] for key in valid_keys if key in backbone_meta}
+    return config or None
+
+
 def _convert_dinov2_state_dict(state_dict: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
     """Convert HuggingFace/local checkpoints to ``torchvision`` naming."""
 
@@ -278,7 +292,10 @@ def load_dinov2_backbone(
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        backbone = _build_torchvision_model(parsed["model"])
+        config = None
+        if parsed["model"] == "slt_vitsmall_patch16":
+            config = _extract_stub_config(checkpoint)
+        backbone = _build_torchvision_model(parsed["model"], config)
         _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
         _apply_freeze(backbone, freeze)
         return backbone
@@ -313,11 +330,19 @@ def _resolve_torchvision_weights(model_name: str, spec: str | None) -> Optional[
     raise ValueError(f"Unknown weight specification '{spec}' for model '{model_name}'")
 
 
-def _build_torchvision_model(model_name: str) -> nn.Module:
+def _build_torchvision_model(model_name: str, config: Optional[dict[str, Any]] = None) -> nn.Module:
+    if model_name == "slt_vitsmall_patch16":
+        vit_config = ViTConfig(**config) if config else None
+        return ViTSmallPatch16(vit_config)
     if tv_get_model is None:
-        raise ImportError(
-            "torchvision>=0.16 is required to instantiate DINOv2 models from checkpoints"
-        )
+        try:
+            return torch.hub.load(
+                "facebookresearch/dinov2", model_name, pretrained=False, trust_repo=True
+            )
+        except Exception as exc:  # pragma: no cover - graceful fallback
+            raise ImportError(
+                "torchvision>=0.16 is required to instantiate DINOv2 models from checkpoints"
+            ) from exc
     try:
         return tv_get_model(model_name, weights=None)
     except Exception as exc:  # pragma: no cover - defensive.

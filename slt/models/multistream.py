@@ -218,7 +218,7 @@ class MultiStreamEncoder(torch.nn.Module):
             # The implementation might expect additional arguments (e.g. variant).
             # In that case we silently skip auto-configuration and rely on manual wiring.
             return
-        except (RuntimeError, ImportError, ValueError) as exc:
+        except (RuntimeError, ImportError, ValueError, AttributeError) as exc:
             warnings.warn(
                 f"Unable to configure {module.__class__.__name__} with DINOv2 weights: {exc}",
                 RuntimeWarning,
