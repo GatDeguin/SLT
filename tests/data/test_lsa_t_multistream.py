@@ -68,6 +68,9 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
     assert sample.hand_r.shape == (4, 3, 32, 32)
     assert sample.pose.shape == (4, 39)
     assert sample.pad_mask.dtype == torch.bool
+    assert torch.equal(sample.pad_mask, torch.ones(4, dtype=torch.bool))
+    assert sample.length.dtype == torch.long
+    assert sample.length.item() == 4
     assert sample.miss_mask_hr.sum() == 0
     assert sample.miss_mask_hl.sum() == 4
     assert sample.text == "hola mundo"
@@ -83,8 +86,51 @@ def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
     assert data["face"].shape == (2, 4, 3, 32, 32)
     assert data["pose"].shape == (2, 4, 39)
     assert data["pad_mask"].dtype == torch.bool
+    assert torch.equal(data["lengths"], torch.tensor([4, 4], dtype=torch.long))
     assert data["texts"] == ["hola mundo", "hola mundo"]
     assert data["video_ids"] == ["vid001", "vid001"]
+
+
+def test_pad_mask_marks_padding_when_clip_shorter(synthetic_dataset: dict) -> None:
+    ds = LsaTMultiStream(T=8, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+
+    expected_mask = torch.tensor([1, 1, 1, 1, 1, 0, 0, 0], dtype=torch.bool)
+    assert torch.equal(sample.pad_mask, expected_mask)
+    assert sample.length.item() == 5
+
+
+class DummyTokenizer:
+    model_max_length = 16
+
+    def __call__(
+        self,
+        text_list,
+        *,
+        max_length,
+        padding,
+        truncation,
+        return_tensors,
+    ):
+        batch_size = len(text_list)
+        input_ids = torch.arange(batch_size * max_length, dtype=torch.long).view(batch_size, max_length)
+        attention_mask = torch.ones_like(input_ids)
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def test_cli_collate_propagates_masks_and_lengths(synthetic_dataset: dict) -> None:
+    from slt.__main__ import _build_collate
+
+    ds = LsaTMultiStream(T=8, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+    collate = _build_collate(DummyTokenizer(), max_length=6)
+
+    batch = collate([sample])
+
+    inputs = batch["inputs"]
+    assert torch.equal(inputs["pad_mask"], sample.pad_mask.unsqueeze(0))
+    assert torch.equal(inputs["encoder_attention_mask"], sample.pad_mask.unsqueeze(0).to(torch.long))
+    assert torch.equal(inputs["lengths"], sample.length.unsqueeze(0))
 
 
 def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:

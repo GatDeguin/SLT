@@ -40,6 +40,7 @@ class SampleItem:
     hand_r: torch.Tensor
     pose: torch.Tensor
     pad_mask: torch.Tensor
+    length: torch.Tensor
     miss_mask_hl: torch.Tensor
     miss_mask_hr: torch.Tensor
     text: str
@@ -160,6 +161,7 @@ class LsaTMultiStream(Dataset):
         hr_frames = self._list_frames(self.hand_r_dir, vid)
 
         T0 = max(len(face_frames), len(hl_frames), len(hr_frames))
+        T_valid = min(max(T0, 0), self.T)
         idxs = self._sample_indices(T0)
 
         pose_path = os.path.join(self.pose_dir, f"{vid}.npz")
@@ -205,7 +207,10 @@ class LsaTMultiStream(Dataset):
 
         pose_t = self._sample_pose(pose)
 
-        pad_mask = torch.ones(self.T, dtype=torch.bool)
+        pad_mask = torch.zeros(self.T, dtype=torch.bool)
+        if T_valid > 0:
+            pad_mask[:T_valid] = True
+        length = torch.tensor(T_valid, dtype=torch.long)
         miss_mask_hl = torch.tensor(miss_hl, dtype=torch.bool)
         miss_mask_hr = torch.tensor(miss_hr, dtype=torch.bool)
 
@@ -230,6 +235,7 @@ class LsaTMultiStream(Dataset):
             hand_r=hand_r,
             pose=pose_t,
             pad_mask=pad_mask,
+            length=length,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
             text=text,
@@ -305,6 +311,7 @@ def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
         "hand_r": stack_attr("hand_r"),
         "pose": stack_attr("pose"),
         "pad_mask": stack_attr("pad_mask"),
+        "lengths": stack_attr("length"),
         "miss_mask_hl": stack_attr("miss_mask_hl"),
         "miss_mask_hr": stack_attr("miss_mask_hr"),
         "texts": [sample.text for sample in batch_list],
