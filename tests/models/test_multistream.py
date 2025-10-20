@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import types
+from typing import Dict
 
 import pytest
 
@@ -275,3 +276,79 @@ def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
     assert all(param.requires_grad for param in backbones["face"].parameters())
     assert all(param.requires_grad for param in backbones["hand_left"].parameters())
     assert all(not param.requires_grad for param in backbones["hand_right"].parameters())
+
+
+def test_register_and_switch_backbones() -> None:
+    config = _tiny_vit_config()
+
+    class ConstantBackbone(torch.nn.Module):
+        def __init__(self, value: float) -> None:
+            super().__init__()
+            self.value = value
+            self.embed_dim = config.embed_dim
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            return torch.full((batch, self.embed_dim), self.value, device=x.device)
+
+    encoder = MultiStreamEncoder(
+        backbone_config=config,
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+
+    encoder.register_backbone("face", "const", lambda: ConstantBackbone(3.14))
+    encoder.activate_backbone("face", "const")
+
+    assert encoder.active_backbone_name("face") == "const"
+    assert "const" in encoder.available_backbones("face")["face"]
+
+    batch, time = 1, 2
+    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    hand = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+
+    output = encoder(face, hand, hand, pose)
+    assert output.shape == (batch, time, 16)
+
+
+def test_hand_masks_emitted_and_tracked() -> None:
+    config = _tiny_vit_config()
+    encoder = MultiStreamEncoder(
+        backbone_config=config,
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+
+    recorded: Dict[str, torch.Tensor] = {}
+
+    def hook(name: str, tensor: torch.Tensor) -> None:
+        recorded[name] = tensor
+
+    encoder.register_observer("hand_left.mask", hook)
+    encoder.register_observer("hand_right.mask", hook)
+    encoder.register_observer("hand.mask", hook)
+
+    batch, time = 1, 3
+    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+
+    miss_hl = torch.tensor([[True, False, True]])
+    miss_hr = torch.tensor([[False, False, True]])
+
+    _ = encoder(face, hand_l, hand_r, pose, miss_mask_hl=miss_hl, miss_mask_hr=miss_hr)
+
+    masks = encoder.last_hand_masks
+    assert torch.equal(masks["hand_left"], miss_hl)
+    assert torch.equal(masks["hand_right"], miss_hr)
+    assert "hand_left.mask" in recorded
+    assert "hand_right.mask" in recorded
+    assert "hand.mask" in recorded

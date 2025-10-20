@@ -5,7 +5,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -23,7 +23,13 @@ except Exception:  # pragma: no cover - optional dependency.
     tv_get_model_weights = None  # type: ignore
 
 
-BackboneFreeze = Union[bool, int, str, Iterable[str]]
+BackboneFreeze = Union[bool, int, str, Iterable[str], Mapping[str, Any]]
+BackboneSpec = Union[
+    str,
+    Mapping[str, Any],
+    nn.Module,
+    Callable[[], nn.Module],
+]
 
 
 def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
@@ -38,6 +44,52 @@ def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
 
     if isinstance(freeze, int):
         _freeze_first_blocks(module, freeze)
+        return
+
+    if isinstance(freeze, Mapping):
+        if not freeze:
+            return
+        if any(str(key).lower() in {"all", "full", "backbone"} for key in freeze):
+            flag = freeze.get("all") or freeze.get("full") or freeze.get("backbone")
+            if flag:
+                _apply_freeze(module, True)
+        blocks = freeze.get("blocks")
+        if blocks is not None:
+            _freeze_first_blocks(module, int(blocks))
+        if freeze.get("patch_embed"):
+            _freeze_patch_embed(module)
+        if freeze.get("head"):
+            _freeze_head(module)
+
+        modules = freeze.get("modules") or freeze.get("layers")
+        if modules:
+            for name in modules:
+                _freeze_named_module(module, name)
+
+        prefixes = freeze.get("prefixes") or freeze.get("parameters")
+        if prefixes:
+            _apply_freeze(module, tuple(prefixes))
+
+        names = freeze.get("names")
+        if names:
+            named_parameters = dict(module.named_parameters())
+            for name in names:
+                parameter = named_parameters.get(name)
+                if parameter is None:
+                    warnings.warn(
+                        f"Freeze configuration referenced unknown parameter '{name}'",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                parameter.requires_grad_(False)
+
+        excludes = freeze.get("exclude") or freeze.get("unfreeze")
+        if excludes:
+            exclude_prefixes = tuple(excludes)
+            for name, parameter in module.named_parameters():
+                if name.startswith(exclude_prefixes):
+                    parameter.requires_grad_(True)
         return
 
     if isinstance(freeze, str):
@@ -111,6 +163,30 @@ def _freeze_head(module: nn.Module) -> None:
         if isinstance(head_module, nn.Module):
             for parameter in head_module.parameters():
                 parameter.requires_grad_(False)
+
+
+def _freeze_named_module(module: nn.Module, name: str) -> None:
+    target = module
+    for part in name.split("."):
+        if not part:
+            continue
+        target = getattr(target, part, None)
+        if target is None:
+            warnings.warn(
+                f"Freeze configuration referenced unknown module '{name}'",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+    if not isinstance(target, nn.Module):
+        warnings.warn(
+            f"Freeze configuration expected '{name}' to be a module; received {type(target)!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    for parameter in target.parameters():
+        parameter.requires_grad_(False)
 
 
 def _load_checkpoint(
@@ -282,7 +358,10 @@ def load_dinov2_backbone(
         model = parsed["model"]
         checkpoint_path = hf_hub_download(repo_id, filename)
         checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        backbone = _build_torchvision_model(model)
+        config = None
+        if model == "slt_vitsmall_patch16":
+            config = _extract_stub_config(checkpoint)
+        backbone = _build_torchvision_model(model, config)
         _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
         _apply_freeze(backbone, freeze)
         return backbone
@@ -301,6 +380,122 @@ def load_dinov2_backbone(
         return backbone
 
     raise RuntimeError(f"Unsupported backbone source: {source}")
+
+
+def load_backbone(
+    spec: BackboneSpec,
+    *,
+    freeze: BackboneFreeze = False,
+    map_location: Optional[Union[str, torch.device]] = None,
+    trust_repo: bool = True,
+) -> nn.Module:
+    """Load a backbone from flexible specification formats.
+
+    Parameters
+    ----------
+    spec:
+        A string, mapping, callable or module describing the backbone. Strings
+        follow the same syntax as :func:`load_dinov2_backbone`. Mappings can
+        contain a ``type``/``source`` key with values ``torchvision``, ``hf`` or
+        ``file`` as well as the corresponding parameters. If ``freeze`` is
+        provided in the mapping it overrides the explicit ``freeze`` argument.
+    freeze:
+        Freeze configuration applied after instantiation.
+    map_location:
+        Optional location used when loading checkpoints.
+    trust_repo:
+        Whether to trust third-party repositories when using ``torch.hub``.
+    """
+
+    explicit_freeze = freeze
+
+    if isinstance(spec, nn.Module):
+        backbone = spec
+    elif callable(spec):
+        candidate = spec()
+        if not isinstance(candidate, nn.Module):
+            raise TypeError(
+                "Backbone factory callable must return an nn.Module instance"
+            )
+        backbone = candidate
+    elif isinstance(spec, Mapping):
+        spec_mapping = dict(spec)
+        mapping_freeze = spec_mapping.pop("freeze", explicit_freeze)
+        source = spec_mapping.get("type") or spec_mapping.get("source") or "dinov2"
+        source = str(source).lower()
+
+        if source in {"torchvision", "torchhub", "tv"}:
+            model = spec_mapping.get("model")
+            if model is None:
+                raise ValueError("Torchvision backbone mappings must specify 'model'")
+            weights = spec_mapping.get("weights")
+            tv_spec = f"{model}:{weights}" if weights not in (None, "") else str(model)
+            backbone = load_dinov2_backbone(
+                f"torchvision::{tv_spec}",
+                freeze=False,
+                map_location=map_location,
+                trust_repo=trust_repo,
+            )
+        elif source in {"hf", "huggingface"}:
+            repo_id = spec_mapping.get("repo_id") or spec_mapping.get("repository")
+            if repo_id is None:
+                raise ValueError("HuggingFace backbone mappings must include 'repo_id'")
+            filename = spec_mapping.get("filename") or "pytorch_model.bin"
+            model = (
+                spec_mapping.get("model")
+                or spec_mapping.get("architecture")
+                or "dinov2_vits14"
+            )
+            backbone = load_dinov2_backbone(
+                f"hf::{repo_id}:{filename}:{model}",
+                freeze=False,
+                map_location=map_location,
+                trust_repo=trust_repo,
+            )
+        elif source in {"file", "local", "path"}:
+            path = spec_mapping.get("path") or spec_mapping.get("checkpoint")
+            if path is None:
+                raise ValueError("File backbone mappings must include 'path'")
+            model = (
+                spec_mapping.get("model")
+                or spec_mapping.get("architecture")
+                or "dinov2_vits14"
+            )
+            backbone = load_dinov2_backbone(
+                f"file::{path}:{model}",
+                freeze=False,
+                map_location=map_location,
+                trust_repo=trust_repo,
+            )
+        elif source in {"dinov2", "default"}:
+            dinov2_spec = spec_mapping.get("spec") or spec_mapping.get("identifier")
+            if dinov2_spec is None:
+                raise ValueError("DINOv2 mappings must provide 'spec'")
+            backbone = load_dinov2_backbone(
+                str(dinov2_spec),
+                freeze=False,
+                map_location=map_location,
+                trust_repo=trust_repo,
+            )
+        else:
+            raise ValueError(f"Unsupported backbone source '{source}'")
+        explicit_freeze = mapping_freeze
+    elif isinstance(spec, str):
+        backbone = load_dinov2_backbone(
+            spec,
+            freeze=False,
+            map_location=map_location,
+            trust_repo=trust_repo,
+        )
+    else:
+        raise TypeError(
+            "Backbone specification must be a string, mapping, module or callable"
+        )
+
+    if explicit_freeze:
+        _apply_freeze(backbone, explicit_freeze)
+
+    return backbone
 
 
 def _resolve_torchvision_weights(model_name: str, spec: str | None) -> Optional[object]:
