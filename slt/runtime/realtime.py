@@ -267,6 +267,12 @@ INPUT_ORDER = (
 MASK_ORDER = ("pad_mask", "miss_mask_hl", "miss_mask_hr")
 ALL_INPUTS = INPUT_ORDER + MASK_ORDER
 
+_NUMPY_DTYPES: Dict[str, np.dtype[Any]] = {
+    "float32": np.dtype(np.float32),
+    "float": np.dtype(np.float32),
+    "bool": np.dtype(np.bool_),
+}
+
 
 def load_export_metadata(path: Path | str) -> Dict[str, Any]:
     """Carga un fichero JSON de metadatos generado por la exportación."""
@@ -279,8 +285,9 @@ def load_export_metadata(path: Path | str) -> Dict[str, Any]:
     return dict(data)
 
 
-def _ensure_inputs(inputs: Mapping[str, Any]) -> None:
-    missing = [name for name in ALL_INPUTS if name not in inputs]
+def _ensure_inputs(inputs: Mapping[str, Any], expected: Optional[Sequence[str]] = None) -> None:
+    required = expected if expected is not None else ALL_INPUTS
+    missing = [name for name in required if name not in inputs]
     if missing:
         raise KeyError(f"Missing required inputs: {', '.join(missing)}")
 
@@ -294,16 +301,30 @@ def _as_torch(value: Any, device: torch.device, *, cast_bool: bool = False) -> t
     return tensor.to(device)
 
 
-def _as_numpy(value: Any, *, cast_bool: bool = False) -> np.ndarray:
+def _tensor_to_numpy(value: Any) -> np.ndarray:
     if isinstance(value, np.ndarray):
-        array = value
-    elif isinstance(value, torch.Tensor):
-        array = value.detach().cpu().numpy()
-    else:
-        array = np.asarray(value)
-    if cast_bool:
-        return array.astype(np.bool_)
-    return array.astype(np.float32)
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _spec_numpy_dtype(spec: Mapping[str, Any]) -> np.dtype[Any]:
+    dtype = spec.get("dtype", "float32")
+    try:
+        return _NUMPY_DTYPES[dtype]
+    except KeyError as exc:  # pragma: no cover - defensive against unknown exports
+        raise ValueError(f"Unsupported dtype '{dtype}' in export metadata") from exc
+
+
+def _as_numpy_with_spec(value: Any, spec: Mapping[str, Any]) -> np.ndarray:
+    array = _tensor_to_numpy(value)
+    target_dtype = _spec_numpy_dtype(spec)
+    if array.dtype != target_dtype:
+        array = array.astype(target_dtype, copy=False)
+    if not array.flags.c_contiguous:
+        array = np.ascontiguousarray(array)
+    return array
 
 
 class TorchScriptEncoderRunner:
@@ -323,7 +344,7 @@ class TorchScriptEncoderRunner:
         self.module.eval()
 
     def __call__(self, inputs: Mapping[str, Any]) -> Tuple[torch.Tensor, ...]:
-        _ensure_inputs(inputs)
+        _ensure_inputs(inputs, INPUT_ORDER + MASK_ORDER)
         args = [
             _as_torch(inputs[name], self.device)
             for name in INPUT_ORDER
@@ -358,6 +379,10 @@ class OnnxRuntimeEncoderRunner:
             ) from exc
 
         self.metadata = dict(metadata)
+        self.input_specs = dict(self.metadata.get("inputs", {}))
+        self.input_order = (
+            tuple(self.input_specs.keys()) if self.input_specs else ALL_INPUTS
+        )
         self.session = ort.InferenceSession(
             str(onnx_path),
             providers=providers,
@@ -365,11 +390,13 @@ class OnnxRuntimeEncoderRunner:
         )
 
     def __call__(self, inputs: Mapping[str, Any]) -> Tuple[np.ndarray, ...]:
-        _ensure_inputs(inputs)
-        feed = {
-            name: _as_numpy(inputs[name], cast_bool=name in MASK_ORDER)
-            for name in ALL_INPUTS
-        }
+        _ensure_inputs(inputs, self.input_order)
+        feed = {}
+        for name in self.input_order:
+            spec = self.input_specs.get(name)
+            if spec is None:
+                spec = {"dtype": "bool" if name in MASK_ORDER else "float32"}
+            feed[name] = _as_numpy_with_spec(inputs[name], spec)
         outputs = self.session.run(None, feed)  # type: ignore[arg-type]
         return tuple(outputs)
 
@@ -382,6 +409,13 @@ class TensorRTEncoderRunner:
             import tensorrt as trt  # type: ignore
         except ImportError as exc:  # pragma: no cover - entorno sin TensorRT
             raise ImportError("TensorRT backend requires the 'tensorrt' package") from exc
+
+        try:
+            import cuda.cudart as cudart  # type: ignore
+        except ImportError as exc:  # pragma: no cover - entorno sin CUDA runtime
+            raise ImportError(
+                "TensorRT backend requires the 'cuda-python' package for CUDA bindings"
+            ) from exc
 
         self.metadata = dict(metadata)
         self.engine_path = Path(engine_path)
@@ -397,12 +431,118 @@ class TensorRTEncoderRunner:
         if context is None:
             raise RuntimeError("Unable to create TensorRT execution context")
         self.context = context
+        self.trt = trt
+        self.cudart = cudart
+        status, stream = self.cudart.cudaStreamCreate()
+        self._check_cuda(status, "cudaStreamCreate")
+        self.stream = stream
+        self.input_specs = dict(self.metadata.get("inputs", {}))
+        self.output_specs = dict(self.metadata.get("outputs", {}))
+        self.input_order = tuple(self.input_specs.keys())
+        self.output_order = tuple(self.output_specs.keys())
+        binding_count = int(self.engine.num_bindings)
+        self._binding_indices = {
+            self.engine.get_binding_name(index): index
+            for index in range(binding_count)
+        }
+        if not self.input_order:
+            self.input_order = tuple(
+                self.engine.get_binding_name(index)
+                for index in range(binding_count)
+                if self.engine.binding_is_input(index)
+            )
+        if not self.output_order:
+            self.output_order = tuple(
+                self.engine.get_binding_name(index)
+                for index in range(binding_count)
+                if not self.engine.binding_is_input(index)
+            )
+        self._binding_dtypes = {
+            name: np.dtype(trt.nptype(self.engine.get_binding_dtype(index)))
+            for name, index in self._binding_indices.items()
+        }
 
-    def __call__(self, inputs: Mapping[str, Any]) -> Tuple[Any, ...]:  # pragma: no cover - requiere CUDA
-        raise NotImplementedError(
-            "TensorRT execution requires explicit CUDA bindings."
-            " Use `context` and `engine` attributes for custom pipelines."
-        )
+    def _check_cuda(self, status: int, action: str) -> None:
+        if status != 0:
+            raise RuntimeError(f"CUDA call failed during {action} (status={status})")
+
+    def __call__(self, inputs: Mapping[str, Any]) -> Tuple[Any, ...]:
+        _ensure_inputs(inputs, self.input_order)
+        feed: Dict[str, np.ndarray] = {}
+        for name in self.input_order:
+            spec = self.input_specs.get(name)
+            if spec is None:
+                spec = {"dtype": "bool" if name in MASK_ORDER else "float32"}
+            feed[name] = _as_numpy_with_spec(inputs[name], spec)
+
+        binding_count = int(self.engine.num_bindings)
+        bindings = [0] * binding_count
+        allocations: list[int] = []
+        try:
+            for name in self.input_order:
+                index = self._binding_indices.get(name)
+                if index is None:
+                    raise KeyError(f"Input binding '{name}' not found in TensorRT engine")
+                array = feed[name]
+                if not self.context.set_binding_shape(index, tuple(array.shape)):
+                    raise RuntimeError(f"Unable to set binding shape for '{name}'")
+                size = array.nbytes
+                status, device_mem = self.cudart.cudaMalloc(size)
+                self._check_cuda(status, f"cudaMalloc({name})")
+                allocations.append(device_mem)
+                bindings[index] = device_mem
+                status = self.cudart.cudaMemcpyAsync(
+                    device_mem,
+                    array.ctypes.data,
+                    size,
+                    self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                    self.stream,
+                )
+                self._check_cuda(status, f"cudaMemcpyAsync H2D ({name})")
+
+            output_buffers: Dict[str, Tuple[np.ndarray, int]] = {}
+            for name in self.output_order:
+                index = self._binding_indices.get(name)
+                if index is None:
+                    raise KeyError(f"Output binding '{name}' not found in TensorRT engine")
+                shape = tuple(self.context.get_binding_shape(index))
+                if any(dim < 0 for dim in shape):
+                    raise RuntimeError(
+                        f"Dynamic shape unresolved for output '{name}': {shape}"
+                    )
+                dtype = self._binding_dtypes.get(name)
+                if dtype is None:
+                    raise KeyError(f"Missing dtype for binding '{name}'")
+                host_array = np.empty(shape, dtype=dtype)
+                size = host_array.nbytes
+                status, device_mem = self.cudart.cudaMalloc(size)
+                self._check_cuda(status, f"cudaMalloc({name})")
+                allocations.append(device_mem)
+                bindings[index] = device_mem
+                output_buffers[name] = (host_array, device_mem)
+
+            if not self.context.execute_async_v2(bindings=bindings, stream_handle=self.stream):
+                raise RuntimeError("TensorRT execution failed")
+
+            results: Dict[str, np.ndarray] = {}
+            for name, (host_array, device_mem) in output_buffers.items():
+                status = self.cudart.cudaMemcpyAsync(
+                    host_array.ctypes.data,
+                    device_mem,
+                    host_array.nbytes,
+                    self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    self.stream,
+                )
+                self._check_cuda(status, f"cudaMemcpyAsync D2H ({name})")
+                results[name] = host_array
+
+            status = self.cudart.cudaStreamSynchronize(self.stream)
+            self._check_cuda(status, "cudaStreamSynchronize")
+        finally:
+            for ptr in allocations:
+                self.cudart.cudaFree(ptr)
+
+        return tuple(results[name] for name in self.output_order)
 
 def preprocess_crop(crop: np.ndarray) -> torch.Tensor:
     """Convierte un recorte BGR en un tensor normalizado CHW."""
