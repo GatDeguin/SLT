@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import types
+from pathlib import Path
 from typing import Dict, Optional
 
 import pytest
@@ -11,6 +12,12 @@ torch = pytest.importorskip("torch")
 
 from slt.models.backbones import load_dinov2_backbone
 from slt.models.multistream import MultiStreamEncoder
+from slt.models.single_signer import (
+    CHECKPOINT_ENV_VAR,
+    CHECKPOINT_FILENAME,
+    build_single_signer_backbones,
+)
+from slt.models.temporal import TextSeq2SeqDecoder
 
 
 IMAGE_SIZE = 32
@@ -25,6 +32,54 @@ class ConstantBackbone(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.size(0)
         return torch.full((batch, self.embed_dim), self.value, device=x.device, dtype=x.dtype)
+
+
+def _write_dummy_single_signer_checkpoint(path: Path) -> None:
+    backbone_kwargs = {
+        "in_channels": 3,
+        "base_channels": 8,
+        "features": 16,
+        "dropout": 0.0,
+    }
+    encoder_kwargs = {
+        "projector_dim": 8,
+        "d_model": 16,
+        "pose_dim": 39,
+        "positional_num_positions": 16,
+        "projector_dropout": 0.0,
+        "fusion_dropout": 0.0,
+        "temporal_kwargs": {"nhead": 2, "nlayers": 1, "dim_feedforward": 32, "dropout": 0.0},
+    }
+    backbones = build_single_signer_backbones(**backbone_kwargs)
+    encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
+
+    decoder_kwargs = {
+        "d_model": 16,
+        "vocab_size": 32,
+        "num_layers": 1,
+        "num_heads": 2,
+        "dropout": 0.0,
+        "pad_token_id": 0,
+        "eos_token_id": 1,
+    }
+    decoder = TextSeq2SeqDecoder(**decoder_kwargs)
+
+    checkpoint = {
+        "schema_version": "1.0",
+        "task": "single_signer",
+        "encoder": {
+            "init_kwargs": encoder_kwargs,
+            "backbone_kwargs": backbone_kwargs,
+            "state_dict": encoder.state_dict(),
+        },
+        "decoder": {
+            "init_kwargs": decoder_kwargs,
+            "state_dict": decoder.state_dict(),
+        },
+        "tokenizer": {"pad_token_id": 0, "eos_token_id": 1},
+        "metadata": {"dummy": True},
+    }
+    torch.save(checkpoint, path)
 
 
 def _make_encoder(**kwargs) -> MultiStreamEncoder:
@@ -418,3 +473,19 @@ def test_stream_state_dict_roundtrip() -> None:
     load_info = fresh.load_stream_state_dict("face", face_state)
     assert not load_info.missing_keys
     assert not load_info.unexpected_keys
+
+
+def test_from_pretrained_returns_loaded_encoder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint_path = tmp_path / CHECKPOINT_FILENAME
+    _write_dummy_single_signer_checkpoint(checkpoint_path)
+    monkeypatch.setenv(CHECKPOINT_ENV_VAR, str(checkpoint_path))
+
+    encoder = MultiStreamEncoder.from_pretrained()
+
+    assert isinstance(encoder, MultiStreamEncoder)
+    assert hasattr(encoder, "pretrained_metadata")
+    metadata = encoder.pretrained_metadata
+    assert metadata.task == "single_signer"
+    assert metadata.encoder_kwargs
+    assert metadata.backbone_kwargs["features"] == 16
+    monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)

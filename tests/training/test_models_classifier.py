@@ -115,6 +115,7 @@ def test_classifier_forward_backward_with_stream_backbones(monkeypatch, batch_si
         face_backbone="stub",
         hand_left_backbone="stub",
         hand_right_backbone="stub",
+        pretrained="none",
     )
 
     tokenizer = TinyTokenizer()

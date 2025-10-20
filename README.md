@@ -1,9 +1,9 @@
 # SLT — Pipeline multi-stream para `single_signer`
 
 Este repositorio agrupa las utilidades necesarias para preparar datos, entrenar,
-evaluar y exportar el stub multi-stream incluido en el paquete `slt`. Los
-scripts están pensados como un flujo de referencia sobre el dataset
-`single_signer`, cuyo CSV de subtítulos principal es `meta.csv`.
+evaluar y exportar el modelo multi-stream validado para el flujo `single_signer`
+del paquete `slt`. Los scripts están pensados como un flujo de referencia sobre
+el dataset `single_signer`, cuyo CSV de subtítulos principal es `meta.csv`.
 
 ## Contenido del repositorio
 
@@ -18,6 +18,25 @@ scripts están pensados como un flujo de referencia sobre el dataset
 
 Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
 `docs/pretraining.md` para ampliar cada etapa.
+
+### Pesos pre-entrenados
+
+El repositorio no incluye el checkpoint validado para `single_signer` debido a
+restricciones de tamaño. Descarga `single_signer_multistream.pt` desde la
+ubicación compartida por el equipo y colócalo en
+`data/single_signer/single_signer_multistream.pt` o expón su ruta mediante la
+variable de entorno `SLT_SINGLE_SIGNER_CHECKPOINT`. Todas las CLI buscarán el
+archivo siguiendo ese orden; puedes desactivarlo con `--pretrained none`. El
+encoder puede instanciarse de forma directa con:
+
+```python
+from slt.models import MultiStreamEncoder
+
+encoder = MultiStreamEncoder.from_pretrained(
+    "single_signer",
+    checkpoint_path="data/single_signer/single_signer_multistream.pt",
+)
+```
 
 ## Instalación
 
@@ -91,7 +110,11 @@ El contrato de datos completo se detalla en `docs/data_contract.md`.
 
 ## Entrenamiento rápido (`python -m slt`)
 
-La CLI empaquetada ejecuta un entrenamiento corto para verificar el pipeline:
+La CLI empaquetada ejecuta un entrenamiento corto para verificar el pipeline.
+Por defecto intenta inicializar con los pesos `single_signer` descargados, por
+lo que puedes comenzar a afinar el modelo directamente. Si el checkpoint vive en
+una ruta distinta utiliza `--pretrained-checkpoint /ruta/al/archivo.pt`. Para
+reiniciar desde parámetros aleatorios añade `--pretrained none`.
 
 ```bash
 python -m slt \
@@ -115,7 +138,10 @@ Consulta `docs/train_slt_multistream_v9.md` para conocer todos los parámetros.
 
 ## Evaluación
 
-Evalúa uno o varios checkpoints y genera predicciones, métricas y reportes:
+Evalúa uno o varios checkpoints y genera predicciones, métricas y reportes. Para
+usar el preset validado sin un checkpoint propio pasa `--checkpoint single_signer`
+y, si el archivo no vive en `data/single_signer/`, añade
+`--pretrained-checkpoint /ruta/al/archivo.pt`:
 
 ```bash
 python tools/eval_slt_multistream_v9.py \
@@ -135,20 +161,23 @@ herramientas analíticas mediante `docs/metrics_dashboard_integration.py`.
 
 ## Exportación y demos en tiempo real
 
-Convierte el encoder a ONNX o TorchScript para ejecutarlo fuera de PyTorch:
+Convierte el encoder a ONNX o TorchScript para ejecutarlo fuera de PyTorch. El
+ejemplo siguiente exporta el preset `single_signer`; añade
+`--pretrained-checkpoint /ruta/al/archivo.pt` si el checkpoint descargado no se
+encuentra en `data/single_signer/`:
 
 ```bash
 python tools/export_onnx_encoder_v9.py \
-  --checkpoint work_dirs/single_signer_demo/best.pt \
+  --checkpoint single_signer \
   --onnx exports/single_signer_encoder.onnx \
   --torchscript exports/single_signer_encoder.ts \
-  --image-size 224 --sequence-length 64 --d-model 512
+  --sequence-length 64
 ```
 
 Valida los artefactos con `tools/demo_realtime_multistream.py` (webcam) o
 `tools/test_realtime_pipeline.py` (video en disco). Ambos aceptan modelos
 TorchScript/ONNX y tokenizadores de HuggingFace. Si no se especifica un modelo,
-usarán el stub embebido para depuración rápida.
+utilizarán el preset validado (asegúrate de tener el checkpoint descargado).
 
 ## Preentrenamiento de backbones
 

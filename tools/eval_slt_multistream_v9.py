@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
+from slt.models.single_signer import load_single_signer_components
 from slt.utils.text import (
     TokenizerValidationError,
     character_error_rate,
@@ -49,22 +50,24 @@ class PredictionItem:
 
 @dataclass
 class ModelConfig:
-    """Configuración del modelo stub utilizada durante la evaluación."""
+    """Configuración del modelo utilizada durante la evaluación."""
 
     image_size: int = 224
-    projector_dim: int = 256
-    d_model: int = 512
+    projector_dim: int = 128
+    d_model: int = 128
     pose_landmarks: int = 13
-    projector_dropout: float = 0.0
-    fusion_dropout: float = 0.0
-    temporal_nhead: int = 8
-    temporal_layers: int = 6
-    temporal_dim_feedforward: int = 2048
-    temporal_dropout: float = 0.1
+    projector_dropout: float = 0.05
+    fusion_dropout: float = 0.05
+    temporal_nhead: int = 4
+    temporal_layers: int = 3
+    temporal_dim_feedforward: int = 384
+    temporal_dropout: float = 0.05
     sequence_length: int = 128
     decoder_layers: int = 2
-    decoder_heads: int = 8
+    decoder_heads: int = 4
     decoder_dropout: float = 0.1
+    pretrained: Optional[str] = "single_signer"
+    pretrained_checkpoint: Optional[Path] = None
 
 
 @dataclass
@@ -82,6 +85,23 @@ class MultiStreamClassifier(nn.Module):
 
     def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
         super().__init__()
+
+        pretrained = (config.pretrained or "").strip().lower()
+        if pretrained and pretrained not in {"none", "false"}:
+            if pretrained not in {"single_signer", "single-signer"}:
+                raise ValueError(
+                    "Identificador de pesos no soportado. Usa 'single_signer' o 'none'."
+                )
+            encoder, decoder, metadata = load_single_signer_components(
+                tokenizer,
+                checkpoint_path=config.pretrained_checkpoint,
+                map_location=torch.device("cpu"),
+                strict=True,
+            )
+            self.encoder = encoder
+            self.decoder = decoder
+            setattr(self, "pretrained_metadata", metadata)
+            return
 
         vit_config = ViTConfig(image_size=config.image_size)
         temporal_kwargs = {
@@ -206,21 +226,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pin-memory", dest="pin_memory", action="store_true", help="Habilita pin_memory en DataLoader")
     parser.set_defaults(pin_memory=True)
 
-    parser.add_argument("--image-size", type=int, default=224, help="Tamaño de imagen esperado por el ViT stub")
-    parser.add_argument("--projector-dim", type=int, default=256, help="Dimensión de los proyectores de stream")
-    parser.add_argument("--d-model", type=int, default=512, help="Dimensión del espacio fusionado")
+    parser.add_argument("--image-size", type=int, default=224, help="Tamaño de imagen esperado por el encoder")
+    parser.add_argument("--projector-dim", type=int, default=128, help="Dimensión de los proyectores de stream")
+    parser.add_argument("--d-model", type=int, default=128, help="Dimensión del espacio fusionado")
     parser.add_argument("--pose-landmarks", type=int, default=13, help="Cantidad de landmarks en el stream de pose")
-    parser.add_argument("--projector-dropout", type=float, default=0.0, help="Dropout aplicado a proyectores")
-    parser.add_argument("--fusion-dropout", type=float, default=0.0, help="Dropout aplicado tras la fusión")
-    parser.add_argument("--temporal-nhead", type=int, default=8, help="Número de cabezales de atención temporal")
-    parser.add_argument("--temporal-layers", type=int, default=6, help="Capas del codificador temporal")
+    parser.add_argument("--projector-dropout", type=float, default=0.05, help="Dropout aplicado a proyectores")
+    parser.add_argument("--fusion-dropout", type=float, default=0.05, help="Dropout aplicado tras la fusión")
+    parser.add_argument("--temporal-nhead", type=int, default=4, help="Número de cabezales de atención temporal")
+    parser.add_argument("--temporal-layers", type=int, default=3, help="Capas del codificador temporal")
     parser.add_argument(
         "--temporal-dim-feedforward",
         type=int,
-        default=2048,
+        default=384,
         help="Dimensión del feedforward en el codificador temporal",
     )
-    parser.add_argument("--temporal-dropout", type=float, default=0.1, help="Dropout del codificador temporal")
+    parser.add_argument("--temporal-dropout", type=float, default=0.05, help="Dropout del codificador temporal")
     parser.add_argument("--sequence-length", type=int, default=128, help="Cantidad de frames muestreados por video")
     parser.add_argument(
         "--decoder-layers",
@@ -231,7 +251,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--decoder-heads",
         type=int,
-        default=8,
+        default=4,
         help="Cabezas de atención del decoder seq2seq",
     )
     parser.add_argument(
@@ -253,6 +273,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Longitud máxima utilizada al generar predicciones",
     )
 
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default="single_signer",
+        help="Pesos pre-entrenados a cargar (single_signer o none)",
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Ruta al checkpoint single_signer descargado. Solo aplica cuando --pretrained"
+            " está activo."
+        ),
+    )
     parser.add_argument("--num-beams", type=int, default=1, help="Cantidad de beams para la decodificación")
     parser.add_argument(
         "--max-new-tokens",
@@ -311,6 +346,8 @@ def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -
         decoder_layers=args.decoder_layers,
         decoder_heads=args.decoder_heads,
         decoder_dropout=args.decoder_dropout,
+        pretrained=args.pretrained,
+        pretrained_checkpoint=args.pretrained_checkpoint,
     )
     return MultiStreamClassifier(config, tokenizer)
 
