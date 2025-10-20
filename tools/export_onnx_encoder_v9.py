@@ -553,62 +553,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
-            "face": {1: "T"},
-            "hand_l": {1: "T"},
-            "hand_r": {1: "T"},
-            "pose": {1: "T"},
-            "pad_mask": {1: "T"},
-            "miss_mask_hl": {1: "T"},
-            "miss_mask_hr": {1: "T"},
-            "encoded": {1: "T"},
-            "face_head": {1: "T"},
-            "hand_left_head": {1: "T"},
-            "hand_right_head": {1: "T"},
-            "pose_head": {1: "T"},
-            "hand_mask": {1: "T"},
-            "padding_mask": {1: "T"},
-        }
-        with torch.no_grad():
-            torch.onnx.export(
-                export_module,
-                positional_args,
-                args.onnx,
-                kwargs=keyword_args,
-                input_names=[
-                    "face",
-                    "hand_l",
-                    "hand_r",
-                    "pose",
-                    "pad_mask",
-                    "miss_mask_hl",
-                    "miss_mask_hr",
-                ],
-                output_names=[
-                    "encoded",
-                    "face_head",
-                    "hand_left_head",
-                    "hand_right_head",
-                    "pose_head",
-                    "hand_mask",
-                    "padding_mask",
-                ],
-                dynamic_axes=dynamic_axes,
-                opset_version=args.opset,
-                fallback=True,
-                operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
-            )
-
-    if args.torchscript is not None:
-        args.torchscript.parent.mkdir(parents=True, exist_ok=True)
-        with torch.no_grad():
-            traced = torch.jit.trace(
-                export_module,
-                positional_args,
-                check_trace=False,
-                strict=False,
-                example_kwarg_inputs=keyword_args,
-            )
-        traced.save(str(args.torchscript))
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
