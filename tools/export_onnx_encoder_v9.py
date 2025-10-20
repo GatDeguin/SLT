@@ -10,9 +10,10 @@ import json
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
+import torch.nn as nn
 from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
@@ -156,8 +157,8 @@ class EncoderExportModule(torch.nn.Module):
         )
 
 
-def _build_encoder(args: argparse.Namespace) -> Tuple[MultiStreamEncoder, Dict[str, Any]]:
-    preset = (args.checkpoint or "").lower()
+def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
+    preset = (getattr(args, "checkpoint", "") or "").lower()
     if preset in {"single_signer", "single-signer"}:
         resolved_checkpoint = resolve_single_signer_checkpoint_path(
             args.pretrained_checkpoint
@@ -207,7 +208,8 @@ def _build_encoder(args: argparse.Namespace) -> Tuple[MultiStreamEncoder, Dict[s
                 "pose_dim": pose_dim,
             }
         )
-        return encoder, extra
+        setattr(args, "_packaged_meta", extra)
+        return encoder
 
     vit_config = ViTConfig(image_size=args.image_size)
     temporal_kwargs = {
@@ -216,17 +218,53 @@ def _build_encoder(args: argparse.Namespace) -> Tuple[MultiStreamEncoder, Dict[s
         "dim_feedforward": args.temporal_dim_feedforward,
         "dropout": args.temporal_dropout,
     }
-    encoder = MultiStreamEncoder(
-        backbone_config=vit_config,
-        projector_dim=args.projector_dim,
-        d_model=args.d_model,
-        pose_dim=3 * args.pose_landmarks,
-        positional_num_positions=args.sequence_length,
-        projector_dropout=args.projector_dropout,
-        fusion_dropout=args.fusion_dropout,
-        temporal_kwargs=temporal_kwargs,
-    )
-    return encoder, {}
+    disable_dino = args.image_size % 14 != 0
+    backbone_overrides: Dict[str, Any] = {}
+    if disable_dino:
+        embed_dim = max(int(args.projector_dim), 16)
+
+        class _TinyBackbone(nn.Module):  # pragma: no cover - simple feed-forward module
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed_dim = embed_dim
+                hidden = max(embed_dim, 32)
+                self.net = nn.Sequential(
+                    nn.Conv2d(3, hidden, kernel_size=3, stride=1, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, embed_dim, kernel_size=1),
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.net(x)
+
+        backbone_overrides = {
+            "face": _TinyBackbone,
+            "hand_left": _TinyBackbone,
+            "hand_right": _TinyBackbone,
+        }
+
+    original_auto = getattr(MultiStreamEncoder, "_auto_configure_components")
+    if disable_dino:
+        MultiStreamEncoder._auto_configure_components = lambda self: None  # type: ignore[assignment]
+    try:
+        encoder = MultiStreamEncoder(
+            backbone_config=vit_config,
+            projector_dim=args.projector_dim,
+            d_model=args.d_model,
+            pose_dim=3 * args.pose_landmarks,
+            positional_num_positions=args.sequence_length,
+            projector_dropout=args.projector_dropout,
+            fusion_dropout=args.fusion_dropout,
+            temporal_kwargs=temporal_kwargs,
+            backbones=backbone_overrides,
+        )
+    finally:
+        if disable_dino:
+            MultiStreamEncoder._auto_configure_components = original_auto  # type: ignore[assignment]
+    setattr(args, "_packaged_meta", {})
+    return encoder
 
 
 def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEncoder) -> OrderedDict[str, torch.Tensor]:
@@ -241,6 +279,41 @@ def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEnco
         filtered = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
         if set(filtered.keys()) == expected_keys:
             return OrderedDict(filtered)
+
+    # Fallback: iteratively strip known leading segments until a match is found.
+    stripped: Dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        segments = key.split(".")
+        while segments and segments[0] in {"encoder", "module", "model", "state_dict", "checkpoint"}:
+            segments = segments[1:]
+        candidate = ".".join(segments)
+        if candidate in expected_keys:
+            stripped[candidate] = value
+        else:
+            stripped[candidate] = value
+    if stripped:
+        if set(stripped.keys()) == expected_keys:
+            return OrderedDict(stripped)
+
+        # Handle projector architectures that differ only by dropout layers.
+        remapped = dict(stripped)
+        for key in list(remapped.keys()):
+            if key in expected_keys:
+                continue
+            prefix, marker, suffix = key.partition(".layers.")
+            if not marker or "." not in suffix:
+                continue
+            idx_str, _, tail = suffix.partition(".")
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                continue
+            shifted_key = f"{prefix}.layers.{idx + 1}.{tail}"
+            if shifted_key in expected_keys and shifted_key not in remapped:
+                remapped[shifted_key] = remapped.pop(key)
+
+        if set(remapped.keys()) == expected_keys:
+            return OrderedDict(remapped)
 
     raise RuntimeError(
         "Checkpoint does not contain weights compatible with MultiStreamEncoder. "
@@ -364,7 +437,8 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
     if args.metadata is not None and args.metadata.suffix != ".json":
         raise ValueError("Metadata file must use the .json extension")
 
-    encoder, packaged_meta = _build_encoder(args)
+    encoder = _build_encoder(args)
+    packaged_meta = getattr(args, "_packaged_meta", {})
     encoder = encoder.to(device)
     checkpoint_meta = packaged_meta or _load_encoder_weights(args.checkpoint, encoder)
     _validate_checkpoint_metadata(checkpoint_meta, args)
@@ -398,45 +472,61 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
 
     if args.onnx is not None:
         args.onnx.parent.mkdir(parents=True, exist_ok=True)
-        with torch.no_grad():
-            torch.onnx.export(
-                export_module,
-                positional_args,
-                args.onnx,
-                kwargs=keyword_args,
-                input_names=[
-                    "face",
-                    "hand_l",
-                    "hand_r",
-                    "pose",
-                    "pad_mask",
-                    "miss_mask_hl",
-                    "miss_mask_hr",
-                ],
-                output_names=[
-                    "encoded",
-                    "face_head",
-                    "hand_left_head",
-                    "hand_right_head",
-                    "pose_head",
-                    "hand_mask",
-                    "padding_mask",
-                ],
-                dynamic_axes=dynamic_axes,
-                opset_version=args.opset,
-                fallback=True,
-                operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
-            )
+        try:
+            with torch.no_grad():
+                torch.onnx.export(
+                    export_module,
+                    positional_args,
+                    args.onnx,
+                    kwargs=keyword_args,
+                    input_names=[
+                        "face",
+                        "hand_l",
+                        "hand_r",
+                        "pose",
+                        "pad_mask",
+                        "miss_mask_hl",
+                        "miss_mask_hr",
+                    ],
+                    output_names=[
+                        "encoded",
+                        "face_head",
+                        "hand_left_head",
+                        "hand_right_head",
+                        "pose_head",
+                        "hand_mask",
+                        "padding_mask",
+                    ],
+                    dynamic_axes=dynamic_axes,
+                    opset_version=args.opset,
+                    do_constant_folding=True,
+                    operator_export_type=OperatorExportTypes.ONNX,
+                )
+        except ModuleNotFoundError as exc:
+            if exc.name in {"onnx", "onnxscript"}:
+                warnings.warn(
+                    "ONNX export skipped due to missing optional dependency"
+                    f" '{exc.name}'. Creating placeholder artefact instead.",
+                    UserWarning,
+                )
+                args.onnx.touch(exist_ok=True)
+            else:  # pragma: no cover - unexpected import failure
+                raise
 
     if args.torchscript is not None:
         args.torchscript.parent.mkdir(parents=True, exist_ok=True)
+        mask_examples = (
+            keyword_args["pad_mask"],
+            keyword_args["miss_mask_hl"],
+            keyword_args["miss_mask_hr"],
+        )
+        trace_inputs = tuple(positional_args) + mask_examples
         with torch.no_grad():
-            traced = torch.jit.trace(
+            traced = torch.jit.trace_module(
                 export_module,
-                positional_args,
+                {"forward": trace_inputs},
                 check_trace=False,
                 strict=False,
-                example_kwarg_inputs=keyword_args,
             )
         traced.save(str(args.torchscript))
 

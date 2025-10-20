@@ -349,12 +349,12 @@ class TorchScriptEncoderRunner:
             _as_torch(inputs[name], self.device)
             for name in INPUT_ORDER
         ]
-        kwargs = {
-            name: _as_torch(inputs[name], self.device, cast_bool=True)
+        mask_args = [
+            _as_torch(inputs[name], self.device, cast_bool=True)
             for name in MASK_ORDER
-        }
+        ]
         with torch.no_grad():
-            outputs = self.module(*args, **kwargs)
+            outputs = self.module(*args, *mask_args)
         if isinstance(outputs, torch.Tensor):  # pragma: no cover - torchscript API quirk
             return (outputs,)
         return tuple(outputs)
