@@ -1,170 +1,27 @@
-"""Demo de entrenamiento corto para ``python -m slt``.
+"""Entrada de demostración para ``python -m slt``.
 
-Este módulo reproduce el ejemplo del archivo ``Proyecto`` utilizando la
-implementación modular del paquete. Instancia el dataset multi-stream,
-construye *DataLoaders* y ejecuta un bucle de entrenamiento/validación de
-unas pocas épocas para verificar la integración de los componentes stub.
-"""
+El módulo ejecuta un entrenamiento corto utilizando los mismos componentes que
+la CLI completa de ``tools/train_slt_multistream_v9.py``. Acepta archivos de
+configuración externos (JSON/YAML) y permite sobreescribir parámetros mediante
+la bandera ``--set`` para facilitar experimentos rápidos."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import DataLoader
 
-from .data import LsaTMultiStream, collate_fn
-from transformers import PreTrainedTokenizerBase
-
-from .models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
+from .data import LsaTMultiStream
+from .training.configuration import resolve_configs
+from .training.data import create_dataloader, normalise_mix_spec
+from .training.models import MultiStreamClassifier
+from .training.optim import create_optimizer
 from .training.loops import eval_epoch, train_epoch
 from .utils.general import set_seed
-from .utils.text import create_tokenizer, encode_batch
-
-
-class _DemoModel(nn.Module):
-    """Encoder + decoder stub utilizados durante la demostración."""
-
-    def __init__(
-        self,
-        *,
-        image_size: int = 224,
-        sequence_length: int = 64,
-        projector_dim: int = 256,
-        d_model: int = 512,
-        pose_landmarks: int = 13,
-        tokenizer: PreTrainedTokenizerBase,
-        decoder_layers: int = 2,
-        decoder_heads: int = 8,
-        decoder_dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-
-        vit_config = ViTConfig(image_size=image_size)
-        temporal_kwargs = {
-            "nhead": 8,
-            "nlayers": 4,
-            "dim_feedforward": 2048,
-            "dropout": 0.1,
-        }
-        self.encoder = MultiStreamEncoder(
-            backbone_config=vit_config,
-            projector_dim=projector_dim,
-            d_model=d_model,
-            pose_dim=3 * pose_landmarks,
-            positional_num_positions=sequence_length,
-            temporal_kwargs=temporal_kwargs,
-        )
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if not vocab_size:
-            vocab_size = len(tokenizer)
-        self.decoder = TextSeq2SeqDecoder(
-            d_model=d_model,
-            vocab_size=int(vocab_size),
-            num_layers=decoder_layers,
-            num_heads=decoder_heads,
-            dropout=decoder_dropout,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-        )
-
-    def forward(
-        self,
-        *,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        miss_mask_hl: Optional[torch.Tensor] = None,
-        miss_mask_hr: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        decoder_attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        encoded = self.encoder(
-            face,
-            hand_l,
-            hand_r,
-            pose,
-            pad_mask=pad_mask,
-            miss_mask_hl=miss_mask_hl,
-            miss_mask_hr=miss_mask_hr,
-        )
-        if encoder_attention_mask is None and pad_mask is not None:
-            encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            labels=labels,
-            decoder_attention_mask=decoder_attention_mask,
-        )
-
-
-def _build_collate(tokenizer: PreTrainedTokenizerBase, *, max_length: int):
-    """Crea una función ``collate_fn`` que incluye etiquetas tokenizadas."""
-
-    def _collate(batch: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-        merged = collate_fn(batch)
-        tokenized = encode_batch(
-            tokenizer,
-            merged["texts"],
-            max_length=max_length,
-            padding="max_length",
-            truncation=True,
-        )
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        inputs: Dict[str, torch.Tensor] = {
-            "face": merged["face"],
-            "hand_l": merged["hand_l"],
-            "hand_r": merged["hand_r"],
-            "pose": merged["pose"],
-            "pose_conf_mask": merged["pose_conf_mask"],
-            "pad_mask": merged["pad_mask"],
-            "lengths": merged["lengths"],
-            "miss_mask_hl": merged["miss_mask_hl"],
-            "miss_mask_hr": merged["miss_mask_hr"],
-            "labels": labels,
-            "decoder_attention_mask": attention_mask,
-            "encoder_attention_mask": merged["pad_mask"].to(torch.long),
-        }
-
-        return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
-
-    return _collate
-
-
-def _create_loader(
-    dataset: LsaTMultiStream,
-    *,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    pin_memory: bool,
-    tokenizer: PreTrainedTokenizerBase,
-    max_length: int,
-) -> DataLoader:
-    collate = _build_collate(tokenizer, max_length=max_length)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate,
-    )
+from .utils.text import create_tokenizer
 
 
 def _select_device(device_flag: str) -> torch.device:
@@ -175,10 +32,77 @@ def _select_device(device_flag: str) -> torch.device:
     return torch.device(device_flag)
 
 
+def _build_cli_overrides(
+    args: argparse.Namespace,
+    mix_streams: Optional[Dict[str, float]],
+) -> Dict[str, Dict[str, object]]:
+    overrides: Dict[str, Dict[str, object]] = {
+        "data": {
+            "face_dir": args.face_dir,
+            "hand_left_dir": args.hand_left_dir,
+            "hand_right_dir": args.hand_right_dir,
+            "pose_dir": args.pose_dir,
+            "metadata_csv": args.metadata_csv,
+            "train_index": args.train_index,
+            "val_index": args.val_index,
+            "work_dir": args.work_dir,
+        },
+        "model": {},
+        "optim": {},
+        "training": {},
+    }
+    data_section = overrides["data"]
+    if args.batch_size is not None:
+        data_section["batch_size"] = args.batch_size
+        data_section["val_batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        data_section["num_workers"] = args.num_workers
+    if args.no_pin_memory:
+        data_section["pin_memory"] = False
+    if args.tokenizer is not None:
+        data_section["tokenizer"] = args.tokenizer
+    if args.max_target_length is not None:
+        data_section["max_target_length"] = args.max_target_length
+    if args.device is not None:
+        data_section["device"] = args.device
+    if args.seed is not None:
+        data_section["seed"] = args.seed
+    if mix_streams:
+        data_section["mix_streams"] = mix_streams
+
+    model_section = overrides["model"]
+    if args.sequence_length is not None:
+        model_section["sequence_length"] = args.sequence_length
+    if args.image_size is not None:
+        model_section["image_size"] = args.image_size
+    if args.decoder_layers is not None:
+        model_section["decoder_layers"] = args.decoder_layers
+    if args.decoder_heads is not None:
+        model_section["decoder_heads"] = args.decoder_heads
+    if args.decoder_dropout is not None:
+        model_section["decoder_dropout"] = args.decoder_dropout
+
+    if args.lr is not None:
+        overrides["optim"]["lr"] = args.lr
+    if args.epochs is not None:
+        overrides["training"]["epochs"] = args.epochs
+    return overrides
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Entrenamiento corto del stub multi-stream (demo).",
     )
+    parser.add_argument("--config", type=Path, help="Plantilla de configuración JSON o YAML")
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Sobrescribe valores utilizando claves con puntos (ej. data.batch_size=4)",
+    )
+
     parser.add_argument("--face-dir", type=Path, required=True, help="Carpeta con frames de rostro")
     parser.add_argument("--hand-left-dir", type=Path, required=True, help="Carpeta con frames de mano izquierda")
     parser.add_argument("--hand-right-dir", type=Path, required=True, help="Carpeta con frames de mano derecha")
@@ -187,104 +111,174 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-index", type=Path, required=True, help="CSV con lista de video_id para entrenamiento")
     parser.add_argument("--val-index", type=Path, required=True, help="CSV con lista de video_id para validación")
     parser.add_argument("--work-dir", type=Path, default=Path("work_dirs/demo"), help="Directorio donde guardar checkpoints")
-    parser.add_argument("--batch-size", type=int, default=2, help="Tamaño de batch")
-    parser.add_argument("--epochs", type=int, default=2, help="Cantidad de épocas de entrenamiento")
-    parser.add_argument("--sequence-length", type=int, default=64, help="Número de frames muestreados por clip")
-    parser.add_argument("--image-size", type=int, default=224, help="Resolución de entrada para los backbones")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate del optimizador AdamW")
-    parser.add_argument("--num-workers", type=int, default=0, help="Workers de DataLoader")
+
+    parser.add_argument("--batch-size", type=int, help="Tamaño de batch")
+    parser.add_argument("--epochs", type=int, help="Cantidad de épocas de entrenamiento")
+    parser.add_argument("--sequence-length", type=int, help="Número de frames muestreados por clip")
+    parser.add_argument("--image-size", type=int, help="Resolución de entrada para los backbones")
+    parser.add_argument("--lr", type=float, help="Learning rate del optimizador")
+    parser.add_argument("--num-workers", type=int, help="Workers de DataLoader")
     parser.add_argument("--no-pin-memory", action="store_true", help="Deshabilita pinned memory en los loaders")
-    parser.add_argument("--device", type=str, default="auto", help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)")
-    parser.add_argument("--seed", type=int, default=1234, help="Semilla aleatoria")
-    parser.add_argument("--tokenizer", type=str, required=True, help="Identificador o ruta a un tokenizer de HuggingFace")
+    parser.add_argument("--device", type=str, help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)")
+    parser.add_argument("--seed", type=int, help="Semilla aleatoria")
+    parser.add_argument("--tokenizer", type=str, help="Identificador o ruta a un tokenizer de HuggingFace")
     parser.add_argument(
         "--max-target-length",
         type=int,
-        default=64,
+        default=None,
         help="Longitud máxima de las secuencias de texto tokenizadas",
     )
     parser.add_argument(
         "--decoder-layers",
         type=int,
-        default=2,
+        default=None,
         help="Capas del decoder seq2seq utilizado durante la demo",
     )
     parser.add_argument(
         "--decoder-heads",
         type=int,
-        default=8,
+        default=None,
         help="Número de cabezas de atención en el decoder seq2seq",
     )
     parser.add_argument(
         "--decoder-dropout",
         type=float,
-        default=0.1,
+        default=None,
         help="Dropout aplicado dentro del decoder seq2seq",
+    )
+    parser.add_argument(
+        "--mix-stream",
+        dest="mix_streams",
+        action="append",
+        default=[],
+        metavar="STREAM[:P]",
+        help="Permuta aleatoriamente streams individuales con probabilidad P (face, hand-left, hand-right, pose)",
     )
     parser.add_argument("--no-amp", action="store_true", help="Desactiva AMP incluso si hay GPU disponible")
     return parser.parse_args()
 
 
+def _parse_mix_streams(raw: list[str]) -> Dict[str, float]:
+    if not raw:
+        return {}
+    mix_spec: Dict[str, float] = {}
+    for entry in raw:
+        name, _, prob_text = entry.partition(":")
+        name = name.strip()
+        prob = 1.0
+        if prob_text:
+            try:
+                prob = float(prob_text)
+            except ValueError as exc:
+                raise ValueError(f"Probabilidad inválida para --mix-stream '{entry}'") from exc
+        mix_spec[name] = prob
+    return normalise_mix_spec(mix_spec)
+
+
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    mix_streams = _parse_mix_streams(args.mix_streams) if args.mix_streams else None
 
-    device = _select_device(args.device)
-    pin_memory = not args.no_pin_memory
-    use_amp = device.type == "cuda" and not args.no_amp and torch.cuda.is_available()
+    base_defaults = {
+        "data": {
+            "batch_size": 2,
+            "val_batch_size": 2,
+            "num_workers": 0,
+            "pin_memory": True,
+            "max_target_length": 64,
+            "device": "auto",
+            "seed": 1234,
+        },
+        "model": {
+            "sequence_length": 64,
+            "image_size": 224,
+        },
+        "training": {
+            "epochs": 2,
+        },
+    }
+
+    cli_overrides = _build_cli_overrides(args, mix_streams)
+
+    data_config, model_config, optim_config, training_config, _ = resolve_configs(
+        config_path=args.config,
+        cli_overrides=cli_overrides,
+        set_overrides=args.overrides,
+        base=base_defaults,
+    )
+
+    try:
+        data_config.mix_streams = normalise_mix_spec(data_config.mix_streams or {})
+    except ValueError as exc:  # pragma: no cover - configuration error
+        raise ValueError(f"Configuración de mezcla inválida: {exc}") from exc
+
+    set_seed(data_config.seed)
+
+    device = _select_device(data_config.device)
+    precision_flag = (data_config.precision or "amp").lower()
+    use_amp = (
+        precision_flag == "amp"
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and not args.no_amp
+    )
+    if device.type.startswith("cuda") and not torch.cuda.is_available():  # pragma: no cover - depende del entorno
+        device = torch.device("cpu")
 
     train_dataset = LsaTMultiStream(
-        str(args.face_dir),
-        str(args.hand_left_dir),
-        str(args.hand_right_dir),
-        str(args.pose_dir),
-        str(args.metadata_csv),
-        str(args.train_index),
-        T=args.sequence_length,
-        img_size=args.image_size,
+        str(data_config.face_dir),
+        str(data_config.hand_left_dir),
+        str(data_config.hand_right_dir),
+        str(data_config.pose_dir),
+        str(data_config.metadata_csv),
+        str(data_config.train_index),
+        T=model_config.sequence_length,
+        img_size=model_config.image_size,
     )
     val_dataset = LsaTMultiStream(
-        str(args.face_dir),
-        str(args.hand_left_dir),
-        str(args.hand_right_dir),
-        str(args.pose_dir),
-        str(args.metadata_csv),
-        str(args.val_index),
-        T=args.sequence_length,
-        img_size=args.image_size,
+        str(data_config.face_dir),
+        str(data_config.hand_left_dir),
+        str(data_config.hand_right_dir),
+        str(data_config.pose_dir),
+        str(data_config.metadata_csv),
+        str(data_config.val_index),
+        T=model_config.sequence_length,
+        img_size=model_config.image_size,
     )
 
-    tokenizer = create_tokenizer(args.tokenizer)
+    tokenizer_source = data_config.tokenizer or model_config.decoder_model or args.tokenizer
+    if tokenizer_source is None:
+        raise ValueError("Debe especificarse un tokenizer en la CLI o en el archivo de configuración")
+    tokenizer = create_tokenizer(tokenizer_source)
 
-    train_loader = _create_loader(
+    train_loader = create_dataloader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=data_config.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
+        num_workers=data_config.num_workers,
+        pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
-        max_length=args.max_target_length,
+        max_length=data_config.max_target_length,
+        mix_streams=data_config.mix_streams,
     )
-    val_loader = _create_loader(
+    val_loader = create_dataloader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=data_config.val_batch_size or data_config.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
+        num_workers=data_config.num_workers,
+        pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
-        max_length=args.max_target_length,
+        max_length=data_config.max_target_length,
     )
 
-    model = _DemoModel(
-        image_size=args.image_size,
-        sequence_length=args.sequence_length,
-        tokenizer=tokenizer,
-        decoder_layers=args.decoder_layers,
-        decoder_heads=args.decoder_heads,
-        decoder_dropout=args.decoder_dropout,
-    ).to(device)
+    model = MultiStreamClassifier(model_config, tokenizer).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optim_cfg = {
+        "type": optim_config.optimizer,
+        "lr": optim_config.lr,
+        "weight_decay": optim_config.weight_decay,
+    }
+    optimizer = create_optimizer(model.parameters(), optim_cfg)
 
     scaler: Optional["torch.cuda.amp.GradScaler"] = None
     autocast_dtype: Optional[torch.dtype] = None
@@ -293,22 +287,19 @@ def main() -> None:
         autocast_dtype = torch.float16
 
     def _loss_fn(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        if hasattr(outputs, "logits"):
-            logits = outputs.logits
-        else:
-            logits = outputs
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
         vocab = logits.size(-1)
         return F.cross_entropy(
             logits.view(-1, vocab),
             targets.view(-1),
             ignore_index=-100,
-            label_smoothing=0.1,
+            label_smoothing=optim_config.label_smoothing,
         )
 
-    args.work_dir.mkdir(parents=True, exist_ok=True)
+    data_config.work_dir.mkdir(parents=True, exist_ok=True)
 
     best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, training_config.epochs + 1):
         train_result = train_epoch(
             model,
             train_loader,
@@ -326,10 +317,10 @@ def main() -> None:
         )
         train_loss = getattr(train_result, "loss", train_result)
         val_loss = getattr(val_result, "loss", val_result)
-        torch.save(model.state_dict(), args.work_dir / "last.pt")
+        torch.save(model.state_dict(), data_config.work_dir / "last.pt")
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(model.state_dict(), args.work_dir / "best.pt")
+            torch.save(model.state_dict(), data_config.work_dir / "best.pt")
         print({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
     print("Entrenamiento demo completado. Sustituye los stubs por modelos reales para producción.")

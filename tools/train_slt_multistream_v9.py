@@ -14,28 +14,30 @@ import json
 import logging
 import math
 import random
-from dataclasses import MISSING, asdict, dataclass, fields
+from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple, Union, get_args, get_origin
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader
 
-from slt.data import LsaTMultiStream, collate_fn
-from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig, load_dinov2_backbone
+from slt.data import LsaTMultiStream
+from slt.training.configuration import (
+    DataConfig,
+    ModelConfig,
+    OptimConfig,
+    TrainingConfig,
+    resolve_configs,
+)
+from slt.training.data import create_dataloader, normalise_mix_spec
 from slt.training.loops import LoopResult, eval_epoch, train_epoch
+from slt.training.models import MultiStreamClassifier
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
-from slt.utils.text import create_tokenizer, encode_batch
+from slt.utils.text import create_tokenizer
 
-from transformers import AutoConfig, PreTrainedTokenizerBase
-
-try:
-    import yaml
-except Exception:  # pragma: no cover - yaml is optional
-    yaml = None  # type: ignore
+from transformers import PreTrainedTokenizerBase
 
 try:  # pragma: no cover - numpy optional for RNG capture
     import numpy as np
@@ -46,214 +48,6 @@ try:  # pragma: no cover - TensorBoard is an optional dependency.
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:  # pragma: no cover - if TensorBoard is not installed we noop.
     SummaryWriter = None  # type: ignore
-
-
-@dataclass
-class ModelConfig:
-    """Model hyper-parameters exposed in the CLI."""
-
-    image_size: int = 224
-    projector_dim: int = 256
-    d_model: int = 512
-    pose_landmarks: int = 13
-    projector_dropout: float = 0.0
-    fusion_dropout: float = 0.0
-    temporal_nhead: int = 8
-    temporal_layers: int = 6
-    temporal_dim_feedforward: int = 2048
-    temporal_dropout: float = 0.1
-    sequence_length: int = 128
-    decoder_layers: int = 2
-    decoder_heads: int = 8
-    decoder_dropout: float = 0.1
-    decoder_model: Optional[str] = None
-    decoder_config: Optional[str] = None
-    face_backbone: Optional[str] = None
-    hand_left_backbone: Optional[str] = None
-    hand_right_backbone: Optional[str] = None
-    freeze_face_backbone: bool = False
-    freeze_hand_left_backbone: bool = False
-    freeze_hand_right_backbone: bool = False
-
-
-@dataclass
-class OptimConfig:
-    """Optimisation related hyper-parameters."""
-
-    optimizer: str = "adamw"
-    lr: float = 1e-3
-    weight_decay: float = 0.0
-    scheduler: Optional[str] = None
-    scheduler_step_size: int = 5
-    scheduler_gamma: float = 0.5
-    label_smoothing: float = 0.1
-    grad_clip_norm: Optional[float] = None
-
-
-@dataclass
-class TrainingConfig:
-    """Configuration of the outer training loop."""
-
-    epochs: int = 40
-    grad_accum_steps: int = 1
-    compile: bool = False
-    compile_mode: Optional[str] = None
-
-
-@dataclass
-class DataConfig:
-    """Paths and data loading configuration."""
-
-    face_dir: Path
-    hand_left_dir: Path
-    hand_right_dir: Path
-    pose_dir: Path
-    metadata_csv: Path
-    train_index: Path
-    val_index: Path
-    work_dir: Path
-    num_workers: int = 0
-    batch_size: int = 4
-    val_batch_size: Optional[int] = None
-    seed: int = 1234
-    device: str = "cuda"
-    precision: str = "amp"
-    tensorboard: Optional[Path] = None
-    pin_memory: bool = True
-    tokenizer: Optional[str] = None
-    max_target_length: int = 128
-
-
-class MultiStreamClassifier(nn.Module):
-    """Convenience wrapper around the encoder/decoder pair."""
-
-    def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
-        super().__init__()
-
-        vit_config = ViTConfig(image_size=config.image_size)
-        temporal_kwargs = {
-            "nhead": config.temporal_nhead,
-            "nlayers": config.temporal_layers,
-            "dim_feedforward": config.temporal_dim_feedforward,
-            "dropout": config.temporal_dropout,
-        }
-
-        backbone_specs = {
-            "face": (config.face_backbone, config.freeze_face_backbone),
-            "hand_left": (config.hand_left_backbone, config.freeze_hand_left_backbone),
-            "hand_right": (config.hand_right_backbone, config.freeze_hand_right_backbone),
-        }
-        external_backbones: Dict[str, torch.nn.Module] = {}
-        for stream, (spec, freeze_flag) in backbone_specs.items():
-            if spec:
-                external_backbones[stream] = load_dinov2_backbone(spec, freeze=freeze_flag)
-
-        self.encoder = MultiStreamEncoder(
-            backbone_config=vit_config,
-            projector_dim=config.projector_dim,
-            d_model=config.d_model,
-            pose_dim=3 * config.pose_landmarks,
-            positional_num_positions=config.sequence_length,
-            projector_dropout=config.projector_dropout,
-            fusion_dropout=config.fusion_dropout,
-            temporal_kwargs=temporal_kwargs,
-            backbones=external_backbones if external_backbones else None,
-        )
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if not vocab_size:
-            vocab_size = len(tokenizer)
-
-        decoder_config = None
-        if config.decoder_config:
-            decoder_config = AutoConfig.from_pretrained(config.decoder_config)
-            hidden_size = getattr(decoder_config, "d_model", None)
-            if hidden_size is not None and hidden_size != config.d_model:
-                raise ValueError(
-                    "Decoder configuration hidden size does not match encoder dimensionality: "
-                    f"expected {config.d_model}, got {hidden_size}."
-                )
-
-        decoder_model_name = None if decoder_config is not None else config.decoder_model
-
-        self.decoder = TextSeq2SeqDecoder(
-            d_model=config.d_model,
-            vocab_size=int(vocab_size),
-            num_layers=config.decoder_layers,
-            num_heads=config.decoder_heads,
-            dropout=config.decoder_dropout,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-            pretrained_model_name_or_path=decoder_model_name,
-            config=decoder_config,
-        )
-
-    def forward(
-        self,
-        *,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        miss_mask_hl: Optional[torch.Tensor] = None,
-        miss_mask_hr: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        decoder_attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        encoded = self.encoder(
-            face,
-            hand_l,
-            hand_r,
-            pose,
-            pad_mask=pad_mask,
-            miss_mask_hl=miss_mask_hl,
-            miss_mask_hr=miss_mask_hr,
-        )
-        if encoder_attention_mask is None and pad_mask is not None:
-            encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            labels=labels,
-            decoder_attention_mask=decoder_attention_mask,
-        )
-
-    def generate(
-        self,
-        *,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        miss_mask_hl: Optional[torch.Tensor] = None,
-        miss_mask_hr: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        **generation_kwargs: Any,
-    ) -> torch.LongTensor:
-        encoded = self.encoder(
-            face,
-            hand_l,
-            hand_r,
-            pose,
-            pad_mask=pad_mask,
-            miss_mask_hl=miss_mask_hl,
-            miss_mask_hr=miss_mask_hr,
-        )
-        if encoder_attention_mask is None and pad_mask is not None:
-            encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder.generate(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            **generation_kwargs,
-        )
-
-
 def _levenshtein_distance(a: str, b: str) -> int:
     if a == b:
         return 0
@@ -370,6 +164,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pinned memory in the data loaders")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or local path")
     parser.add_argument("--max-target-length", type=int, help="Maximum length of the tokenised target sequences")
+    parser.add_argument(
+        "--mix-stream",
+        dest="mix_streams",
+        action="append",
+        default=[],
+        metavar="STREAM[:P]",
+        help=(
+            "Optionally permute individual streams across the batch with probability P."
+            " STREAM can be face, hand-left, hand-right or pose."
+        ),
+    )
 
     # Model arguments
     parser.add_argument("--image-size", type=int, help="Input image resolution expected by the ViT backbones")
@@ -394,6 +199,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-hand-right-backbone", action="store_true", help="Freeze the right hand backbone")
     parser.add_argument("--decoder-model", type=str, help="Pretrained decoder model name or path")
     parser.add_argument("--decoder-config", type=str, help="Decoder configuration name or path")
+    parser.add_argument(
+        "--decoder-class",
+        type=str,
+        help="Python path to a custom decoder class (module:ClassName or module.ClassName)",
+    )
+    parser.add_argument(
+        "--decoder-kwargs",
+        type=str,
+        help="JSON object with keyword arguments forwarded to the decoder constructor",
+    )
 
     # Optimiser and loop arguments
     parser.add_argument("--epochs", type=int, help="Number of training epochs")
@@ -426,129 +241,51 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Checkpoint path to resume training from (loads model, optimiser and AMP scaler state).",
     )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="Initial checkpoint to warm-start the model weights before training",
+    )
 
     args = parser.parse_args()
     if args.decoder_config and args.decoder_model:
         parser.error("--decoder-model and --decoder-config are mutually exclusive")
+    if args.decoder_class and (args.decoder_model or args.decoder_config):
+        parser.error("--decoder-class cannot be combined with --decoder-model/--decoder-config")
+    if args.decoder_kwargs:
+        try:
+            parsed_kwargs = json.loads(args.decoder_kwargs)
+        except json.JSONDecodeError as exc:
+            parser.error(f"Unable to parse --decoder-kwargs as JSON: {exc}")
+        if not isinstance(parsed_kwargs, dict):
+            parser.error("--decoder-kwargs must encode a JSON object")
+        args.decoder_kwargs = parsed_kwargs
+    else:
+        args.decoder_kwargs = None
+    if args.resume and args.init_checkpoint:
+        parser.error("--resume and --init-checkpoint are mutually exclusive")
+    if args.mix_streams:
+        mix_spec: Dict[str, float] = {}
+        for entry in args.mix_streams:
+            name, _, prob_text = entry.partition(":")
+            name = name.strip()
+            prob = 1.0
+            if prob_text:
+                try:
+                    prob = float(prob_text)
+                except ValueError:
+                    parser.error(f"Invalid probability for --mix-stream '{entry}'")
+            mix_spec[name] = prob
+        try:
+            args.mix_streams = normalise_mix_spec(mix_spec)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        args.mix_streams = None
     if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
     return args
-
-
-def _dataclass_defaults(cls: type) -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {}
-    for field in fields(cls):
-        if field.default is not MISSING:
-            defaults[field.name] = field.default
-        elif field.default_factory is not MISSING:  # type: ignore[attr-defined]
-            defaults[field.name] = field.default_factory()  # type: ignore[misc]
-    return defaults
-
-
-def _load_config_template(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {path}")
-
-    text = path.read_text(encoding="utf-8")
-    suffix = path.suffix.lower()
-    if suffix in {".yml", ".yaml"}:
-        if yaml is None:
-            raise RuntimeError("PyYAML is required to parse YAML configuration files")
-        data = yaml.safe_load(text)
-    else:
-        data = json.loads(text)
-
-    if not isinstance(data, Mapping):
-        raise ValueError("Configuration root must be a mapping")
-    return dict(data)
-
-
-def _deep_update(target: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
-    for key, value in updates.items():
-        if isinstance(value, Mapping) and isinstance(target.get(key), dict):
-            target[key] = _deep_update(dict(target[key]), value)
-        else:
-            target[key] = value
-    return target
-
-
-def _coerce_override_value(value: str) -> Any:
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        lowered = value.lower()
-        if lowered in {"true", "false"}:
-            return lowered == "true"
-        if lowered == "null":
-            return None
-        try:
-            return int(value)
-        except ValueError:
-            try:
-                return float(value)
-            except ValueError:
-                return value
-
-
-def _apply_string_overrides(config: Dict[str, Any], overrides: Iterable[str]) -> None:
-    for item in overrides:
-        if "=" not in item:
-            raise ValueError(f"Invalid override format '{item}'. Expected KEY=VALUE")
-        key, raw_value = item.split("=", 1)
-        value = _coerce_override_value(raw_value)
-        parts = key.split(".")
-        cursor: Dict[str, Any] = config
-        for part in parts[:-1]:
-            if part not in cursor or not isinstance(cursor[part], dict):
-                cursor[part] = {}
-            cursor = cursor[part]
-        cursor[parts[-1]] = value
-
-
-def _coerce_field_value(field_obj, value: Any) -> Any:
-    if value is None:
-        return None
-    annotation = field_obj.type
-    origin = get_origin(annotation)
-    if origin is Union:
-        args = [arg for arg in get_args(annotation) if arg is not type(None)]
-        if len(args) == 1:
-            annotation = args[0]
-            origin = get_origin(annotation)
-    if annotation is Path and not isinstance(value, Path):
-        return Path(value)
-    if annotation is int and isinstance(value, str):
-        return int(value)
-    if annotation is float and isinstance(value, str):
-        return float(value)
-    if annotation is bool and isinstance(value, str):
-        lowered = value.lower()
-        if lowered in {"true", "1", "yes"}:
-            return True
-        if lowered in {"false", "0", "no"}:
-            return False
-    return value
-
-
-def _instantiate_config(cls: type, values: Mapping[str, Any]) -> Any:
-    kwargs: Dict[str, Any] = {}
-    missing: list[str] = []
-    for field_obj in fields(cls):
-        if field_obj.name in values:
-            val = values[field_obj.name]
-            if isinstance(val, str) and field_obj.type is Path:
-                val = Path(val)
-            kwargs[field_obj.name] = _coerce_field_value(field_obj, val)
-        elif field_obj.default is not MISSING or field_obj.default_factory is not MISSING:  # type: ignore[attr-defined]
-            continue
-        else:
-            missing.append(field_obj.name)
-    if missing:
-        raise ValueError(
-            f"Missing configuration values for {cls.__name__}: {', '.join(missing)}"
-        )
-    return cls(**kwargs)
 
 
 def _collect_cli_overrides(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
@@ -594,55 +331,15 @@ def _collect_cli_overrides(args: argparse.Namespace) -> Dict[str, Dict[str, Any]
 
 def build_configs(
     args: argparse.Namespace,
-) -> Tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, Dict[str, Any]]:
-    base: Dict[str, Any] = {
-        "data": _dataclass_defaults(DataConfig),
-        "model": _dataclass_defaults(ModelConfig),
-        "optim": _dataclass_defaults(OptimConfig),
-        "training": _dataclass_defaults(TrainingConfig),
-    }
-
-    if args.config is not None:
-        loaded = _load_config_template(args.config)
-        for key in ("data", "model", "optim", "training"):
-            if key in loaded and isinstance(loaded[key], Mapping):
-                base[key] = _deep_update(base.get(key, {}), loaded[key])
-        for key, value in loaded.items():
-            if key not in base:
-                base[key] = value
-
+) -> tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, Dict[str, Any]]:
     cli_overrides = _collect_cli_overrides(args)
-    for section, values in cli_overrides.items():
-        if not values:
-            continue
-        base.setdefault(section, {})
-        base[section].update(values)
-
-    _apply_string_overrides(base, args.overrides)
-
-    data_config = _instantiate_config(DataConfig, base.get("data", {}))
-    model_config = _instantiate_config(ModelConfig, base.get("model", {}))
-    optim_config = _instantiate_config(OptimConfig, base.get("optim", {}))
-    training_config = _instantiate_config(TrainingConfig, base.get("training", {}))
-
-    scheduler_choice = optim_config.scheduler
-    if scheduler_choice is not None:
-        scheduler_choice = scheduler_choice.lower()
-        if scheduler_choice == "none":
-            optim_config.scheduler = None
-        else:
-            optim_config.scheduler = scheduler_choice
-
-    if optim_config.scheduler == "cosine":
-        tmax = base.get("optim", {}).get("scheduler_tmax")
-        if tmax is None:
-            tmax = optim_config.scheduler_step_size
-        optim_config.scheduler_step_size = int(tmax)
-
-    if data_config.val_batch_size is None:
-        data_config.val_batch_size = data_config.batch_size
-
-    return data_config, model_config, optim_config, training_config, base
+    base: Dict[str, Any] = {}
+    return resolve_configs(
+        config_path=args.config,
+        cli_overrides=cli_overrides,
+        set_overrides=args.overrides,
+        base=base,
+    )
 
 
 def setup_logging() -> None:
@@ -666,66 +363,6 @@ def _validate_paths(config: DataConfig) -> None:
     _ensure_exists(config.train_index, kind="Train index CSV")
     _ensure_exists(config.val_index, kind="Validation index CSV")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _build_collate(
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    max_length: int,
-) -> Callable[[Iterable[Dict[str, torch.Tensor]]], Dict[str, torch.Tensor]]:
-    def _collate(batch: Iterable[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        merged = collate_fn(batch)
-        tokenized = encode_batch(
-            tokenizer,
-            merged["texts"],
-            max_length=max_length,
-            padding="max_length",
-            truncation=True,
-        )
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        inputs: Dict[str, torch.Tensor] = {
-            "face": merged["face"],
-            "hand_l": merged["hand_l"],
-            "hand_r": merged["hand_r"],
-            "pose": merged["pose"],
-            "pad_mask": merged["pad_mask"],
-            "lengths": merged["lengths"],
-            "miss_mask_hl": merged["miss_mask_hl"],
-            "miss_mask_hr": merged["miss_mask_hr"],
-            "labels": labels,
-            "decoder_attention_mask": attention_mask,
-            "encoder_attention_mask": merged["pad_mask"].to(torch.long),
-        }
-        return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
-
-    return _collate
-
-
-def _create_dataloader(
-    dataset: LsaTMultiStream,
-    *,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    pin_memory: bool,
-    tokenizer: PreTrainedTokenizerBase,
-    max_length: int,
-) -> DataLoader:
-    collate = _build_collate(tokenizer, max_length=max_length)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate,
-    )
-
-
 def _maybe_compile_model(model: nn.Module, training: TrainingConfig) -> nn.Module:
     if not training.compile:
         return model
@@ -812,6 +449,24 @@ def _load_rng_state(work_dir: Path) -> None:
         torch.cuda.set_rng_state_all(cuda_state)
 
 
+def _load_initial_checkpoint(model: nn.Module, path: Path, *, device: torch.device) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Initial checkpoint not found: {path}")
+    logging.info("Loading initial weights from %s", path)
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(payload, Mapping) and "model_state" in payload:
+        state_dict = payload["model_state"]
+    else:
+        state_dict = payload
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("Initial checkpoint must be a state dict or contain a 'model_state' key")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        logging.warning("Missing keys when loading init checkpoint: %s", missing)
+    if unexpected:
+        logging.warning("Unexpected keys when loading init checkpoint: %s", unexpected)
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -895,7 +550,13 @@ def main() -> None:
     )
 
     val_batch_size = data_config.val_batch_size or data_config.batch_size
-    train_loader = _create_dataloader(
+    try:
+        train_mix = normalise_mix_spec(data_config.mix_streams or {})
+    except ValueError as exc:
+        raise ValueError(f"Invalid mix_streams configuration: {exc}") from exc
+    data_config.mix_streams = train_mix
+
+    train_loader = create_dataloader(
         train_dataset,
         batch_size=data_config.batch_size,
         shuffle=True,
@@ -903,8 +564,9 @@ def main() -> None:
         pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
+        mix_streams=train_mix,
     )
-    val_loader = _create_dataloader(
+    val_loader = create_dataloader(
         val_dataset,
         batch_size=val_batch_size,
         shuffle=False,
@@ -912,9 +574,12 @@ def main() -> None:
         pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
+        mix_streams=None,
     )
 
     model = MultiStreamClassifier(model_config, tokenizer).to(device)
+    if training_config.init_checkpoint is not None:
+        _load_initial_checkpoint(model, training_config.init_checkpoint, device=device)
     model = _maybe_compile_model(model, training_config)
     optimizer = create_optimizer(
         model.parameters(),
