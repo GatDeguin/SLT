@@ -25,8 +25,9 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -39,9 +40,29 @@ from slt.models.backbones import ViTConfig, ViTSmallPatch16
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+def _serialize_json(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Unsupported value for JSON serialization: {value!r}")
+
+
 # ---------------------------------------------------------------------------
 # Dataset helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class DatasetConfig:
+    roots: Sequence[Path | str]
+    batch_size: int = 32
+    num_workers: int = 0
+    shuffle: bool = True
+    pin_memory: bool = False
+    persistent_workers: bool = False
 
 
 class ImageFolderDataset(Dataset[Image.Image]):
@@ -442,6 +463,8 @@ def build_dataloader(
     batch_size: int,
     num_workers: int,
     shuffle: bool = True,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
     collate_fn: Optional[callable] = None,
 ) -> DataLoader:
     dataset = ImageFolderDataset(roots)
@@ -451,6 +474,8 @@ def build_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn or pil_collate,
+        pin_memory=pin_memory,
+        persistent_workers=bool(persistent_workers and num_workers > 0),
     )
 
 
@@ -468,3 +493,88 @@ def mask_patches(shape: Tuple[int, int, int], mask_ratio: float, device: torch.d
         perm = torch.randperm(num_patches, device=device)
         mask[idx, perm[:num_mask]] = True
     return mask
+
+
+# ---------------------------------------------------------------------------
+# Experiment tracking helpers
+# ---------------------------------------------------------------------------
+
+
+class ExperimentTracker:
+    """Minimal experiment tracking helper used by the CLI wrappers."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        history_filename: str = "metrics.jsonl",
+        params_filename: str = "params.json",
+        artifacts_filename: str = "artifacts.json",
+    ) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.history_path = self.root / history_filename
+        self.params_path = self.root / params_filename
+        self.artifacts_path = self.root / artifacts_filename
+
+    def log_params(self, params: Mapping[str, object]) -> None:
+        payload: dict[str, object] = {}
+        if self.params_path.exists():
+            with self.params_path.open("r", encoding="utf8") as handle:
+                try:
+                    payload = json.load(handle)
+                except json.JSONDecodeError:
+                    payload = {}
+        payload.update(params)
+        payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with self.params_path.open("w", encoding="utf8") as handle:
+            json.dump(payload, handle, indent=2, default=_serialize_json)
+
+    def log_metrics(self, step: int, metrics: Mapping[str, object], *, context: str | None = None) -> None:
+        record: dict[str, object] = {
+            "step": step,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if context:
+            record["context"] = context
+        record.update(metrics)
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.history_path.open("a", encoding="utf8") as handle:
+            handle.write(json.dumps(record, default=_serialize_json) + "\n")
+
+    def register_artifact(
+        self,
+        path: Path,
+        *,
+        name: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        artifact_entry: dict[str, object] = {
+            "name": name or Path(path).name,
+            "path": str(Path(path)),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if metadata:
+            artifact_entry["metadata"] = dict(metadata)
+
+        entries: list[dict[str, object]] = []
+        if self.artifacts_path.exists():
+            with self.artifacts_path.open("r", encoding="utf8") as handle:
+                try:
+                    existing = json.load(handle)
+                except json.JSONDecodeError:
+                    existing = []
+            if isinstance(existing, list):
+                entries = list(existing)
+
+        replaced = False
+        for idx, current in enumerate(entries):
+            if current.get("name") == artifact_entry["name"]:
+                entries[idx] = artifact_entry
+                replaced = True
+                break
+        if not replaced:
+            entries.append(artifact_entry)
+
+        with self.artifacts_path.open("w", encoding="utf8") as handle:
+            json.dump(entries, handle, indent=2, default=_serialize_json)
