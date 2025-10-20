@@ -5,12 +5,12 @@ from __future__ import annotations
 import inspect
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
 
-from .backbones import ViTConfig, ViTSmallPatch16
+from .backbones import BackboneSpec, ViTConfig, ViTSmallPatch16, load_backbone
 from .modules import FuseConcatLinear, PositionalEncodingLearned, StreamProjector
 from .temporal import TemporalEncoder
 
@@ -38,15 +38,18 @@ class MultiStreamEncoder(torch.nn.Module):
         temporal_kwargs = temporal_kwargs or {}
 
         backbones = backbones or {}
-        self.face_backbone = self._resolve_backbone(
-            backbones, "face", backbone_config
-        )
-        self.hand_backbone_left = self._resolve_backbone(
-            backbones, "hand_left", backbone_config
-        )
-        self.hand_backbone_right = self._resolve_backbone(
-            backbones, "hand_right", backbone_config
-        )
+        self._stream_to_attr = {
+            "face": "face_backbone",
+            "hand_left": "hand_backbone_left",
+            "hand_right": "hand_backbone_right",
+        }
+        self._backbone_factories: DefaultDict[str, Dict[str, Callable[[], torch.nn.Module]]] = defaultdict(dict)
+        self._backbone_instances: DefaultDict[str, Dict[str, torch.nn.Module]] = defaultdict(dict)
+        self._backbone_indices: DefaultDict[str, Dict[str, int]] = defaultdict(dict)
+        self._active_backbone_names: Dict[str, str] = {}
+        self._last_hand_masks: Dict[str, Optional[Tensor]] = {"hand_left": None, "hand_right": None}
+        self._observers: DefaultDict[str, list[Callable[[str, Tensor], None]]] = defaultdict(list)
+        self._register_initial_backbones(backbones, backbone_config)
 
         backbone_dim = self._infer_backbone_dim(self.face_backbone)
 
@@ -73,8 +76,6 @@ class MultiStreamEncoder(torch.nn.Module):
         self.temporal = TemporalEncoder(d_model=d_model, **temporal_kwargs)
         self._last_combined_hand_mask: Optional[Tensor] = None
         self._last_padding_mask: Optional[Tensor] = None
-        self._observers: DefaultDict[str, list[Callable[[str, Tensor], None]]] = defaultdict(list)
-
         self._auto_configure_components()
 
     def forward(
@@ -169,6 +170,75 @@ class MultiStreamEncoder(torch.nn.Module):
 
         return self._last_padding_mask
 
+    @property
+    def last_hand_masks(self) -> Dict[str, Optional[Tensor]]:
+        """Return the last per-hand masks applied during fusion."""
+
+        return dict(self._last_hand_masks)
+
+    def active_backbone_name(self, stream: str) -> Optional[str]:
+        """Return the currently active backbone identifier for ``stream``."""
+
+        return self._active_backbone_names.get(stream)
+
+    def active_backbones(self) -> Dict[str, torch.nn.Module]:
+        """Return a mapping with the currently instantiated backbones."""
+
+        return {stream: getattr(self, attr) for stream, attr in self._stream_to_attr.items()}
+
+    # ------------------------------------------------------------------
+    # Backbone registry API
+    # ------------------------------------------------------------------
+    def register_backbone(
+        self,
+        stream: str,
+        name: str,
+        spec: BackboneSpec,
+        *,
+        map_location: Optional[Union[str, torch.device]] = None,
+        trust_repo: bool = True,
+    ) -> None:
+        """Register ``spec`` under ``name`` for ``stream``."""
+
+        if stream not in self._stream_to_attr:
+            raise ValueError(f"Unsupported stream '{stream}'")
+
+        factory = self._build_backbone_factory(spec, map_location, trust_repo)
+        self._backbone_factories[stream][name] = factory
+        if name not in self._backbone_indices[stream]:
+            self._backbone_indices[stream][name] = len(self._backbone_indices[stream])
+
+    def activate_backbone(self, stream: str, name: str) -> torch.nn.Module:
+        """Activate the registered backbone ``name`` for ``stream``."""
+
+        if stream not in self._stream_to_attr:
+            raise ValueError(f"Unsupported stream '{stream}'")
+        if name not in self._backbone_factories[stream]:
+            raise KeyError(f"No backbone named '{name}' registered for stream '{stream}'")
+
+        instance = self._backbone_instances[stream].get(name)
+        if instance is None:
+            instance = self._backbone_factories[stream][name]()
+            if hasattr(instance, "as_backbone") and callable(instance.as_backbone):
+                instance = instance.as_backbone()  # type: ignore[assignment]
+            self._backbone_instances[stream][name] = instance
+
+        attr = self._stream_to_attr[stream]
+        setattr(self, attr, instance)
+        self._active_backbone_names[stream] = name
+        self._emit_backbone_state(stream, name)
+        return instance
+
+    def available_backbones(self, stream: Optional[str] = None) -> Dict[str, Tuple[str, ...]]:
+        """Return available backbone names for one or all streams."""
+
+        if stream is not None:
+            return {stream: tuple(self._backbone_factories[stream].keys())}
+        return {
+            stream_name: tuple(factory.keys())
+            for stream_name, factory in self._backbone_factories.items()
+        }
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -240,9 +310,12 @@ class MultiStreamEncoder(torch.nn.Module):
         self, features: Tensor, mask: Optional[Tensor], *, stream: str
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if mask is None:
+            self._last_hand_masks[stream] = None
             return features, None
         mask_bool = self._ensure_bool_mask(mask, features.shape[:2])
         masked = self._mask_hand_features(features, mask_bool, stream=stream)
+        self._last_hand_masks[stream] = mask_bool
+        self._emit(f"{stream}.mask", mask_bool.to(torch.float32))
         return masked, mask_bool
 
     @staticmethod
@@ -321,19 +394,6 @@ class MultiStreamEncoder(torch.nn.Module):
         return False
 
     @staticmethod
-    def _resolve_backbone(
-        backbones: Mapping[str, torch.nn.Module],
-        stream: str,
-        config: Optional[ViTConfig],
-    ) -> torch.nn.Module:
-        backbone = backbones.get(stream)
-        if backbone is None:
-            backbone = ViTSmallPatch16(config)
-        if hasattr(backbone, "as_backbone") and callable(backbone.as_backbone):
-            backbone = backbone.as_backbone()  # type: ignore[assignment]
-        return backbone
-
-    @staticmethod
     def _infer_backbone_dim(backbone: torch.nn.Module) -> int:
         if hasattr(backbone, "config") and hasattr(backbone.config, "embed_dim"):
             return int(backbone.config.embed_dim)
@@ -362,3 +422,57 @@ class MultiStreamEncoder(torch.nn.Module):
         if mask_bool.dim() > 2:
             mask_bool = mask_bool.view(mask_bool.shape[0], -1)
         return ~mask_bool
+
+    def _register_initial_backbones(
+        self,
+        backbones: Mapping[str, BackboneSpec],
+        config: Optional[ViTConfig],
+    ) -> None:
+        for stream, attr in self._stream_to_attr.items():
+            candidate: BackboneSpec
+            if stream in backbones:
+                candidate = backbones[stream]
+            else:
+                candidate = ViTSmallPatch16(config)
+            self.register_backbone(stream, "default", candidate)
+            self.activate_backbone(stream, "default")
+        # Ensure bookkeeping emits signals for initial selection
+        for stream in self._stream_to_attr:
+            self._emit_backbone_state(stream, self._active_backbone_names[stream])
+
+    def _build_backbone_factory(
+        self,
+        spec: BackboneSpec,
+        map_location: Optional[Union[str, torch.device]],
+        trust_repo: bool,
+    ) -> Callable[[], torch.nn.Module]:
+        if isinstance(spec, torch.nn.Module):
+            module = spec
+
+            def factory() -> torch.nn.Module:
+                return module
+
+            return factory
+
+        if callable(spec) and not isinstance(spec, Mapping):
+            def factory_callable() -> torch.nn.Module:
+                candidate = spec()  # type: ignore[operator]
+                if not isinstance(candidate, torch.nn.Module):
+                    raise TypeError(
+                        "Backbone factory callable must return an nn.Module instance"
+                    )
+                return candidate
+
+            return factory_callable
+
+        def factory_loader() -> torch.nn.Module:
+            return load_backbone(spec, map_location=map_location, trust_repo=trust_repo)
+
+        return factory_loader
+
+    def _emit_backbone_state(self, stream: str, name: str) -> None:
+        index = self._backbone_indices[stream].setdefault(
+            name, len(self._backbone_indices[stream])
+        )
+        value = torch.tensor([float(index)], dtype=torch.float32)
+        self._emit(f"{stream}.backbone", value)
