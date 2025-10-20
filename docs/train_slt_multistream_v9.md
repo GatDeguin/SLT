@@ -138,6 +138,40 @@ Además de la CLI, el comando acepta `--config config.yml` (JSON o YAML) y
 sobre-escrituras puntuales con `--set data.batch_size=8`. Estas plantillas se
 persisten en `config.json` para garantizar reproducibilidad.
 
+Un ejemplo mínimo de plantilla es el siguiente:
+
+```yaml
+data:
+  face_dir: data/single_signer/processed/face
+  hand_left_dir: data/single_signer/processed/hand_l
+  hand_right_dir: data/single_signer/processed/hand_r
+  pose_dir: data/single_signer/processed/pose
+  metadata_csv: meta.csv
+  train_index: data/single_signer/index/train.csv
+  val_index: data/single_signer/index/val.csv
+  work_dir: work_dirs/single_signer_experiment
+model:
+  sequence_length: 64
+  image_size: 224
+training:
+  epochs: 40
+optim:
+  lr: 0.0005
+```
+
+Puedes modificar hiperparámetros concretos al vuelo manteniendo la plantilla
+base sin cambios:
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --config configs/single_signer.yml \
+  --set data.batch_size=6 \
+  --set optim.scheduler="cosine"
+```
+
+Los valores aplicados se combinan con los defaults del script y se registran en
+`config.json` dentro de `work_dir`.
+
 ## Evaluación y exportación
 
 Una vez finalizado el entrenamiento, evalúa el checkpoint con

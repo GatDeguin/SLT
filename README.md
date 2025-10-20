@@ -93,6 +93,43 @@ Para configuraciones más extensas utiliza `tools/train_slt_multistream_v9.py`.
 La guía en `docs/train_slt_multistream_v9.md` cubre los parámetros disponibles y
 las recomendaciones de optimización.
 
+## Plantillas de configuración y `--set`
+
+La CLI acepta plantillas JSON/YAML mediante `--config`. Esto permite conservar un
+esquema reproducible y versionar hiperparámetros junto con el código. Por
+ejemplo, guarda el siguiente contenido como `configs/demo.yml`:
+
+```yaml
+data:
+  face_dir: data/single_signer/processed/face
+  hand_left_dir: data/single_signer/processed/hand_l
+  hand_right_dir: data/single_signer/processed/hand_r
+  pose_dir: data/single_signer/processed/pose
+  metadata_csv: meta.csv
+  train_index: data/single_signer/index/train.csv
+  val_index: data/single_signer/index/val.csv
+  work_dir: work_dirs/single_signer_demo
+  batch_size: 2
+model:
+  sequence_length: 32
+  image_size: 224
+optim:
+  lr: 0.001
+training:
+  epochs: 2
+```
+
+Ejecuta el entrenamiento leyendo la plantilla y sobreescribe parámetros puntuales
+con `--set seccion.clave=valor` cuando necesites probar variantes rápidas:
+
+```bash
+python -m slt --config configs/demo.yml --set optim.batch_size=4 --set optim.lr=5e-4
+```
+
+Los cambios efectivos quedan registrados en `work_dir/config.json`, lo que
+facilita auditar el origen de cada experimento. Consulta `docs/data_contract.md`
+para revisar la estructura de datos esperada por estos comandos.
+
 ## Evaluación
 
 Evalúa el checkpoint más reciente y genera predicciones alineadas con los textos
