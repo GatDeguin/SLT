@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -20,9 +19,9 @@ import torch.nn.functional as F
 from .data import LsaTMultiStream, collate_fn
 from .training.configuration import resolve_configs
 from .training.data import create_dataloader, normalise_mix_spec
+from .training.loops import eval_epoch, train_epoch
 from .training.models import MultiStreamClassifier
 from .training.optim import create_optimizer
-from .training.loops import eval_epoch, train_epoch
 from .utils.general import set_seed
 from .utils.text import create_tokenizer
 
@@ -77,9 +76,9 @@ def _select_device(device_flag: str) -> torch.device:
 
 def _build_cli_overrides(
     args: argparse.Namespace,
-    mix_streams: Optional[Dict[str, float]],
-) -> Dict[str, Dict[str, object]]:
-    overrides: Dict[str, Dict[str, object]] = {
+    mix_streams: dict[str, float] | None,
+) -> dict[str, dict[str, object]]:
+    overrides: dict[str, dict[str, object]] = {
         "data": {
             "face_dir": args.face_dir,
             "hand_left_dir": args.hand_left_dir,
@@ -98,6 +97,8 @@ def _build_cli_overrides(
     if args.batch_size is not None:
         data_section["batch_size"] = args.batch_size
         data_section["val_batch_size"] = args.batch_size
+    if getattr(args, "val_batch_size", None) is not None:
+        data_section["val_batch_size"] = args.val_batch_size
     if args.num_workers is not None:
         data_section["num_workers"] = args.num_workers
     if args.no_pin_memory:
@@ -108,6 +109,11 @@ def _build_cli_overrides(
         data_section["max_target_length"] = args.max_target_length
     if args.device is not None:
         data_section["device"] = args.device
+    if getattr(args, "precision", None) is not None:
+        precision_flag = args.precision
+        if precision_flag == "float32":
+            precision_flag = "fp32"
+        data_section["precision"] = precision_flag
     if args.seed is not None:
         data_section["seed"] = args.seed
     if mix_streams:
@@ -142,7 +148,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Entrenamiento corto del modelo multi-stream validado (demo).",
     )
-    parser.add_argument("--config", type=Path, help="Plantilla de configuración JSON o YAML")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Plantilla de configuración JSON o YAML",
+    )
     parser.add_argument(
         "--set",
         dest="overrides",
@@ -152,25 +162,91 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescribe valores utilizando claves con puntos (ej. data.batch_size=4)",
     )
 
-    parser.add_argument("--face-dir", type=Path, required=True, help="Carpeta con frames de rostro")
-    parser.add_argument("--hand-left-dir", type=Path, required=True, help="Carpeta con frames de mano izquierda")
-    parser.add_argument("--hand-right-dir", type=Path, required=True, help="Carpeta con frames de mano derecha")
-    parser.add_argument("--pose-dir", type=Path, required=True, help="Carpeta con archivos .npz de pose")
-    parser.add_argument("--metadata-csv", type=Path, required=True, help="CSV con columnas video_id;texto")
-    parser.add_argument("--train-index", type=Path, required=True, help="CSV con lista de video_id para entrenamiento")
-    parser.add_argument("--val-index", type=Path, required=True, help="CSV con lista de video_id para validación")
-    parser.add_argument("--work-dir", type=Path, default=Path("work_dirs/demo"), help="Directorio donde guardar checkpoints")
+    parser.add_argument(
+        "--face-dir",
+        type=Path,
+        required=True,
+        help="Carpeta con frames de rostro",
+    )
+    parser.add_argument(
+        "--hand-left-dir",
+        type=Path,
+        required=True,
+        help="Carpeta con frames de mano izquierda",
+    )
+    parser.add_argument(
+        "--hand-right-dir",
+        type=Path,
+        required=True,
+        help="Carpeta con frames de mano derecha",
+    )
+    parser.add_argument(
+        "--pose-dir",
+        type=Path,
+        required=True,
+        help="Carpeta con archivos .npz de pose",
+    )
+    parser.add_argument(
+        "--metadata-csv",
+        type=Path,
+        required=True,
+        help="CSV con columnas video_id;texto",
+    )
+    parser.add_argument(
+        "--train-index",
+        type=Path,
+        required=True,
+        help="CSV con lista de video_id para entrenamiento",
+    )
+    parser.add_argument(
+        "--val-index",
+        type=Path,
+        required=True,
+        help="CSV con lista de video_id para validación",
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=Path("work_dirs/demo"),
+        help="Directorio donde guardar checkpoints",
+    )
 
     parser.add_argument("--batch-size", type=int, help="Tamaño de batch")
+    parser.add_argument("--val-batch-size", type=int, help="Batch de validación")
     parser.add_argument("--epochs", type=int, help="Cantidad de épocas de entrenamiento")
-    parser.add_argument("--sequence-length", type=int, help="Número de frames muestreados por clip")
-    parser.add_argument("--image-size", type=int, help="Resolución de entrada para los backbones")
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        help="Número de frames muestreados por clip",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        help="Resolución de entrada para los backbones",
+    )
     parser.add_argument("--lr", type=float, help="Learning rate del optimizador")
     parser.add_argument("--num-workers", type=int, help="Workers de DataLoader")
-    parser.add_argument("--no-pin-memory", action="store_true", help="Deshabilita pinned memory en los loaders")
-    parser.add_argument("--device", type=str, help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)")
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="Deshabilita pinned memory en los loaders",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)",
+    )
     parser.add_argument("--seed", type=int, help="Semilla aleatoria")
-    parser.add_argument("--tokenizer", type=str, help="Identificador o ruta a un tokenizer de HuggingFace")
+    parser.add_argument(
+        "--precision",
+        choices=["amp", "fp32", "float32"],
+        help="Precisión numérica. 'amp' usa mixed precision en GPU",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        help="Identificador o ruta a un tokenizer de HuggingFace",
+    )
     parser.add_argument(
         "--max-target-length",
         type=int,
@@ -206,8 +282,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Ruta al checkpoint single_signer ya descargado. Se usa cuando --pretrained"
-            " está activo."
+            "Ruta al checkpoint single_signer ya descargado. Se usa cuando "
+            "--pretrained está activo."
         ),
     )
     parser.add_argument(
@@ -216,16 +292,23 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="STREAM[:P]",
-        help="Permuta aleatoriamente streams individuales con probabilidad P (face, hand-left, hand-right, pose)",
+        help=(
+            "Permuta aleatoriamente streams individuales con probabilidad P "
+            "(face, hand-left, hand-right, pose)"
+        ),
     )
-    parser.add_argument("--no-amp", action="store_true", help="Desactiva AMP incluso si hay GPU disponible")
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Desactiva AMP incluso si hay GPU disponible",
+    )
     return parser.parse_args()
 
 
-def _parse_mix_streams(raw: list[str]) -> Dict[str, float]:
+def _parse_mix_streams(raw: list[str]) -> dict[str, float]:
     if not raw:
         return {}
-    mix_spec: Dict[str, float] = {}
+    mix_spec: dict[str, float] = {}
     for entry in raw:
         name, _, prob_text = entry.partition(":")
         name = name.strip()
@@ -281,13 +364,15 @@ def main() -> None:
 
     device = _select_device(data_config.device)
     precision_flag = (data_config.precision or "amp").lower()
+    if precision_flag == "float32":
+        precision_flag = "fp32"
     use_amp = (
         precision_flag == "amp"
         and device.type == "cuda"
         and torch.cuda.is_available()
         and not getattr(args, "no_amp", False)
     )
-    if device.type.startswith("cuda") and not torch.cuda.is_available():  # pragma: no cover - depende del entorno
+    if device.type.startswith("cuda") and not torch.cuda.is_available():  # pragma: no cover
         device = torch.device("cpu")
 
     train_dataset = LsaTMultiStream(
@@ -299,6 +384,7 @@ def main() -> None:
         str(data_config.train_index),
         T=model_config.sequence_length,
         img_size=model_config.image_size,
+        lkp_count=model_config.pose_landmarks,
     )
     val_dataset = LsaTMultiStream(
         str(data_config.face_dir),
@@ -309,11 +395,17 @@ def main() -> None:
         str(data_config.val_index),
         T=model_config.sequence_length,
         img_size=model_config.image_size,
+        lkp_count=model_config.pose_landmarks,
     )
 
-    tokenizer_source = data_config.tokenizer or model_config.decoder_model or args.tokenizer
+    tokenizer_source = (
+        data_config.tokenizer or model_config.decoder_model or args.tokenizer
+    )
     if tokenizer_source is None:
-        raise ValueError("Debe especificarse un tokenizer en la CLI o en el archivo de configuración")
+        raise ValueError(
+            "Debe especificarse un tokenizer en la CLI o en el archivo de "
+            "configuración"
+        )
     tokenizer = create_tokenizer(tokenizer_source)
 
     train_loader = create_dataloader(
@@ -335,6 +427,7 @@ def main() -> None:
         pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
+        mix_streams=None,
         seed=data_config.seed,
     )
 
@@ -347,8 +440,8 @@ def main() -> None:
     }
     optimizer = create_optimizer(model.parameters(), optim_cfg)
 
-    scaler: Optional["torch.cuda.amp.GradScaler"] = None
-    autocast_dtype: Optional[torch.dtype] = None
+    scaler: torch.cuda.amp.GradScaler | None = None
+    autocast_dtype: torch.dtype | None = None
     if use_amp:
         scaler = torch.cuda.amp.GradScaler()
         autocast_dtype = torch.float16
@@ -375,6 +468,8 @@ def main() -> None:
             device=device,
             scaler=scaler,
             autocast_dtype=autocast_dtype,
+            grad_clip_norm=optim_config.grad_clip_norm,
+            grad_accum_steps=training_config.grad_accum_steps,
         )
         val_result = eval_epoch(
             model,
