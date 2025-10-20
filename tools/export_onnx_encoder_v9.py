@@ -4,14 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import hashlib
+import json
+import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
+
+IMAGENET_STATS = {
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225],
+}
+METADATA_VERSION = 1
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -37,6 +47,23 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--temporal-dropout", type=float, default=0.1, help="Dropout probability in the temporal encoder")
     parser.add_argument("--device", type=str, default="cpu", help="Torch device identifier used during export")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        help="Directory where artefacts (ONNX/TorchScript/metadata) will be stored",
+    )
+    parser.add_argument(
+        "--version",
+        type=str,
+        default="v1",
+        help="Identifier used to version the exported artefacts",
+    )
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        help="Optional destination JSON metadata file."
+        " If not provided, it is derived from --artifact-dir/--version.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,13 +175,18 @@ def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEnco
     )
 
 
-def _load_encoder_weights(path: Path, model: MultiStreamEncoder) -> None:
-    checkpoint = torch.load(path, map_location="cpu")
+def _load_encoder_weights(path: Path, model: MultiStreamEncoder) -> Dict[str, Any]:
+    raw_checkpoint = torch.load(path, map_location="cpu")
 
-    if isinstance(checkpoint, Mapping):
+    metadata: Dict[str, Any] = {}
+    if isinstance(raw_checkpoint, Mapping):
+        metadata = _extract_checkpoint_metadata(raw_checkpoint)
+
+    checkpoint = raw_checkpoint
+    if isinstance(raw_checkpoint, Mapping):
         for candidate in ("encoder_state", "model_state", "state_dict"):
-            if candidate in checkpoint:
-                checkpoint = checkpoint[candidate]
+            if candidate in raw_checkpoint:
+                checkpoint = raw_checkpoint[candidate]
                 break
 
     if not isinstance(checkpoint, Mapping):
@@ -162,6 +194,56 @@ def _load_encoder_weights(path: Path, model: MultiStreamEncoder) -> None:
 
     state_dict = _select_state_dict(checkpoint, model)
     model.load_state_dict(state_dict)
+    return metadata
+
+
+def _extract_checkpoint_metadata(checkpoint: Mapping[str, Any]) -> Dict[str, Any]:
+    meta_candidates = ("encoder_config", "encoder_meta", "metadata", "config")
+    for key in meta_candidates:
+        value = checkpoint.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _validate_checkpoint_metadata(
+    checkpoint_meta: Mapping[str, Any], args: argparse.Namespace
+) -> None:
+    if not checkpoint_meta:
+        warnings.warn(
+            "Checkpoint metadata missing. Compatibility validation skipped.",
+            UserWarning,
+        )
+        return
+
+    expected = {
+        "image_size": args.image_size,
+        "projector_dim": args.projector_dim,
+        "d_model": args.d_model,
+        "pose_landmarks": args.pose_landmarks,
+        "sequence_length": args.sequence_length,
+    }
+
+    derived = dict(checkpoint_meta)
+    if "pose_dim" in derived and "pose_landmarks" not in derived:
+        derived["pose_landmarks"] = int(derived["pose_dim"]) // 3
+
+    mismatches = {}
+    for key, expected_value in expected.items():
+        if key not in derived:
+            continue
+        if int(derived[key]) != int(expected_value):
+            mismatches[key] = (derived[key], expected_value)
+
+    if mismatches:
+        mismatch_str = ", ".join(
+            f"{key}: checkpoint={checkpoint_val}, args={arg_val}"
+            for key, (checkpoint_val, arg_val) in mismatches.items()
+        )
+        raise ValueError(
+            "Checkpoint configuration is incompatible with export arguments: "
+            f"{mismatch_str}"
+        )
 
 
 def _dummy_inputs(args: argparse.Namespace, device: torch.device) -> tuple:
@@ -188,11 +270,25 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
     if device.type.startswith("cuda") and not torch.cuda.is_available():
         device = torch.device("cpu")
 
+    if args.artifact_dir is not None:
+        args.artifact_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"encoder_{args.version}"
+        if args.onnx is None:
+            args.onnx = args.artifact_dir / f"{base_name}.onnx"
+        if args.torchscript is None:
+            args.torchscript = args.artifact_dir / f"{base_name}.ts"
+        if args.metadata is None:
+            args.metadata = args.artifact_dir / f"{base_name}.json"
+
     if args.onnx is None and args.torchscript is None:
         raise ValueError("At least one output (--onnx or --torchscript) must be provided")
 
+    if args.metadata is not None and args.metadata.suffix != ".json":
+        raise ValueError("Metadata file must use the .json extension")
+
     encoder = _build_encoder(args).to(device)
-    _load_encoder_weights(args.checkpoint, encoder)
+    checkpoint_meta = _load_encoder_weights(args.checkpoint, encoder)
+    _validate_checkpoint_metadata(checkpoint_meta, args)
     encoder.eval()
 
     export_module = EncoderExportModule(encoder).to(device)
@@ -204,9 +300,175 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
         "miss_mask_hr": inputs[6],
     }
 
+    dynamic_axes = {
+        "face": {1: "T"},
+        "hand_l": {1: "T"},
+        "hand_r": {1: "T"},
+        "pose": {1: "T"},
+        "pad_mask": {1: "T"},
+        "miss_mask_hl": {1: "T"},
+        "miss_mask_hr": {1: "T"},
+        "encoded": {1: "T"},
+        "face_head": {1: "T"},
+        "hand_left_head": {1: "T"},
+        "hand_right_head": {1: "T"},
+        "pose_head": {1: "T"},
+        "hand_mask": {1: "T"},
+        "padding_mask": {1: "T"},
+    }
+
     if args.onnx is not None:
         args.onnx.parent.mkdir(parents=True, exist_ok=True)
-        dynamic_axes = {
+        with torch.no_grad():
+            torch.onnx.export(
+                export_module,
+                positional_args,
+                args.onnx,
+                kwargs=keyword_args,
+                input_names=[
+                    "face",
+                    "hand_l",
+                    "hand_r",
+                    "pose",
+                    "pad_mask",
+                    "miss_mask_hl",
+                    "miss_mask_hr",
+                ],
+                output_names=[
+                    "encoded",
+                    "face_head",
+                    "hand_left_head",
+                    "hand_right_head",
+                    "pose_head",
+                    "hand_mask",
+                    "padding_mask",
+                ],
+                dynamic_axes=dynamic_axes,
+                opset_version=args.opset,
+                fallback=True,
+                operator_export_type=OperatorExportTypes.ONNX_FALLTHROUGH,
+            )
+
+    if args.torchscript is not None:
+        args.torchscript.parent.mkdir(parents=True, exist_ok=True)
+        with torch.no_grad():
+            traced = torch.jit.trace(
+                export_module,
+                positional_args,
+                check_trace=False,
+                strict=False,
+                example_kwarg_inputs=keyword_args,
+            )
+        traced.save(str(args.torchscript))
+
+    if args.metadata is not None:
+        args.metadata.parent.mkdir(parents=True, exist_ok=True)
+        metadata = _build_metadata(
+            args=args,
+            checkpoint_meta=checkpoint_meta,
+            dynamic_axes=dynamic_axes,
+        )
+        with args.metadata.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True)
+
+
+def _build_metadata(
+    *, args: argparse.Namespace, checkpoint_meta: Mapping[str, Any], dynamic_axes: Mapping[str, Mapping[int, str]]
+) -> Dict[str, Any]:
+    timestamp = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat()
+    checkpoint_hash = _sha256(args.checkpoint)
+    model_config = {
+        "image_size": args.image_size,
+        "projector_dim": args.projector_dim,
+        "d_model": args.d_model,
+        "pose_landmarks": args.pose_landmarks,
+        "sequence_length": args.sequence_length,
+        "temporal": {
+            "nhead": args.temporal_nhead,
+            "layers": args.temporal_layers,
+            "dim_feedforward": args.temporal_dim_feedforward,
+            "dropout": args.temporal_dropout,
+        },
+    }
+
+    inputs = {
+        "face": _image_input_spec(args),
+        "hand_l": _image_input_spec(args),
+        "hand_r": _image_input_spec(args),
+        "pose": {
+            "dtype": "float32",
+            "shape": ["batch", "time", 3 * args.pose_landmarks],
+            "normalization": {
+                "type": "identity",
+            },
+        },
+        "pad_mask": {
+            "dtype": "bool",
+            "shape": ["batch", "time"],
+        },
+        "miss_mask_hl": {
+            "dtype": "bool",
+            "shape": ["batch", "time"],
+        },
+        "miss_mask_hr": {
+            "dtype": "bool",
+            "shape": ["batch", "time"],
+        },
+    }
+
+    outputs = {
+        "encoded": {"dtype": "float32", "shape": ["batch", "time", args.d_model]},
+        "face_head": {"dtype": "float32", "shape": ["batch", "time", args.projector_dim]},
+        "hand_left_head": {"dtype": "float32", "shape": ["batch", "time", args.projector_dim]},
+        "hand_right_head": {"dtype": "float32", "shape": ["batch", "time", args.projector_dim]},
+        "pose_head": {"dtype": "float32", "shape": ["batch", "time", args.projector_dim]},
+        "hand_mask": {"dtype": "float32", "shape": ["batch", "time"]},
+        "padding_mask": {"dtype": "float32", "shape": ["batch", "time"]},
+    }
+
+    metadata: Dict[str, Any] = {
+        "metadata_version": METADATA_VERSION,
+        "artifact_version": args.version,
+        "generated_at": timestamp,
+        "checkpoint": {
+            "path": str(args.checkpoint.resolve()),
+            "sha256": checkpoint_hash,
+            "config": dict(checkpoint_meta),
+        },
+        "model": model_config,
+        "inputs": inputs,
+        "outputs": outputs,
+        "dynamic_axes": {
+            name: {str(axis): label for axis, label in axes.items()}
+            for name, axes in dynamic_axes.items()
+        },
+        "backends": {
+            "onnx": str(args.onnx.resolve()) if args.onnx is not None else None,
+            "torchscript": str(args.torchscript.resolve()) if args.torchscript is not None else None,
+        },
+        "opset": args.opset,
+    }
+    return metadata
+
+
+def _image_input_spec(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "dtype": "float32",
+        "shape": ["batch", "time", 3, args.image_size, args.image_size],
+        "normalization": {
+            "type": "imagenet",
+            "mean": IMAGENET_STATS["mean"],
+            "std": IMAGENET_STATS["std"],
+        },
+    }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
             "face": {1: "T"},
             "hand_l": {1: "T"},
             "hand_r": {1: "T"},
