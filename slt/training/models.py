@@ -76,7 +76,7 @@ class MultiStreamClassifier(nn.Module):
         decoder_config = None
         if config.decoder_config:
             decoder_config = AutoConfig.from_pretrained(config.decoder_config)
-            hidden_size = getattr(decoder_config, "d_model", None)
+            hidden_size = TextSeq2SeqDecoder.hidden_size_from_config(decoder_config)
             if hidden_size is not None and hidden_size != config.d_model:
                 raise ValueError(
                     "Decoder configuration hidden size does not match encoder dimensionality: "
