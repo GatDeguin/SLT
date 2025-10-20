@@ -325,6 +325,7 @@ def main() -> None:
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
         mix_streams=data_config.mix_streams,
+        seed=data_config.seed,
     )
     val_loader = create_dataloader(
         val_dataset,
@@ -334,6 +335,7 @@ def main() -> None:
         pin_memory=data_config.pin_memory,
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
+        seed=data_config.seed,
     )
 
     model = _DemoModel(model_config, tokenizer).to(device)

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 from transformers import PreTrainedTokenizerBase
 
 from slt.data import LsaTMultiStream, collate_fn
@@ -54,6 +54,8 @@ def normalise_mix_spec(spec: Mapping[str, float]) -> Dict[str, float]:
 def _apply_stream_mixing(
     merged: MutableMapping[str, Any],
     mix_streams: Mapping[str, float],
+    *,
+    generator: torch.Generator,
 ) -> None:
     if not mix_streams:
         return
@@ -65,8 +67,6 @@ def _apply_stream_mixing(
             break
     if batch_size is None or batch_size <= 1:
         return
-
-    generator = torch.random.default_generator
 
     for stream, prob in mix_streams.items():
         group = _CANONICAL_STREAMS.get(stream)
@@ -86,14 +86,34 @@ def build_collate(
     *,
     max_length: int,
     mix_streams: Optional[Mapping[str, float]] = None,
+    seed: Optional[int] = None,
 ):
     """Create a ``collate_fn`` wiring tokenisation and optional stream mixing."""
 
     mix_streams = normalise_mix_spec(mix_streams or {})
+    base_generator = torch.Generator()
+    if seed is not None:
+        base_generator.manual_seed(seed)
+    else:  # pragma: no cover - non deterministic branch
+        base_generator.seed()
+    worker_generators: Dict[int, torch.Generator] = {}
+
+    def _resolve_generator() -> torch.Generator:
+        info = get_worker_info()
+        if info is None:
+            return base_generator
+        worker_id = info.id
+        generator = worker_generators.get(worker_id)
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(info.seed)
+            worker_generators[worker_id] = generator
+        return generator
 
     def _collate(batch: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
         merged = collate_fn(batch)
-        _apply_stream_mixing(merged, mix_streams)
+        generator = _resolve_generator()
+        _apply_stream_mixing(merged, mix_streams, generator=generator)
         tokenized = encode_batch(
             tokenizer,
             merged["texts"],
@@ -135,10 +155,20 @@ def create_dataloader(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
     mix_streams: Optional[Mapping[str, float]] = None,
+    seed: Optional[int] = None,
 ) -> DataLoader:
     """Instantiate a :class:`~torch.utils.data.DataLoader` for SLT datasets."""
 
-    collate = build_collate(tokenizer, max_length=max_length, mix_streams=mix_streams)
+    collate = build_collate(
+        tokenizer,
+        max_length=max_length,
+        mix_streams=mix_streams,
+        seed=seed,
+    )
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -146,5 +176,6 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate,
+        generator=generator,
     )
 
