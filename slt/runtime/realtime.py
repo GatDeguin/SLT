@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Deque, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -26,10 +29,24 @@ class FrameDetections:
 class TemporalBuffer:
     """Acumula ventanas temporales listas para inferencia."""
 
-    def __init__(self, sequence_length: int, image_size: int, pose_landmarks: int) -> None:
+    def __init__(
+        self,
+        sequence_length: int,
+        image_size: int,
+        pose_landmarks: int,
+        *,
+        target_latency_ms: Optional[float] = None,
+        frame_rate: float = 30.0,
+    ) -> None:
         self.sequence_length = sequence_length
         self.image_size = image_size
         self.pose_landmarks = pose_landmarks
+        if frame_rate <= 0:
+            raise ValueError("frame_rate must be strictly positive")
+        if target_latency_ms is not None and target_latency_ms <= 0:
+            raise ValueError("target_latency_ms must be positive when provided")
+        self._target_latency_ms = target_latency_ms
+        self._frame_rate = frame_rate
 
         self.face: Deque[torch.Tensor] = deque(maxlen=sequence_length)
         self.hand_l: Deque[torch.Tensor] = deque(maxlen=sequence_length)
@@ -38,6 +55,33 @@ class TemporalBuffer:
         self.miss_hl: Deque[bool] = deque(maxlen=sequence_length)
         self.miss_hr: Deque[bool] = deque(maxlen=sequence_length)
 
+    @property
+    def frame_rate(self) -> float:
+        return self._frame_rate
+
+    @property
+    def target_latency_ms(self) -> Optional[float]:
+        return self._target_latency_ms
+
+    @property
+    def window_size(self) -> int:
+        if self._target_latency_ms is None:
+            return self.sequence_length
+        frames = math.ceil(self._frame_rate * self._target_latency_ms / 1000.0)
+        frames = max(frames, 1)
+        return min(self.sequence_length, frames)
+
+    def set_target_latency(
+        self, *, latency_ms: Optional[float], frame_rate: Optional[float] = None
+    ) -> None:
+        if frame_rate is not None:
+            if frame_rate <= 0:
+                raise ValueError("frame_rate must be strictly positive")
+            self._frame_rate = frame_rate
+        if latency_ms is not None and latency_ms <= 0:
+            raise ValueError("latency_ms must be positive when provided")
+        self._target_latency_ms = latency_ms
+
     def append(
         self,
         face: torch.Tensor,
@@ -45,50 +89,55 @@ class TemporalBuffer:
         hand_r: torch.Tensor,
         pose: torch.Tensor,
         *,
-        detected_left: bool,
-        detected_right: bool,
+        missing_left: bool,
+        missing_right: bool,
     ) -> None:
         self.face.append(face)
         self.hand_l.append(hand_l)
         self.hand_r.append(hand_r)
         self.pose.append(pose)
-        self.miss_hl.append(detected_left)
-        self.miss_hr.append(detected_right)
+        self.miss_hl.append(bool(missing_left))
+        self.miss_hr.append(bool(missing_right))
 
     def _pad_stream(self, stream: Deque[torch.Tensor]) -> torch.Tensor:
-        if stream:
-            stacked = torch.stack(list(stream), dim=0)
+        window = list(stream)[-self.window_size :]
+        if window:
+            stacked = torch.stack(window, dim=0)
+            device = stacked.device
+            dtype = stacked.dtype
         else:
-            stacked = torch.zeros((0, 3, self.image_size, self.image_size), dtype=torch.float32)
+            device = torch.device("cpu")
+            dtype = torch.float32
+            stacked = torch.zeros((0, 3, self.image_size, self.image_size), dtype=dtype, device=device)
 
-        if stacked.shape[0] == self.sequence_length:
-            return stacked
+        if stacked.shape[0] >= self.sequence_length:
+            return stacked[-self.sequence_length :]
 
         pad_frames = self.sequence_length - stacked.shape[0]
-        if stacked.shape[0] == 0:
-            return torch.zeros((pad_frames, 3, self.image_size, self.image_size), dtype=torch.float32)
-
-        padding = torch.zeros((pad_frames, *stacked.shape[1:]), dtype=stacked.dtype, device=stacked.device)
+        padding = torch.zeros((pad_frames, *stacked.shape[1:]), dtype=dtype, device=device)
         return torch.cat([stacked, padding], dim=0)
 
     def _pad_pose(self, stream: Deque[torch.Tensor]) -> torch.Tensor:
-        if stream:
-            stacked = torch.stack(list(stream), dim=0)
+        window = list(stream)[-self.window_size :]
+        feature_dim = 3 * self.pose_landmarks
+        if window:
+            stacked = torch.stack(window, dim=0)
+            device = stacked.device
+            dtype = stacked.dtype
         else:
-            stacked = torch.zeros((0, 3 * self.pose_landmarks), dtype=torch.float32)
-        if stacked.shape[0] == self.sequence_length:
-            return stacked
+            device = torch.device("cpu")
+            dtype = torch.float32
+            stacked = torch.zeros((0, feature_dim), dtype=dtype, device=device)
+        if stacked.shape[0] >= self.sequence_length:
+            return stacked[-self.sequence_length :]
         pad_frames = self.sequence_length - stacked.shape[0]
-        if stacked.shape[0] == 0:
-            return torch.zeros((pad_frames, 3 * self.pose_landmarks), dtype=torch.float32)
-        padding = torch.zeros((pad_frames, stacked.shape[1]), dtype=stacked.dtype, device=stacked.device)
+        padding = torch.zeros((pad_frames, stacked.shape[1]), dtype=dtype, device=device)
         return torch.cat([stacked, padding], dim=0)
 
-    def _pad_mask(self, stream: Deque[bool]) -> torch.Tensor:
+    def _pad_mask(self, stream: Deque[bool], valid_len: int) -> torch.Tensor:
         mask = torch.zeros(self.sequence_length, dtype=torch.bool)
-        valid_len = len(stream)
         if valid_len:
-            mask[:valid_len] = torch.tensor(list(stream), dtype=torch.bool)
+            mask[:valid_len] = torch.tensor(list(stream)[-valid_len:], dtype=torch.bool)
         return mask
 
     def as_model_inputs(
@@ -106,14 +155,17 @@ class TemporalBuffer:
         pose = self._pad_pose(self.pose)
 
         pad_mask = torch.zeros(self.sequence_length, dtype=torch.bool)
-        valid_len = len(self.face)
+        valid_len = min(len(self.face), self.window_size)
         if valid_len:
             pad_mask[:valid_len] = True
 
-        miss_mask_hl = self._pad_mask(self.miss_hl)
-        miss_mask_hr = self._pad_mask(self.miss_hr)
+        miss_mask_hl = self._pad_mask(self.miss_hl, valid_len)
+        miss_mask_hr = self._pad_mask(self.miss_hr, valid_len)
 
-        if backend == "torch":
+        torch_backends = {"torch", "torchscript"}
+        numpy_backends = {"onnx", "onnxruntime", "tensorrt"}
+
+        if backend in torch_backends:
             return {
                 "face": face.unsqueeze(0).to(device),
                 "hand_l": hand_l.unsqueeze(0).to(device),
@@ -123,6 +175,9 @@ class TemporalBuffer:
                 "miss_mask_hl": miss_mask_hl.unsqueeze(0).to(device),
                 "miss_mask_hr": miss_mask_hr.unsqueeze(0).to(device),
             }
+
+        if backend not in numpy_backends:
+            raise ValueError(f"Unsupported backend '{backend}'")
 
         face_np = face.unsqueeze(0).cpu().numpy().astype(np.float32)
         hand_l_np = hand_l.unsqueeze(0).cpu().numpy().astype(np.float32)
@@ -197,6 +252,157 @@ def crop_square(
         return np.zeros((out_size, out_size, 3), dtype=image.dtype)
 
     return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
+
+
+# ---------------------------------------------------------------------------
+# Artefact metadata & backend loaders
+# ---------------------------------------------------------------------------
+
+INPUT_ORDER = (
+    "face",
+    "hand_l",
+    "hand_r",
+    "pose",
+)
+MASK_ORDER = ("pad_mask", "miss_mask_hl", "miss_mask_hr")
+ALL_INPUTS = INPUT_ORDER + MASK_ORDER
+
+
+def load_export_metadata(path: Path | str) -> Dict[str, Any]:
+    """Carga un fichero JSON de metadatos generado por la exportación."""
+
+    metadata_path = Path(path)
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, Mapping):  # pragma: no cover - defensive
+        raise ValueError("Export metadata must be a JSON object")
+    return dict(data)
+
+
+def _ensure_inputs(inputs: Mapping[str, Any]) -> None:
+    missing = [name for name in ALL_INPUTS if name not in inputs]
+    if missing:
+        raise KeyError(f"Missing required inputs: {', '.join(missing)}")
+
+
+def _as_torch(value: Any, device: torch.device, *, cast_bool: bool = False) -> torch.Tensor:
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if cast_bool:
+        tensor = tensor.to(dtype=torch.bool)
+    else:
+        tensor = tensor.to(dtype=torch.float32)
+    return tensor.to(device)
+
+
+def _as_numpy(value: Any, *, cast_bool: bool = False) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        array = value
+    elif isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    if cast_bool:
+        return array.astype(np.bool_)
+    return array.astype(np.float32)
+
+
+class TorchScriptEncoderRunner:
+    """Invoca el *encoder* exportado como TorchScript."""
+
+    def __init__(
+        self,
+        module_path: Path | str,
+        metadata: Mapping[str, Any],
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.module_path = Path(module_path)
+        self.metadata = dict(metadata)
+        self.device = device or torch.device("cpu")
+        self.module = torch.jit.load(str(self.module_path), map_location=self.device)
+        self.module.eval()
+
+    def __call__(self, inputs: Mapping[str, Any]) -> Tuple[torch.Tensor, ...]:
+        _ensure_inputs(inputs)
+        args = [
+            _as_torch(inputs[name], self.device)
+            for name in INPUT_ORDER
+        ]
+        kwargs = {
+            name: _as_torch(inputs[name], self.device, cast_bool=True)
+            for name in MASK_ORDER
+        }
+        with torch.no_grad():
+            outputs = self.module(*args, **kwargs)
+        if isinstance(outputs, torch.Tensor):  # pragma: no cover - torchscript API quirk
+            return (outputs,)
+        return tuple(outputs)
+
+
+class OnnxRuntimeEncoderRunner:
+    """Invoca el *encoder* exportado mediante ONNX Runtime."""
+
+    def __init__(
+        self,
+        onnx_path: Path | str,
+        metadata: Mapping[str, Any],
+        *,
+        providers: Optional[Sequence[str]] = None,
+        session_options: Optional[Any] = None,
+    ) -> None:
+        try:
+            import onnxruntime as ort  # type: ignore
+        except ImportError as exc:  # pragma: no cover - entorno sin onnxruntime
+            raise ImportError(
+                "ONNX Runtime is required to use OnnxRuntimeEncoderRunner"
+            ) from exc
+
+        self.metadata = dict(metadata)
+        self.session = ort.InferenceSession(
+            str(onnx_path),
+            providers=providers,
+            sess_options=session_options,
+        )
+
+    def __call__(self, inputs: Mapping[str, Any]) -> Tuple[np.ndarray, ...]:
+        _ensure_inputs(inputs)
+        feed = {
+            name: _as_numpy(inputs[name], cast_bool=name in MASK_ORDER)
+            for name in ALL_INPUTS
+        }
+        outputs = self.session.run(None, feed)  # type: ignore[arg-type]
+        return tuple(outputs)
+
+
+class TensorRTEncoderRunner:
+    """Crea un *runner* básico para motores TensorRT serializados."""
+
+    def __init__(self, engine_path: Path | str, metadata: Mapping[str, Any]) -> None:
+        try:
+            import tensorrt as trt  # type: ignore
+        except ImportError as exc:  # pragma: no cover - entorno sin TensorRT
+            raise ImportError("TensorRT backend requires the 'tensorrt' package") from exc
+
+        self.metadata = dict(metadata)
+        self.engine_path = Path(engine_path)
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with self.engine_path.open("rb") as handle:
+            engine_data = handle.read()
+        runtime = trt.Runtime(self.logger)
+        engine = runtime.deserialize_cuda_engine(engine_data)
+        if engine is None:
+            raise RuntimeError("Failed to deserialize TensorRT engine")
+        self.engine = engine
+        context = self.engine.create_execution_context()
+        if context is None:
+            raise RuntimeError("Unable to create TensorRT execution context")
+        self.context = context
+
+    def __call__(self, inputs: Mapping[str, Any]) -> Tuple[Any, ...]:  # pragma: no cover - requiere CUDA
+        raise NotImplementedError(
+            "TensorRT execution requires explicit CUDA bindings."
+            " Use `context` and `engine` attributes for custom pipelines."
+        )
 
 def preprocess_crop(crop: np.ndarray) -> torch.Tensor:
     """Convierte un recorte BGR en un tensor normalizado CHW."""

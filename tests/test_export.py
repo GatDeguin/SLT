@@ -147,3 +147,37 @@ def test_main_export_generates_onnx_and_torchscript(tmp_path: Path, encoder_args
         "hand_mask",
         "padding_mask",
     ]
+
+
+def test_main_export_validates_checkpoint_metadata(tmp_path: Path, encoder_args: SimpleNamespace) -> None:
+    encoder = _build_state(encoder_args)
+    state_dict = {f"encoder.{k}": v for k, v in encoder.state_dict().items()}
+
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model_state": state_dict,
+            "encoder_config": {
+                "image_size": encoder_args.image_size + 1,
+                "projector_dim": encoder_args.projector_dim,
+                "d_model": encoder_args.d_model,
+                "pose_landmarks": encoder_args.pose_landmarks,
+                "sequence_length": encoder_args.sequence_length,
+            },
+        },
+        checkpoint,
+    )
+
+    argv = [
+        "--checkpoint",
+        str(checkpoint),
+        "--onnx",
+        str(tmp_path / "encoder.onnx"),
+        "--image-size",
+        str(encoder_args.image_size),
+        "--sequence-length",
+        str(encoder_args.sequence_length),
+    ]
+
+    with pytest.raises(ValueError, match="image_size"):
+        main_export(argv)
