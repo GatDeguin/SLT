@@ -101,6 +101,10 @@ Si prefieres un modelo de HuggingFace concreto, utiliza `--decoder-model` o
 `--decoder-config`; el script validará que la dimensionalidad coincide con el
 encoder multi-stream.
 
+> **Importante:** al usar checkpoints preentrenados asegúrate de que el modelo
+> sea un decoder T5/BART con la misma dimensión (`d_model`) que el encoder.
+> Checkpoints incompatibles fallarán durante la inicialización del decoder.
+
 ### Warm start desde checkpoints
 
 Arranca el entrenamiento con pesos preexistentes (sin restaurar el optimizador)

@@ -114,6 +114,11 @@ python tools/eval_slt_multistream_v9.py \
 Además del CSV de predicciones, la carpeta de salida contiene `report.json` y
 `report.csv` con BLEU, CHRF y CER cuando se instala el extra `metrics`.
 
+> **Nota:** el decoder textual debe provenir de un checkpoint T5/BART entrenado
+> para la tarea. El tamaño oculto (`d_model`) del checkpoint tiene que coincidir
+> con el `--d-model` del encoder multi-stream; de lo contrario la carga del
+> modelo fallará.
+
 ## Exportación y despliegue
 
 Exporta el encoder multi-stream a formatos ligeros para integrarlo en demos en

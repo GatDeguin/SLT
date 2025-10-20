@@ -6,7 +6,12 @@ from typing import Any, Dict, Optional, Type
 
 import torch
 from torch import Tensor, nn
-from transformers import AutoModelForSeq2SeqLM, PretrainedConfig, T5Config, T5ForConditionalGeneration
+from transformers import (
+    AutoConfig,
+    AutoModelForSeq2SeqLM,
+    PretrainedConfig,
+    T5ForConditionalGeneration,
+)
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 
 
@@ -65,7 +70,9 @@ class TextSeq2SeqDecoder(nn.Module):
         super().__init__()
 
         if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads for the decoder configuration.")
+            raise ValueError(
+                "d_model must be divisible by num_heads for the decoder configuration."
+            )
 
         config_kwargs = dict(config_kwargs or {})
 
@@ -105,38 +112,112 @@ class TextSeq2SeqDecoder(nn.Module):
         auto_model_cls: Type[AutoModelForSeq2SeqLM],
     ) -> nn.Module:
         if config is not None:
+            TextSeq2SeqDecoder._validate_hidden_size(config, d_model)
             return auto_model_cls.from_config(config)
 
         if pretrained_model_name_or_path is not None:
             model = auto_model_cls.from_pretrained(pretrained_model_name_or_path)
-            hidden_size = getattr(model.config, "d_model", None)
-            if hidden_size is not None and hidden_size != d_model:
-                raise ValueError(
-                    "Loaded model hidden size does not match encoder dimensionality: "
-                    f"expected {d_model}, got {hidden_size}."
-                )
+            TextSeq2SeqDecoder._validate_hidden_size(model.config, d_model)
             return model
 
-        default_config: Dict[str, Any] = {
-            "vocab_size": vocab_size,
-            "d_model": d_model,
-            "d_kv": d_model // num_heads,
-            "d_ff": config_kwargs.pop("d_ff", d_model * 4),
-            "num_layers": num_layers,
-            "num_decoder_layers": config_kwargs.pop("num_decoder_layers", num_layers),
-            "num_heads": num_heads,
-            "dropout_rate": dropout,
-            "layer_norm_epsilon": config_kwargs.pop("layer_norm_epsilon", 1e-6),
-            "initializer_factor": config_kwargs.pop("initializer_factor", 1.0),
-            "pad_token_id": pad_token_id,
-            "eos_token_id": eos_token_id,
-            "decoder_start_token_id": config_kwargs.pop("decoder_start_token_id", pad_token_id),
-        }
-        default_config.update(config_kwargs)
-        t5_config = T5Config(**default_config)
-        if issubclass(auto_model_cls, T5ForConditionalGeneration):
-            return auto_model_cls(t5_config)
-        return auto_model_cls.from_config(t5_config)
+        model_type = config_kwargs.pop("model_type", "t5").lower()
+        default_kwargs = TextSeq2SeqDecoder._build_default_config_kwargs(
+            model_type=model_type,
+            d_model=d_model,
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            overrides=config_kwargs,
+        )
+        try:
+            auto_config = AutoConfig.for_model(model_type, **default_kwargs)
+        except ValueError as exc:  # pragma: no cover - error depends on transformers internals
+            raise ValueError(
+                f"Unsupported model_type '{model_type}' for AutoConfig"
+            ) from exc
+        TextSeq2SeqDecoder._validate_hidden_size(auto_config, d_model)
+        if (
+            issubclass(auto_model_cls, T5ForConditionalGeneration)
+            and auto_config.model_type == "t5"
+        ):
+            return auto_model_cls(auto_config)
+        return auto_model_cls.from_config(auto_config)
+
+    @staticmethod
+    def _build_default_config_kwargs(
+        *,
+        model_type: str,
+        d_model: int,
+        vocab_size: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+        pad_token_id: int,
+        eos_token_id: int,
+        overrides: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        overrides = dict(overrides)
+        if model_type in {"bart", "mbart"}:
+            bos_token_id = overrides.pop("bos_token_id", eos_token_id)
+            base: Dict[str, Any] = {
+                "vocab_size": vocab_size,
+                "d_model": d_model,
+                "encoder_layers": overrides.pop("encoder_layers", num_layers),
+                "decoder_layers": overrides.pop("decoder_layers", num_layers),
+                "encoder_attention_heads": overrides.pop("encoder_attention_heads", num_heads),
+                "decoder_attention_heads": overrides.pop("decoder_attention_heads", num_heads),
+                "dropout": overrides.pop("dropout", dropout),
+                "attention_dropout": overrides.pop("attention_dropout", dropout),
+                "activation_dropout": overrides.pop("activation_dropout", 0.0),
+                "pad_token_id": pad_token_id,
+                "bos_token_id": bos_token_id,
+                "eos_token_id": eos_token_id,
+                "decoder_start_token_id": overrides.pop(
+                    "decoder_start_token_id", bos_token_id
+                ),
+            }
+        else:
+            base = {
+                "vocab_size": vocab_size,
+                "d_model": d_model,
+                "d_kv": overrides.pop("d_kv", d_model // num_heads),
+                "d_ff": overrides.pop("d_ff", d_model * 4),
+                "num_layers": overrides.pop("num_layers", num_layers),
+                "num_decoder_layers": overrides.pop(
+                    "num_decoder_layers", num_layers
+                ),
+                "num_heads": overrides.pop("num_heads", num_heads),
+                "dropout_rate": overrides.pop("dropout_rate", dropout),
+                "layer_norm_epsilon": overrides.pop("layer_norm_epsilon", 1e-6),
+                "initializer_factor": overrides.pop("initializer_factor", 1.0),
+                "pad_token_id": pad_token_id,
+                "eos_token_id": eos_token_id,
+                "decoder_start_token_id": overrides.pop(
+                    "decoder_start_token_id", pad_token_id
+                ),
+            }
+        base.update(overrides)
+        return base
+
+    @staticmethod
+    def _validate_hidden_size(config: PretrainedConfig, expected: int) -> None:
+        hidden_size = TextSeq2SeqDecoder.hidden_size_from_config(config)
+        if hidden_size is not None and hidden_size != expected:
+            raise ValueError(
+                "Loaded model hidden size does not match encoder dimensionality: "
+                f"expected {expected}, got {hidden_size}."
+            )
+
+    @staticmethod
+    def hidden_size_from_config(config: PretrainedConfig) -> Optional[int]:
+        for attr in ("d_model", "hidden_size", "model_dim"):
+            value = getattr(config, attr, None)
+            if isinstance(value, int):
+                return value
+        return None
 
     def _tie_embeddings(self) -> None:
         tie_fn = getattr(self.model, "tie_weights", None)
