@@ -1,8 +1,6 @@
 """Data pipeline helpers shared across CLIs."""
-
 from __future__ import annotations
 
-import random
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 
 import torch
@@ -68,13 +66,15 @@ def _apply_stream_mixing(
     if batch_size is None or batch_size <= 1:
         return
 
+    generator = torch.random.default_generator
+
     for stream, prob in mix_streams.items():
         group = _CANONICAL_STREAMS.get(stream)
         if not group:
             continue
-        if random.random() > prob:
+        if prob < 1.0 and torch.rand((), generator=generator).item() > prob:
             continue
-        permutation = torch.randperm(batch_size)
+        permutation = torch.randperm(batch_size, generator=generator)
         for key in group:
             tensor = merged.get(key)
             if isinstance(tensor, torch.Tensor) and tensor.shape[0] == batch_size:

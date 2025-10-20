@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import importlib
-import math
 import os
 import random
 import warnings
@@ -170,20 +169,24 @@ class LsaTMultiStream(Dataset):
         return files
 
     def _sample_indices(self, T0: int) -> List[int]:
+        """Devuelve índices equiespaciados para muestrear ``T0`` frames."""
+
+        if self.T <= 0:
+            return []
         if T0 <= 0:
             return [0] * self.T
-        if T0 >= self.T:
-            stride = math.ceil(T0 / self.T)
-            offset = random.randint(0, max(0, stride - 1))
-            idxs = list(range(offset, min(offset + stride * self.T, T0), stride))
-            while len(idxs) < self.T:
-                idxs.append(idxs[-1])
-            return idxs[: self.T]
 
-        idxs = list(range(T0))
-        while len(idxs) < self.T:
-            idxs.append(idxs[-1])
-        return idxs[: self.T]
+        np = self._np
+        last_index = max(T0 - 1, 0)
+
+        if T0 == 1:
+            return [0] * self.T
+
+        # ``linspace`` garantiza alineación consistente sin depender de ``random``
+        # para mantener reproducibilidad.
+        positions = np.linspace(0.0, float(last_index), num=self.T)
+        idxs = np.rint(positions).astype("int64").tolist()
+        return [max(0, min(last_index, int(i))) for i in idxs]
 
     # ------------------------------------------------------------------
     # Dataset API
@@ -304,29 +307,92 @@ class LsaTMultiStream(Dataset):
     def _load_pose(self, pose_path: str) -> Any:
         np = self._np
         if not os.path.exists(pose_path):
-            return np.zeros((1, 3 * self.lkp_count), dtype="float32")
+            return np.zeros((1, self.lkp_count * 3), dtype="float32")
 
-        with np.load(pose_path) as pose_npz:
-            pose = pose_npz.get("pose")
-            if pose is None or pose.shape[0] == 0:
-                return np.zeros((1, 3 * self.lkp_count), dtype="float32")
-            return pose
+        try:
+            with np.load(pose_path) as pose_npz:
+                pose = pose_npz.get("pose")
+                if pose is None:
+                    return np.zeros((1, self.lkp_count * 3), dtype="float32")
+
+                pose_arr = np.asarray(pose, dtype="float32")
+                if pose_arr.ndim == 3:
+                    frames, landmarks, dims = pose_arr.shape
+                    if dims < 2:
+                        return np.zeros((1, self.lkp_count * 3), dtype="float32")
+                    if dims == 2:
+                        conf = pose_npz.get("confidence") or pose_npz.get("pose_confidence")
+                        if conf is None:
+                            conf = np.ones((frames, landmarks), dtype="float32")
+                        conf = np.asarray(conf, dtype="float32").reshape(frames, landmarks)
+                        conf = np.clip(conf, 0.0, 1.0)
+                        pose_arr = np.concatenate([pose_arr, conf[..., None]], axis=2)
+                    elif dims > 3:
+                        pose_arr = pose_arr[..., :3]
+                elif pose_arr.ndim == 2:
+                    frames = pose_arr.shape[0]
+                    features = pose_arr.shape[1]
+                    if features % 3 == 0:
+                        landmarks = features // 3
+                        pose_arr = pose_arr.reshape(frames, landmarks, 3)
+                    elif features % 2 == 0:
+                        landmarks = features // 2
+                        coords = pose_arr.reshape(frames, landmarks, 2)
+                        conf = pose_npz.get("confidence") or pose_npz.get("pose_confidence")
+                        if conf is None:
+                            conf = np.ones((frames, landmarks), dtype="float32")
+                        conf = np.asarray(conf, dtype="float32").reshape(frames, landmarks)
+                        conf = np.clip(conf, 0.0, 1.0)
+                        pose_arr = np.concatenate([coords, conf[..., None]], axis=2)
+                    else:
+                        return np.zeros((1, self.lkp_count * 3), dtype="float32")
+                else:
+                    return np.zeros((1, self.lkp_count * 3), dtype="float32")
+
+                frames = pose_arr.shape[0]
+                landmarks = pose_arr.shape[1]
+                out = np.zeros((frames, self.lkp_count, 3), dtype="float32")
+                copy_landmarks = min(self.lkp_count, landmarks)
+                out[:, :copy_landmarks, : pose_arr.shape[2]] = pose_arr[:, :copy_landmarks, : pose_arr.shape[2]]
+                return out.reshape(frames, self.lkp_count * 3)
+        except (OSError, ValueError):
+            return np.zeros((1, self.lkp_count * 3), dtype="float32")
 
     def _sample_pose(self, pose: Any) -> tuple[torch.Tensor, torch.Tensor]:
         np = self._np
-        T0p = pose.shape[0]
+        pose_arr = np.asarray(pose, dtype="float32")
+        T0p = pose_arr.shape[0] if pose_arr.size > 0 else 0
+
         if T0p <= 0:
-            pose_s = np.zeros((self.T, 3 * self.lkp_count), dtype="float32")
+            pose_s = np.zeros((self.T, self.lkp_count, 3), dtype="float32")
         else:
             idxs_p = self._sample_indices(T0p)
-            pose_s = pose[idxs_p]
-        pose_s = pose_s.astype("float32", copy=False)
-        pose_s = pose_s.reshape(self.T, self.lkp_count, 3)
+            pose_s = pose_arr[idxs_p]
+            if pose_s.ndim == 2:
+                expected = self.lkp_count * 3
+                if pose_s.shape[1] < expected:
+                    padded = np.zeros((self.T, expected), dtype="float32")
+                    padded[:, : pose_s.shape[1]] = pose_s
+                    pose_s = padded
+                pose_s = pose_s.reshape(self.T, self.lkp_count, 3)
+            elif pose_s.ndim == 3:
+                if pose_s.shape[1] != self.lkp_count:
+                    trimmed = np.zeros((self.T, self.lkp_count, pose_s.shape[2]), dtype="float32")
+                    copy_landmarks = min(self.lkp_count, pose_s.shape[1])
+                    trimmed[:, :copy_landmarks, : pose_s.shape[2]] = pose_s[:, :copy_landmarks]
+                    pose_s = trimmed
+                if pose_s.shape[2] < 3:
+                    pad = np.zeros((self.T, self.lkp_count, 3 - pose_s.shape[2]), dtype="float32")
+                    pose_s = np.concatenate([pose_s, pad], axis=2)
+                elif pose_s.shape[2] > 3:
+                    pose_s = pose_s[:, :, :3]
+            else:
+                pose_s = np.zeros((self.T, self.lkp_count, 3), dtype="float32")
+
         conf = pose_s[:, :, 2]
         mask = conf >= self.min_conf
         pose_s[:, :, :2] *= mask[..., None].astype("float32")
-        pose_s = pose_s.reshape(self.T, 3 * self.lkp_count)
-        pose_tensor = torch.from_numpy(pose_s)
+        pose_tensor = torch.from_numpy(pose_s.reshape(self.T, self.lkp_count * 3))
         mask_tensor = torch.from_numpy(mask.astype("bool"))
         return pose_tensor, mask_tensor
 
