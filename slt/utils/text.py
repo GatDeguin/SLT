@@ -15,6 +15,7 @@ __all__ = [
     "validate_tokenizer",
     "character_error_rate",
     "word_error_rate",
+    "levenshtein_distance",
 ]
 
 
@@ -79,7 +80,11 @@ def validate_tokenizer(
         non-space character.
     """
 
-    missing_tokens = [attr for attr in required_special_tokens if getattr(tokenizer, attr, None) is None]
+    missing_tokens = [
+        attr
+        for attr in required_special_tokens
+        if getattr(tokenizer, attr, None) is None
+    ]
     if missing_tokens:
         raise TokenizerValidationError(
             f"Tokenizer is missing required special tokens: {', '.join(missing_tokens)}"
@@ -103,13 +108,19 @@ def validate_tokenizer(
         raise TokenizerValidationError("Tokenizer failed to decode probe ids.") from exc
 
     if not allow_empty_decode and decoded.strip() == "":
-        raise TokenizerValidationError("Decoded probe text is empty; check special token configuration.")
+        raise TokenizerValidationError(
+            "Decoded probe text is empty; check special token configuration."
+        )
 
     # ensure the tokenizer exposes integer IDs for the configured attributes
     for attr in required_special_tokens:
         value = getattr(tokenizer, attr, None)
         if not isinstance(value, int):
             raise TokenizerValidationError(f"Tokenizer attribute '{attr}' must be an integer ID.")
+        if value < 0:
+            raise TokenizerValidationError(
+                f"Tokenizer attribute '{attr}' must be a non-negative integer ID."
+            )
 
 
 def encode_batch(
@@ -126,6 +137,8 @@ def encode_batch(
     text_list = list(texts)
     if not text_list:
         raise ValueError("encode_batch received an empty iterable of texts.")
+    if any(text is None for text in text_list):
+        raise ValueError("encode_batch received a None entry; please filter inputs beforehand.")
 
     if max_length is None:
         max_length = tokenizer.model_max_length
@@ -157,6 +170,11 @@ def decode(
     else:
         seq_list = list(sequences)  # type: ignore[list-item]
 
+    if not seq_list:
+        return []
+    if any(seq is None for seq in seq_list):
+        raise ValueError("decode received a None entry; please filter inputs beforehand.")
+
     return tokenizer.batch_decode(
         seq_list,
         skip_special_tokens=skip_special_tokens,
@@ -164,7 +182,7 @@ def decode(
     )
 
 
-def _levenshtein_distance(reference: Sequence[str], prediction: Sequence[str]) -> int:
+def levenshtein_distance(reference: Sequence[str], prediction: Sequence[str]) -> int:
     if reference == prediction:
         return 0
     if not reference:
@@ -197,7 +215,7 @@ def _error_rate(
     for ref, pred in zip(references, predictions):
         ref_seq = tokenizer(ref or "")
         pred_seq = tokenizer(pred or "")
-        total_distance += _levenshtein_distance(ref_seq, pred_seq)
+        total_distance += levenshtein_distance(ref_seq, pred_seq)
         total_length += max(len(ref_seq), 1)
 
     if total_length == 0:

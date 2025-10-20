@@ -23,3 +23,6 @@ otras utilidades que dependen de los detectores de MediaPipe. El extra
   declarar `--model-format stub`, junto a un tokenizador de HuggingFace (`--tokenizer`).
 - `test_realtime_pipeline.py` reutiliza el pipeline con videos pregrabados y puede generar un video
   anotado (`--output`). Resulta útil para depurar cambios sin requerir una cámara física.
+- `eval_slt_multistream_v9.py` valida el tokenizador con `slt.utils.validate_tokenizer` antes de
+  procesar los lotes y reporta BLEU, ChrF, CER y WER empleando las utilidades de
+  `slt.utils.text`. Reutiliza `slt.utils.decode` para reconstruir las secuencias generadas.
