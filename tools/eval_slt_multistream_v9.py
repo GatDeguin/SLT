@@ -297,6 +297,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--log-level", default="INFO", help="Nivel de logging (INFO, DEBUG, ...)")
+    parser.add_argument(
+        "--skip-metrics",
+        dest="compute_metrics",
+        action="store_false",
+        help="Omite el cálculo de métricas de calidad de texto",
+    )
+    parser.set_defaults(compute_metrics=True)
 
     return parser.parse_args(argv)
 
@@ -674,15 +681,18 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
         _write_csv(output_csv, predictions)
         references = [item.reference for item in predictions]
         texts = [item.prediction for item in predictions]
-        bleu, chrf, cer, wer = _compute_metrics(references, texts)
         latency_metrics = _compute_latency_stats(latencies)
-        metrics = {
-            "bleu": bleu,
-            "chrf": chrf,
-            "cer": cer,
-            "wer": wer,
-            **latency_metrics,
-        }
+        metrics = dict(latency_metrics)
+        if args.compute_metrics:
+            bleu, chrf, cer, wer = _compute_metrics(references, texts)
+            metrics.update({
+                "bleu": bleu,
+                "chrf": chrf,
+                "cer": cer,
+                "wer": wer,
+            })
+        else:
+            bleu = chrf = cer = wer = float("nan")
         examples = _select_examples(predictions)
         evaluation_results.append(
             EvaluationResult(
@@ -692,15 +702,22 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
                 examples=examples,
             )
         )
-        logging.info(
-            "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, Latencia media: %.2f ms",
-            checkpoint_path.name,
-            bleu,
-            chrf,
-            cer,
-            wer,
-            metrics["avg_latency_ms"],
-        )
+        if args.compute_metrics:
+            logging.info(
+                "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, Latencia media: %.2f ms",
+                checkpoint_path.name,
+                bleu,
+                chrf,
+                cer,
+                wer,
+                metrics["avg_latency_ms"],
+            )
+        else:
+            logging.info(
+                "Métricas %s - métricas de texto omitidas, latencia media: %.2f ms",
+                checkpoint_path.name,
+                metrics["avg_latency_ms"],
+            )
         logging.info("Predicciones guardadas en %s", output_csv)
         del model
 
