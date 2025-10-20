@@ -15,15 +15,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import random
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import PreTrainedTokenizerBase
 
 from slt.data import LsaTMultiStream
 from slt.training.configuration import (
@@ -34,13 +35,11 @@ from slt.training.configuration import (
     resolve_configs,
 )
 from slt.training.data import create_dataloader, normalise_mix_spec
-from slt.training.loops import LoopResult, eval_epoch, train_epoch
+from slt.training.loops import eval_epoch, train_epoch
 from slt.training.models import MultiStreamClassifier
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
 from slt.utils.text import create_tokenizer
-
-from transformers import PreTrainedTokenizerBase
 
 try:  # pragma: no cover - numpy optional for RNG capture
     import numpy as np
@@ -51,6 +50,21 @@ try:  # pragma: no cover - TensorBoard is an optional dependency.
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:  # pragma: no cover - if TensorBoard is not installed we noop.
     SummaryWriter = None  # type: ignore
+
+
+def _resolve_device(flag: str | torch.device) -> torch.device:
+    if isinstance(flag, torch.device):
+        device = flag
+    else:
+        value = str(flag).strip().lower()
+        if value == "auto":
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(flag)
+    if device.type.startswith("cuda") and not torch.cuda.is_available():
+        logging.warning("CUDA solicitada pero no disponible. Se usará CPU.")
+        return torch.device("cpu")
+    return device
 def _levenshtein_distance(a: str, b: str) -> int:
     if a == b:
         return 0
@@ -195,11 +209,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-heads", type=int, help="Number of attention heads in the seq2seq decoder")
     parser.add_argument("--decoder-dropout", type=float, help="Dropout probability inside the seq2seq decoder")
     parser.add_argument("--face-backbone", type=str, help="Backbone specification for the face stream")
-    parser.add_argument("--hand-left-backbone", type=str, help="Backbone specification for the left hand stream")
-    parser.add_argument("--hand-right-backbone", type=str, help="Backbone specification for the right hand stream")
-    parser.add_argument("--freeze-face-backbone", action="store_true", help="Freeze the face backbone")
-    parser.add_argument("--freeze-hand-left-backbone", action="store_true", help="Freeze the left hand backbone")
-    parser.add_argument("--freeze-hand-right-backbone", action="store_true", help="Freeze the right hand backbone")
+    parser.add_argument(
+        "--hand-left-backbone",
+        type=str,
+        help="Backbone specification for the left hand stream",
+    )
+    parser.add_argument(
+        "--hand-right-backbone",
+        type=str,
+        help="Backbone specification for the right hand stream",
+    )
+    parser.add_argument(
+        "--freeze-face-backbone",
+        action="store_true",
+        help="Freeze the face backbone",
+    )
+    parser.add_argument(
+        "--freeze-hand-left-backbone",
+        action="store_true",
+        help="Freeze the left hand backbone",
+    )
+    parser.add_argument(
+        "--freeze-hand-right-backbone",
+        action="store_true",
+        help="Freeze the right hand backbone",
+    )
     parser.add_argument(
         "--pretrained",
         type=str,
@@ -245,17 +279,38 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Optional maximum norm for gradient clipping before each optimisation step.",
     )
-    parser.add_argument("--grad-accum-steps", type=int, help="Number of gradient accumulation steps")
-    parser.add_argument("--compile-mode", type=str, help="torch.compile mode (default, reduce-overhead, max-autotune)")
-    parser.add_argument("--compile", dest="compile_flag", action="store_true", help="Enable torch.compile")
-    parser.add_argument("--no-compile", dest="compile_flag", action="store_false", help="Disable torch.compile")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        help="Number of gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        help="torch.compile mode (default, reduce-overhead, max-autotune)",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_flag",
+        action="store_true",
+        help="Enable torch.compile",
+    )
+    parser.add_argument(
+        "--no-compile",
+        dest="compile_flag",
+        action="store_false",
+        help="Disable torch.compile",
+    )
     parser.set_defaults(compile_flag=None)
 
     parser.add_argument(
         "--resume",
         type=Path,
         default=None,
-        help="Checkpoint path to resume training from (loads model, optimiser and AMP scaler state).",
+        help=(
+            "Checkpoint path to resume training from (loads model, optimiser "
+            "and AMP scaler state)."
+        ),
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -281,7 +336,7 @@ def parse_args() -> argparse.Namespace:
     if args.resume and args.init_checkpoint:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     if args.mix_streams:
-        mix_spec: Dict[str, float] = {}
+        mix_spec: dict[str, float] = {}
         for entry in args.mix_streams:
             name, _, prob_text = entry.partition(":")
             name = name.strip()
@@ -298,20 +353,22 @@ def parse_args() -> argparse.Namespace:
             parser.error(str(exc))
     else:
         args.mix_streams = None
+    if args.precision == "float32":
+        args.precision = "fp32"
     if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
     return args
 
 
-def _collect_cli_overrides(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+def _collect_cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     sections = {
         "data": DataConfig,
         "model": ModelConfig,
         "optim": OptimConfig,
         "training": TrainingConfig,
     }
-    overrides: Dict[str, Dict[str, Any]] = {key: {} for key in sections}
+    overrides: dict[str, dict[str, Any]] = {key: {} for key in sections}
 
     for section, cls in sections.items():
         for field_obj in fields(cls):
@@ -347,9 +404,9 @@ def _collect_cli_overrides(args: argparse.Namespace) -> Dict[str, Dict[str, Any]
 
 def build_configs(
     args: argparse.Namespace,
-) -> tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, Dict[str, Any]]:
+) -> tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, dict[str, Any]]:
     cli_overrides = _collect_cli_overrides(args)
-    base: Dict[str, Any] = {}
+    base: dict[str, Any] = {}
     return resolve_configs(
         config_path=args.config,
         cli_overrides=cli_overrides,
@@ -391,7 +448,10 @@ def _maybe_compile_model(model: nn.Module, training: TrainingConfig) -> nn.Modul
         compile_kwargs["mode"] = training.compile_mode
     try:
         compiled = compile_fn(model, **compile_kwargs)
-        logging.info("Model compiled with torch.compile (mode=%s)", training.compile_mode or "default")
+        logging.info(
+            "Model compiled with torch.compile (mode=%s)",
+            training.compile_mode or "default",
+        )
         return compiled
     except Exception:
         logging.exception("torch.compile failed; continuing with eager execution.")
@@ -425,8 +485,32 @@ def _serialise_config(
     )
 
 
-def _capture_rng_state() -> Dict[str, Any]:
-    state: Dict[str, Any] = {
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _convert_metrics(metrics: Mapping[str, Any] | None) -> dict[str, float | None]:
+    converted: dict[str, float | None] = {}
+    if not metrics:
+        return converted
+    for name, value in metrics.items():
+        converted[name] = _safe_float(value)
+    return converted
+
+
+def _append_metrics(path: Path, record: Mapping[str, Any]) -> None:
+    payload = json.loads(json.dumps(record, default=str))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
         "python": random.getstate(),
         "torch": torch.get_rng_state(),
     }
@@ -490,9 +574,10 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     val_loss: float,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
-    best_val: Optional[float] = None,
-    config: Optional[Mapping[str, Any]] = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    best_val: float | None = None,
+    config: Mapping[str, Any] | None = None,
+    scheduler: Any | None = None,
 ) -> None:
     state = {
         "epoch": epoch,
@@ -506,6 +591,8 @@ def _save_checkpoint(
         state["best_val"] = float(best_val)
     if config is not None:
         state["config"] = json.loads(json.dumps(dict(config), default=str))
+    if scheduler is not None:
+        state["scheduler_state"] = scheduler.state_dict()
     torch.save(state, path)
 
 
@@ -532,10 +619,10 @@ def main() -> None:
     else:
         _save_rng_state(data_config.work_dir)
 
-    device = torch.device(data_config.device)
-    if device.type.startswith("cuda") and not torch.cuda.is_available():
-        logging.warning("CUDA requested but not available. Falling back to CPU.")
-        device = torch.device("cpu")
+    if data_config.precision.lower() == "float32":
+        data_config.precision = "fp32"
+
+    device = _resolve_device(data_config.device)
 
     tokenizer_source = data_config.tokenizer or model_config.decoder_model
     if tokenizer_source is None:
@@ -640,14 +727,20 @@ def main() -> None:
             )
         except TypeError:  # pragma: no cover - fallback when label smoothing unsupported
             logging.warning(
-                "Label smoothing unsupported in this PyTorch version. Falling back to default loss.")
+                "Label smoothing unsupported in this PyTorch version. "
+                "Falling back to default loss."
+            )
             return F.cross_entropy(
                 logits.view(-1, vocab),
                 targets.view(-1),
                 ignore_index=-100,
             )
 
-    use_amp = data_config.precision == "amp" and device.type == "cuda" and torch.cuda.is_available()
+    use_amp = (
+        data_config.precision == "amp"
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    )
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     perplexity_metric = _build_perplexity_metric()
@@ -658,7 +751,10 @@ def main() -> None:
     writer = None
     if data_config.tensorboard is not None:
         if SummaryWriter is None:
-            logging.warning("TensorBoard requested but not available. Install tensorboard to enable logging.")
+            logging.warning(
+                "TensorBoard requested but not available. Install tensorboard "
+                "to enable logging."
+            )
         else:
             data_config.tensorboard.mkdir(parents=True, exist_ok=True)
             writer = SummaryWriter(log_dir=str(data_config.tensorboard))
@@ -671,6 +767,10 @@ def main() -> None:
         training_config,
         merged_config,
     )
+
+    metrics_path = data_config.work_dir / "metrics.jsonl"
+    if args.resume is None and metrics_path.exists():
+        metrics_path.unlink()
 
     best_val = float("inf")
     best_path = data_config.work_dir / "best.pt"
@@ -688,13 +788,16 @@ def main() -> None:
             optimizer.load_state_dict(optimizer_state)
         if scaler is not None and "scaler_state" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state"])
+        if scheduler is not None and "scheduler_state" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
         best_val = float(checkpoint.get("best_val", checkpoint.get("val_loss", best_val)))
         start_epoch = int(checkpoint.get("epoch", 0))
         logging.info("Resumed training from %s at epoch %d", checkpoint_path, start_epoch)
 
     if training_config.epochs <= start_epoch:
         logging.info(
-            "Checkpoint epoch (%d) is greater than or equal to requested epochs (%d). Nothing to do.",
+            "Checkpoint epoch (%d) is greater than or equal to requested "
+            "epochs (%d). Nothing to do.",
             start_epoch,
             training_config.epochs,
         )
@@ -726,7 +829,8 @@ def main() -> None:
         val_loss = val_result.loss
 
         logging.info(
-            "Epoch %d/%d - train_loss=%.4f - val_loss=%.4f - ppl_train=%.4f - ppl_val=%.4f - cer_val=%.4f",
+            "Epoch %d/%d - train_loss=%.4f - val_loss=%.4f - ppl_train=%.4f - "
+            "ppl_val=%.4f - cer_val=%.4f",
             epoch,
             training_config.epochs,
             train_loss,
@@ -746,6 +850,7 @@ def main() -> None:
                 for name, value in val_result.metrics.items():
                     writer.add_scalar(f"val/{name}", value, epoch)
 
+        improved = val_loss < best_val
         _save_checkpoint(
             last_path,
             model=model,
@@ -755,10 +860,11 @@ def main() -> None:
             scaler=scaler,
             best_val=best_val,
             config=merged_config,
+            scheduler=scheduler,
         )
         _save_rng_state(data_config.work_dir)
 
-        if val_loss < best_val:
+        if improved:
             best_val = val_loss
             logging.info("New best validation loss: %.4f", best_val)
             _save_checkpoint(
@@ -770,7 +876,25 @@ def main() -> None:
                 scaler=scaler,
                 best_val=best_val,
                 config=merged_config,
+                scheduler=scheduler,
             )
+
+        current_lr = optimizer.param_groups[0].get("lr", optim_config.lr)
+        record = {
+            "epoch": epoch,
+            "train": {
+                "loss": _safe_float(train_loss),
+                **_convert_metrics(train_result.metrics),
+            },
+            "val": {
+                "loss": _safe_float(val_loss),
+                **_convert_metrics(val_result.metrics),
+            },
+            "learning_rate": _safe_float(current_lr),
+            "best_val": _safe_float(best_val),
+            "improved": improved,
+        }
+        _append_metrics(metrics_path, record)
 
         if scheduler is not None:
             scheduler.step()
