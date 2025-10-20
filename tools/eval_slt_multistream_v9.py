@@ -5,10 +5,13 @@ import argparse
 import csv
 import json
 import logging
+import math
+import statistics
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -16,7 +19,14 @@ from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
-from slt.utils.text import create_tokenizer, decode
+from slt.utils.text import (
+    TokenizerValidationError,
+    character_error_rate,
+    create_tokenizer,
+    decode,
+    validate_tokenizer,
+    word_error_rate,
+)
 
 from transformers import PreTrainedTokenizerBase
 
@@ -34,6 +44,7 @@ class PredictionItem:
     video_id: str
     prediction: str
     reference: str
+    latency_ms: Optional[float] = None
 
 
 @dataclass
@@ -54,6 +65,16 @@ class ModelConfig:
     decoder_layers: int = 2
     decoder_heads: int = 8
     decoder_dropout: float = 0.1
+
+
+@dataclass
+class EvaluationResult:
+    """Resumen de evaluación asociado a un checkpoint específico."""
+
+    checkpoint: Path
+    predictions: List[PredictionItem]
+    metrics: Dict[str, float]
+    examples: List[PredictionItem]
 
 
 class MultiStreamClassifier(nn.Module):
@@ -169,7 +190,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pose-dir", type=Path, required=True, help="Directorio con poses .npz")
     parser.add_argument("--metadata-csv", type=Path, required=True, help="CSV con columnas video_id/texto")
     parser.add_argument("--eval-index", type=Path, required=True, help="CSV con la lista de video_id a evaluar")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Ruta al checkpoint a cargar")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="Ruta(s) a uno o varios checkpoints a cargar",
+    )
     parser.add_argument("--output-csv", type=Path, required=True, help="Archivo de salida para escribir predicciones")
 
     parser.add_argument("--batch-size", type=int, default=4, help="Tamaño de batch para la evaluación")
@@ -255,7 +282,8 @@ def _validate_inputs(args: argparse.Namespace) -> None:
     _ensure_path(args.pose_dir, kind="Directorio de pose")
     _ensure_path(args.metadata_csv, kind="CSV de metadata")
     _ensure_path(args.eval_index, kind="CSV de índices")
-    _ensure_path(args.checkpoint, kind="Checkpoint")
+    for ckpt in args.checkpoint:
+        _ensure_path(ckpt, kind="Checkpoint")
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -355,8 +383,9 @@ def _predict(
     max_length: int,
     num_beams: int,
     max_new_tokens: Optional[int],
-) -> List[PredictionItem]:
+) -> Tuple[List[PredictionItem], List[float]]:
     results: List[PredictionItem] = []
+    latencies: List[float] = []
     model.eval()
     with torch.inference_mode():
         for batch in loader:
@@ -374,97 +403,170 @@ def _predict(
             else:
                 generation_kwargs["max_length"] = max_length
             generation_kwargs.setdefault("min_length", 2)
+            start = time.perf_counter()
             sequences = model.generate(**inputs, **generation_kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
             if hasattr(sequences, "sequences"):
                 sequences_tensor = sequences.sequences  # type: ignore[attr-defined]
             else:
                 sequences_tensor = sequences
             decoded = decode(tokenizer, sequences_tensor)
             references = batch.get("texts") or [""] * len(decoded)
+            batch_size = len(decoded) if decoded else 1
+            sample_latency = elapsed_ms / max(batch_size, 1)
+            latencies.extend([sample_latency] * len(decoded))
             for video_id, text, ref in zip(batch["video_ids"], decoded, references):
-                results.append(PredictionItem(video_id=video_id, prediction=text, reference=ref))
-    return results
+                results.append(
+                    PredictionItem(
+                        video_id=video_id,
+                        prediction=text,
+                        reference=ref,
+                        latency_ms=sample_latency,
+                    )
+                )
+    return results, latencies
 
 
 def _write_csv(path: Path, rows: Iterable[PredictionItem]) -> None:
     temp_file = None
     with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)) as tmp:
         writer = csv.writer(tmp)
-        writer.writerow(["video_id", "prediction", "reference"])
+        writer.writerow(["video_id", "prediction", "reference", "latency_ms"])
         for row in rows:
-            writer.writerow([row.video_id, row.prediction, row.reference])
+            latency = "" if row.latency_ms is None else f"{row.latency_ms:.6f}"
+            writer.writerow([row.video_id, row.prediction, row.reference, latency])
         temp_file = Path(tmp.name)
     if temp_file is None:
         raise RuntimeError("No se pudo escribir el archivo temporal de predicciones")
     temp_file.replace(path)
 
 
-def _levenshtein_distance(reference: str, prediction: str) -> int:
-    if reference == prediction:
-        return 0
-    if not reference:
-        return len(prediction)
-    if not prediction:
-        return len(reference)
-    prev_row = list(range(len(prediction) + 1))
-    for i, ref_char in enumerate(reference, start=1):
-        current = [i]
-        for j, pred_char in enumerate(prediction, start=1):
-            insert_cost = current[j - 1] + 1
-            delete_cost = prev_row[j] + 1
-            replace_cost = prev_row[j - 1] + (ref_char != pred_char)
-            current.append(min(insert_cost, delete_cost, replace_cost))
-        prev_row = current
-    return prev_row[-1]
-
-
-def _character_error_rate(references: Sequence[str], predictions: Sequence[str]) -> float:
-    total_distance = 0
-    total_length = 0
-    for ref, pred in zip(references, predictions):
-        ref_text = ref or ""
-        pred_text = pred or ""
-        total_distance += _levenshtein_distance(ref_text, pred_text)
-        total_length += max(len(ref_text), 1)
-    if total_length == 0:
-        return 0.0
-    return (total_distance / total_length) * 100.0
-
-
-def _compute_metrics(references: Sequence[str], predictions: Sequence[str]) -> Tuple[float, float, float]:
+def _compute_metrics(
+    references: Sequence[str], predictions: Sequence[str]
+) -> Tuple[float, float, float, float]:
     if not references or not predictions:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     if BLEU is None or CHRF is None:
         logging.warning("sacrebleu no disponible, las métricas BLEU/ChrF se devolverán en 0.0")
-        cer = _character_error_rate(references, predictions)
-        return 0.0, 0.0, cer
+        cer = character_error_rate(references, predictions)
+        wer = word_error_rate(references, predictions)
+        return 0.0, 0.0, cer, wer
     bleu_metric = BLEU(tokenize="13a")
     chrf_metric = CHRF()
     bleu_score = bleu_metric.corpus_score(predictions, [references]).score
     chrf_score = chrf_metric.corpus_score(predictions, [references]).score
-    cer_score = _character_error_rate(references, predictions)
-    return float(bleu_score), float(chrf_score), float(cer_score)
+    cer_score = character_error_rate(references, predictions)
+    wer_score = word_error_rate(references, predictions)
+    return float(bleu_score), float(chrf_score), float(cer_score), float(wer_score)
+
+
+def _percentile(data: Sequence[float], percentile: float) -> float:
+    if not data:
+        return 0.0
+    if not 0.0 <= percentile <= 1.0:
+        raise ValueError("percentile debe estar entre 0.0 y 1.0")
+    sorted_data = sorted(data)
+    if len(sorted_data) == 1:
+        return sorted_data[0]
+    index = (len(sorted_data) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return sorted_data[int(index)]
+    lower_value = sorted_data[lower]
+    upper_value = sorted_data[upper]
+    weight = index - lower
+    return lower_value + (upper_value - lower_value) * weight
+
+
+def _compute_latency_stats(latencies_ms: Sequence[float]) -> Dict[str, float]:
+    if not latencies_ms:
+        return {
+            "avg_latency_ms": 0.0,
+            "std_latency_ms": 0.0,
+            "p50_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
+            "min_latency_ms": 0.0,
+            "max_latency_ms": 0.0,
+        }
+    avg = statistics.fmean(latencies_ms)
+    std = statistics.pstdev(latencies_ms) if len(latencies_ms) > 1 else 0.0
+    return {
+        "avg_latency_ms": float(avg),
+        "std_latency_ms": float(std),
+        "p50_latency_ms": float(_percentile(latencies_ms, 0.5)),
+        "p95_latency_ms": float(_percentile(latencies_ms, 0.95)),
+        "min_latency_ms": float(min(latencies_ms)),
+        "max_latency_ms": float(max(latencies_ms)),
+    }
+
+
+def _aggregate_metric_sets(metric_sets: Sequence[Mapping[str, float]]) -> Dict[str, Dict[str, float]]:
+    aggregated: Dict[str, Dict[str, float]] = {}
+    if not metric_sets:
+        return aggregated
+    grouped: Dict[str, List[float]] = {}
+    for metrics in metric_sets:
+        for key, value in metrics.items():
+            grouped.setdefault(key, []).append(float(value))
+    for key, values in grouped.items():
+        mean = statistics.fmean(values)
+        std = statistics.pstdev(values) if len(values) > 1 else 0.0
+        aggregated[key] = {
+            "mean": float(mean),
+            "std": float(std),
+            "min": float(min(values)),
+            "max": float(max(values)),
+            "count": int(len(values)),
+        }
+    return aggregated
 
 
 def _select_examples(predictions: Sequence[PredictionItem], limit: int = 5) -> List[PredictionItem]:
     return list(predictions[: min(limit, len(predictions))])
 
 
+def _sanitize_checkpoint_name(checkpoint: Path) -> str:
+    name = checkpoint.stem or checkpoint.name
+    sanitized = [
+        ch if ch.isalnum() or ch in {"-", "_"} else "_"
+        for ch in name
+    ]
+    return "".join(sanitized).strip("_") or "checkpoint"
+
+
+def _resolve_output_path(base_path: Path, checkpoint: Path, multiple: bool) -> Path:
+    if not multiple:
+        return base_path
+    suffix = base_path.suffix
+    stem = base_path.stem
+    checkpoint_name = _sanitize_checkpoint_name(checkpoint)
+    return base_path.with_name(f"{stem}__{checkpoint_name}{suffix}")
+
+
 def _write_reports(
     output_dir: Path,
     *,
-    metrics: Mapping[str, float],
-    examples: Sequence[PredictionItem],
+    aggregate: Mapping[str, Mapping[str, float]],
+    results: Sequence[EvaluationResult],
 ) -> None:
     report = {
-        "metrics": {key: float(value) for key, value in metrics.items()},
-        "examples": [
+        "aggregate": aggregate,
+        "checkpoints": [
             {
-                "video_id": item.video_id,
-                "prediction": item.prediction,
-                "reference": item.reference,
+                "checkpoint": str(result.checkpoint),
+                "metrics": {key: float(value) for key, value in result.metrics.items()},
+                "examples": [
+                    {
+                        "video_id": item.video_id,
+                        "prediction": item.prediction,
+                        "reference": item.reference,
+                        "latency_ms": item.latency_ms,
+                    }
+                    for item in result.examples
+                ],
             }
-            for item in examples
+            for result in results
         ],
     }
 
@@ -479,11 +581,21 @@ def _write_reports(
     csv_tmp: Optional[Path] = None
     with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(output_dir)) as tmp:
         writer = csv.writer(tmp)
-        writer.writerow(["type", "name", "value", "reference"])
-        for key in sorted(metrics):
-            writer.writerow(["metric", key, metrics[key], ""])
-        for item in examples:
-            writer.writerow(["example", item.video_id, item.prediction, item.reference])
+        writer.writerow(["type", "checkpoint", "name", "value", "reference"])
+        for metric_name, stats in aggregate.items():
+            for stat_name, value in stats.items():
+                writer.writerow(["aggregate", "ALL", f"{metric_name}_{stat_name}", value, ""])
+        for result in results:
+            for metric_name, value in result.metrics.items():
+                writer.writerow(["metric", result.checkpoint.name, metric_name, value, ""])
+            for item in result.examples:
+                writer.writerow([
+                    "example",
+                    result.checkpoint.name,
+                    item.video_id,
+                    item.prediction,
+                    item.reference,
+                ])
         csv_tmp = Path(tmp.name)
     if csv_tmp is None:
         raise RuntimeError("No se pudo escribir el archivo CSV de métricas")
@@ -497,29 +609,80 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     device = _select_device(args.device)
 
     tokenizer = create_tokenizer(args.tokenizer)
-    loader = _create_dataloader(args)
-    model = _build_model(args, tokenizer).to(device)
-    _load_checkpoint(model, args.checkpoint, device)
+    try:
+        validate_tokenizer(tokenizer)
+    except TokenizerValidationError as exc:
+        raise RuntimeError(f"Tokenizer inválido: {exc}") from exc
 
-    predictions = _predict(
-        model,
-        loader,
-        device,
-        tokenizer,
-        max_length=args.max_target_length,
-        num_beams=args.num_beams,
-        max_new_tokens=args.max_new_tokens,
-    )
-    _write_csv(args.output_csv, predictions)
-    references = [item.reference for item in predictions]
-    texts = [item.prediction for item in predictions]
-    bleu, chrf, cer = _compute_metrics(references, texts)
-    metrics = {"bleu": bleu, "chrf": chrf, "cer": cer}
-    examples = _select_examples(predictions)
-    _write_reports(args.output_csv.parent, metrics=metrics, examples=examples)
-    logging.info("Predicciones guardadas en %s", args.output_csv)
-    logging.info("Métricas - BLEU: %.2f, ChrF: %.2f, CER: %.2f", bleu, chrf, cer)
-    return predictions
+    loader = _create_dataloader(args)
+    multiple_checkpoints = len(args.checkpoint) > 1
+    evaluation_results: List[EvaluationResult] = []
+
+    for checkpoint_path in args.checkpoint:
+        logging.info("Evaluando checkpoint %s", checkpoint_path)
+        model = _build_model(args, tokenizer).to(device)
+        _load_checkpoint(model, checkpoint_path, device)
+        predictions, latencies = _predict(
+            model,
+            loader,
+            device,
+            tokenizer,
+            max_length=args.max_target_length,
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+        output_csv = _resolve_output_path(args.output_csv, checkpoint_path, multiple_checkpoints)
+        _write_csv(output_csv, predictions)
+        references = [item.reference for item in predictions]
+        texts = [item.prediction for item in predictions]
+        bleu, chrf, cer, wer = _compute_metrics(references, texts)
+        latency_metrics = _compute_latency_stats(latencies)
+        metrics = {
+            "bleu": bleu,
+            "chrf": chrf,
+            "cer": cer,
+            "wer": wer,
+            **latency_metrics,
+        }
+        examples = _select_examples(predictions)
+        evaluation_results.append(
+            EvaluationResult(
+                checkpoint=checkpoint_path,
+                predictions=predictions,
+                metrics=metrics,
+                examples=examples,
+            )
+        )
+        logging.info(
+            "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, Latencia media: %.2f ms",
+            checkpoint_path.name,
+            bleu,
+            chrf,
+            cer,
+            wer,
+            metrics["avg_latency_ms"],
+        )
+        logging.info("Predicciones guardadas en %s", output_csv)
+        del model
+
+    aggregate = _aggregate_metric_sets([result.metrics for result in evaluation_results])
+    report_dir = args.output_csv.parent
+    _write_reports(report_dir, aggregate=aggregate, results=evaluation_results)
+    logging.info("Reportes agregados guardados en %s", report_dir)
+    if aggregate:
+        for metric_name, stats in aggregate.items():
+            logging.info(
+                "Resumen %s -> media=%.4f, std=%.4f, min=%.4f, max=%.4f (n=%d)",
+                metric_name,
+                stats.get("mean", 0.0),
+                stats.get("std", 0.0),
+                stats.get("min", 0.0),
+                stats.get("max", 0.0),
+                int(stats.get("count", 0)),
+            )
+
+    return evaluation_results[0].predictions if evaluation_results else []
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
