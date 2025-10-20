@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -15,6 +16,24 @@ from .modules import FuseConcatLinear, PositionalEncodingLearned, StreamProjecto
 from .temporal import TemporalEncoder
 
 __all__ = ["MultiStreamEncoder"]
+
+
+@dataclass(frozen=True)
+class _StreamAssembly:
+    """Book-keeping structure linking stream attributes."""
+
+    name: str
+    backbone_attr: Optional[str]
+    projector_attr: str
+
+    def modules(self, owner: "MultiStreamEncoder") -> Dict[str, torch.nn.Module]:
+        modules: Dict[str, torch.nn.Module] = {}
+        if self.backbone_attr is not None:
+            backbone = getattr(owner, self.backbone_attr)
+            modules["backbone"] = backbone
+        projector = getattr(owner, self.projector_attr)
+        modules["projector"] = projector
+        return modules
 
 
 class MultiStreamEncoder(torch.nn.Module):
@@ -42,6 +61,12 @@ class MultiStreamEncoder(torch.nn.Module):
             "face": "face_backbone",
             "hand_left": "hand_backbone_left",
             "hand_right": "hand_backbone_right",
+        }
+        self._stream_to_projector = {
+            "face": "face_projector",
+            "hand_left": "hand_left_projector",
+            "hand_right": "hand_right_projector",
+            "pose": "pose_projector",
         }
         self._backbone_factories: DefaultDict[str, Dict[str, Callable[[], torch.nn.Module]]] = defaultdict(dict)
         self._backbone_instances: DefaultDict[str, Dict[str, torch.nn.Module]] = defaultdict(dict)
@@ -76,6 +101,15 @@ class MultiStreamEncoder(torch.nn.Module):
         self.temporal = TemporalEncoder(d_model=d_model, **temporal_kwargs)
         self._last_combined_hand_mask: Optional[Tensor] = None
         self._last_padding_mask: Optional[Tensor] = None
+        self._last_pose_mask: Optional[Tensor] = None
+        self._stream_assemblies: Dict[str, _StreamAssembly] = {
+            stream: _StreamAssembly(
+                name=stream,
+                backbone_attr=self._stream_to_attr.get(stream),
+                projector_attr=self._stream_to_projector[stream],
+            )
+            for stream in self._stream_to_projector
+        }
         self._auto_configure_components()
 
     def forward(
@@ -87,6 +121,7 @@ class MultiStreamEncoder(torch.nn.Module):
         pad_mask: Optional[Tensor] = None,
         miss_mask_hl: Optional[Tensor] = None,
         miss_mask_hr: Optional[Tensor] = None,
+        pose_conf_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Encode multi-stream inputs returning a temporal sequence tensor."""
 
@@ -107,8 +142,12 @@ class MultiStreamEncoder(torch.nn.Module):
         face_proj = self.face_projector(face_feats)
         hand_l_proj = self.hand_left_projector(hand_l_feats)
         hand_r_proj = self.hand_right_projector(hand_r_feats)
-        pose_proj = self.pose_projector(self._ensure_pose_shape(pose))
+        pose_processed = self._ensure_pose_shape(pose)
+        pose_processed, pose_mask = self._apply_pose_mask(pose_processed, pose_conf_mask)
+        pose_proj = self.pose_projector(pose_processed)
         self._emit("pose.projector", pose_proj)
+        if pose_mask is not None:
+            self._emit("pose.mask", pose_mask.to(torch.float32))
 
         combined_hand_mask = self._combine_missing_masks(hand_l_mask, hand_r_mask)
         self._last_combined_hand_mask = combined_hand_mask
@@ -176,6 +215,12 @@ class MultiStreamEncoder(torch.nn.Module):
 
         return dict(self._last_hand_masks)
 
+    @property
+    def last_pose_mask(self) -> Optional[Tensor]:
+        """Return the most recent pose confidence mask."""
+
+        return self._last_pose_mask
+
     def active_backbone_name(self, stream: str) -> Optional[str]:
         """Return the currently active backbone identifier for ``stream``."""
 
@@ -189,6 +234,30 @@ class MultiStreamEncoder(torch.nn.Module):
     # ------------------------------------------------------------------
     # Backbone registry API
     # ------------------------------------------------------------------
+    def stream_state_dict(self, stream: str) -> Dict[str, Tensor]:
+        """Return a shallow state dictionary for a single ``stream``."""
+
+        assembly = self._require_stream(stream)
+        wrapper = torch.nn.Module()
+        for name, module in assembly.modules(self).items():
+            setattr(wrapper, name, module)
+        return OrderedDict(wrapper.state_dict())
+
+    def load_stream_state_dict(
+        self,
+        stream: str,
+        state_dict: Mapping[str, Tensor],
+        *,
+        strict: bool = True,
+    ) -> torch.nn.modules.module._IncompatibleKeys:
+        """Load parameters for a particular ``stream``."""
+
+        assembly = self._require_stream(stream)
+        wrapper = torch.nn.Module()
+        for name, module in assembly.modules(self).items():
+            setattr(wrapper, name, module)
+        return wrapper.load_state_dict(state_dict, strict=strict)
+
     def register_backbone(
         self,
         stream: str,
@@ -352,6 +421,51 @@ class MultiStreamEncoder(torch.nn.Module):
 
         return features.masked_fill(expanded_mask, 0)
 
+    def _apply_pose_mask(
+        self, pose: Tensor, mask: Optional[Tensor]
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        if mask is None:
+            self._last_pose_mask = None
+            return pose, None
+        mask_bool = mask.to(dtype=torch.bool)
+        expected_bt = pose.shape[:2]
+        if mask_bool.shape[0] != expected_bt[0] or mask_bool.shape[1] != expected_bt[1]:
+            raise ValueError(
+                "Pose confidence masks must match batch/time dimensions; received "
+                f"shape {tuple(mask_bool.shape)}"
+            )
+        landmarks = pose.size(-1) // 3
+        if pose.size(-1) % 3 != 0:
+            raise ValueError("Pose dimensionality must be divisible by 3")
+        if mask_bool.dim() == 2:
+            mask_bool = mask_bool.unsqueeze(-1).expand(-1, -1, landmarks)
+        elif mask_bool.dim() == 3:
+            if mask_bool.size(-1) != landmarks:
+                raise ValueError(
+                    "Pose mask landmark dimension does not match pose dimensionality"
+                )
+        else:
+            raise ValueError("Pose confidence masks must have 2 or 3 dimensions")
+        mask_bool = mask_bool.to(device=pose.device)
+        masked = self._mask_pose_features(pose, mask_bool)
+        self._last_pose_mask = mask_bool
+        return masked, mask_bool
+
+    def _mask_pose_features(self, pose: Tensor, mask: Tensor) -> Tensor:
+        if pose.dim() != 3:
+            raise ValueError("Pose features must have shape (batch, time, pose_dim)")
+        pose_dim = pose.size(-1)
+        if pose_dim % 3 != 0:
+            raise ValueError("Pose dimensionality must be divisible by 3")
+        if mask.dim() != 3:
+            raise ValueError("Pose masks must have shape (batch, time, landmarks)")
+        mask_bool = mask.to(device=pose.device, dtype=torch.bool)
+        expanded = mask_bool.unsqueeze(-1)
+        reshaped = pose.view(*pose.shape[:-1], pose_dim // 3, 3)
+        zeros = torch.zeros_like(reshaped)
+        reshaped = torch.where(expanded, reshaped, zeros)
+        return reshaped.view_as(pose)
+
     def _combine_missing_masks(
         self, left: Optional[Tensor], right: Optional[Tensor]
     ) -> Optional[Tensor]:
@@ -483,3 +597,8 @@ class MultiStreamEncoder(torch.nn.Module):
         )
         value = torch.tensor([float(index)], dtype=torch.float32)
         self._emit(f"{stream}.backbone", value)
+
+    def _require_stream(self, stream: str) -> _StreamAssembly:
+        if stream not in self._stream_assemblies:
+            raise ValueError(f"Unknown stream '{stream}'")
+        return self._stream_assemblies[stream]

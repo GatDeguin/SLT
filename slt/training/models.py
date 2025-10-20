@@ -124,6 +124,7 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
@@ -136,6 +137,7 @@ class MultiStreamClassifier(nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
@@ -156,6 +158,7 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         **generation_kwargs: Any,
     ) -> torch.LongTensor:
@@ -167,6 +170,7 @@ class MultiStreamClassifier(nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)

@@ -138,6 +138,19 @@ def test_cli_collate_propagates_masks_and_lengths(synthetic_dataset: dict) -> No
     assert torch.equal(inputs["pose_conf_mask"], sample.pose_conf_mask.unsqueeze(0))
 
 
+def test_training_collate_includes_pose_mask(synthetic_dataset: dict) -> None:
+    from slt.training.data import build_collate
+
+    ds = LsaTMultiStream(T=6, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+    tokenizer = DummyTokenizer()
+    collate = build_collate(tokenizer, max_length=5)
+
+    batch = collate([sample])
+    inputs = batch["inputs"]
+    assert torch.equal(inputs["pose_conf_mask"], sample.pose_conf_mask.unsqueeze(0))
+
+
 def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
     ds_no_flip = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
     ds_flip = LsaTMultiStream(T=4, img_size=32, flip_prob=1.0, **synthetic_dataset)

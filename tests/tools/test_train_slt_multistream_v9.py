@@ -61,7 +61,18 @@ def test_multistream_classifier_forward_with_custom_decoder_config(tmp_path, bat
         def __init__(self) -> None:
             super().__init__()
 
-        def forward(self, face, hand_l, hand_r, pose, *, pad_mask=None, miss_mask_hl=None, miss_mask_hr=None):
+        def forward(
+            self,
+            face,
+            hand_l,
+            hand_r,
+            pose,
+            *,
+            pad_mask=None,
+            miss_mask_hl=None,
+            miss_mask_hr=None,
+            pose_conf_mask=None,
+        ):
             batch, time = face.shape[:2]
             return torch.zeros(batch, time, model_config.d_model, device=face.device)
 

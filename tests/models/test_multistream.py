@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import types
-from typing import Dict
+from typing import Dict, Optional
 
 import pytest
 
@@ -342,3 +342,79 @@ def test_hand_masks_emitted_and_tracked() -> None:
     assert "hand_left.mask" in recorded
     assert "hand_right.mask" in recorded
     assert "hand.mask" in recorded
+
+
+def test_pose_conf_mask_zeroes_landmarks() -> None:
+    encoder = _make_encoder(
+        projector_dim=4,
+        d_model=8,
+        pose_dim=6,
+        positional_num_positions=4,
+        temporal_kwargs={"nhead": 2, "nlayers": 1, "dim_feedforward": 16},
+    )
+
+    class CaptureProjector(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.last_input: Optional[torch.Tensor] = None
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.last_input = x.detach()
+            return x
+
+    original_projector = encoder.pose_projector
+
+    class WrappedProjector(CaptureProjector):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.last_input = x.detach()
+            return original_projector(x)
+
+    capture = WrappedProjector()
+    encoder.pose_projector = capture
+
+    batch, time = 1, 2
+    landmarks = 2
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
+    hand = torch.randn_like(face)
+    pose = torch.arange(batch * time * landmarks * 3, dtype=torch.float32).view(batch, time, landmarks * 3)
+    mask = torch.tensor([[[True, True], [False, False]]])
+
+    _ = encoder(
+        face,
+        hand,
+        hand,
+        pose,
+        pose_conf_mask=mask,
+    )
+
+    assert encoder.last_pose_mask is not None
+    assert torch.equal(encoder.last_pose_mask, mask)
+    assert capture.last_input is not None
+    reshaped = capture.last_input.view(batch, time, landmarks, 3)
+    assert torch.allclose(reshaped[0, 0], pose.view(batch, time, landmarks, 3)[0, 0])
+    assert torch.all(reshaped[0, 1] == 0)
+
+
+def test_stream_state_dict_roundtrip() -> None:
+    encoder = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+
+    face_state = encoder.stream_state_dict("face")
+    assert face_state
+    assert any(key.startswith("projector") for key in face_state)
+
+    fresh = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+    load_info = fresh.load_stream_state_dict("face", face_state)
+    assert not load_info.missing_keys
+    assert not load_info.unexpected_keys
