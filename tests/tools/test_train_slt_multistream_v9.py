@@ -57,8 +57,19 @@ def test_multistream_classifier_forward_with_custom_decoder_config(tmp_path, bat
         decoder_config=str(config_dir),
     )
 
+    class DummyEncoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+
+        def forward(self, face, hand_l, hand_r, pose, *, pad_mask=None, miss_mask_hl=None, miss_mask_hr=None):
+            batch, time = face.shape[:2]
+            return torch.zeros(batch, time, model_config.d_model, device=face.device)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr("slt.training.models.MultiStreamEncoder", lambda *args, **kwargs: DummyEncoder())
     tokenizer = TinyTokenizer()
     model = train_module.MultiStreamClassifier(model_config, tokenizer)
+    patch.undo()
 
     sequence_length = model_config.sequence_length
     image_size = model_config.image_size

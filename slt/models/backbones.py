@@ -1,13 +1,13 @@
 """Backbone neural network definitions used by the SLT models."""
 from __future__ import annotations
 
-import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Union
 
 import torch
+import torch.hub
 from torch import Tensor, nn
 
 try:  # pragma: no cover - optional dependency.
@@ -30,6 +30,39 @@ BackboneSpec = Union[
     nn.Module,
     Callable[[], nn.Module],
 ]
+
+
+DINOV2_DEFAULT_REPO = "facebookresearch/dinov2"
+DINOV2_DEFAULT_MODEL = "dinov2_vits14"
+DINOV2_IMAGE_MEAN = (0.485, 0.456, 0.406)
+DINOV2_IMAGE_STD = (0.229, 0.224, 0.225)
+
+
+@dataclass
+class ViTConfig:
+    """Configuration container for DINOv2-style ViT backbones."""
+
+    model_name: str = DINOV2_DEFAULT_MODEL
+    repo: str = DINOV2_DEFAULT_REPO
+    pretrained: bool = True
+    image_size: int = 224
+    patch_size: int = 14
+    in_channels: int = 3
+    embed_dim: int = 384
+    depth: int = 12
+    num_heads: int = 6
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
+    attention_dropout: float = 0.0
+    stochastic_dropout: float = 0.0
+    mean: Tuple[float, float, float] = DINOV2_IMAGE_MEAN
+    std: Tuple[float, float, float] = DINOV2_IMAGE_STD
+
+    def to_spec(self) -> str:
+        """Return a :func:`load_dinov2_backbone` specification string."""
+
+        mode = "pretrained" if self.pretrained else "random"
+        return f"torchhub::{self.repo}:{self.model_name}:{mode}"
 
 
 def _apply_freeze(module: nn.Module, freeze: BackboneFreeze) -> None:
@@ -224,20 +257,6 @@ def _load_checkpoint(
         )
 
 
-def _extract_stub_config(checkpoint: object) -> Optional[dict[str, Any]]:
-    if not isinstance(checkpoint, Mapping):
-        return None
-    metadata = checkpoint.get("metadata")
-    if not isinstance(metadata, Mapping):
-        return None
-    backbone_meta = metadata.get("backbone")
-    if not isinstance(backbone_meta, Mapping):
-        return None
-    valid_keys = set(ViTConfig.__dataclass_fields__.keys())
-    config = {key: backbone_meta[key] for key in valid_keys if key in backbone_meta}
-    return config or None
-
-
 def _convert_dinov2_state_dict(state_dict: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
     """Convert HuggingFace/local checkpoints to ``torchvision`` naming."""
 
@@ -259,20 +278,30 @@ def _convert_dinov2_state_dict(state_dict: Mapping[str, Tensor]) -> Mapping[str,
     return converted
 
 
+def _normalize_model_name(model_name: str) -> str:
+    alias_map = {
+        "slt_vitsmall_patch16": DINOV2_DEFAULT_MODEL,
+        "dinov2-s/16": DINOV2_DEFAULT_MODEL,
+        "dinov2_s16": DINOV2_DEFAULT_MODEL,
+        "dinov2-s16": DINOV2_DEFAULT_MODEL,
+    }
+    return alias_map.get(model_name.lower(), model_name)
+
+
 def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
     """Parse a ``load_dinov2_backbone`` specification string."""
 
     if "::" in spec:
         source, remainder = spec.split("::", 1)
     else:
-        source, remainder = "torchvision", spec
+        source, remainder = "torchhub", spec
     source = source.lower()
 
-    if source in {"torchhub", "torchvision", "tv"}:
+    if source in {"torchvision", "tv"}:
         parts = [part for part in remainder.split(":") if part]
         if not parts:
             raise ValueError("Torchvision specification must include a model name")
-        model = parts[0]
+        model = _normalize_model_name(parts[0])
         if len(parts) == 1:
             weight = "default"
         elif len(parts) == 2:
@@ -284,6 +313,33 @@ def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
             )
         return "torchvision", {"model": model, "weights": weight}
 
+    if source in {"torchhub"}:
+        parts = [part for part in remainder.split(":") if part]
+        if not parts:
+            raise ValueError("TorchHub specification must include a model name")
+        if len(parts) == 1:
+            repo = DINOV2_DEFAULT_REPO
+            model = _normalize_model_name(parts[0])
+            pretrained = "pretrained"
+        elif len(parts) == 2:
+            if parts[1].lower() in {"pretrained", "true", "false", "random", "0", "1", "yes", "no"}:
+                repo = DINOV2_DEFAULT_REPO
+                model = _normalize_model_name(parts[0])
+                pretrained = parts[1]
+            else:
+                repo = parts[0]
+                model = _normalize_model_name(parts[1])
+                pretrained = "pretrained"
+        elif len(parts) == 3:
+            repo, model, pretrained = parts
+            repo = repo or DINOV2_DEFAULT_REPO
+            model = _normalize_model_name(model)
+        else:
+            raise ValueError(
+                "TorchHub specification must follow 'model', 'model:mode' or 'repo:model:mode' format"
+            )
+        return "torchhub", {"repo": repo, "model": model, "pretrained": pretrained}
+
     if source in {"hf", "huggingface"}:
         parts = [part for part in remainder.split(":") if part]
         if not parts:
@@ -293,12 +349,13 @@ def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
         if len(parts) == 1:
             repo_id = parts[0]
             filename = "pytorch_model.bin"
-            model = "dinov2_vits14"
+            model = DINOV2_DEFAULT_MODEL
         elif len(parts) == 2:
             repo_id, filename = parts
-            model = "dinov2_vits14"
+            model = DINOV2_DEFAULT_MODEL
         elif len(parts) == 3:
             repo_id, filename, model = parts
+            model = _normalize_model_name(model)
         else:
             raise ValueError(
                 "HuggingFace specification must follow 'repo_id:filename:model' format"
@@ -312,12 +369,114 @@ def _parse_backbone_spec(spec: str) -> tuple[str, dict[str, str]]:
             path, model = remainder.split(":", 1)
         else:
             path = remainder
-            model = "dinov2_vits14"
-        return "file", {"path": path, "model": model}
+            model = DINOV2_DEFAULT_MODEL
+        return "file", {"path": path, "model": _normalize_model_name(model)}
 
     raise ValueError(
         "Backbone specification must start with 'torchhub::', 'hf::' or 'file::'."
     )
+
+
+def _resolve_map_location(map_location: Optional[Union[str, torch.device]]) -> Optional[torch.device]:
+    if map_location is None:
+        return None
+    if isinstance(map_location, torch.device):
+        return map_location
+    return torch.device(map_location)
+
+
+def _interpret_pretrained_flag(value: Optional[Union[str, bool, int]]) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    if text in {"", "pretrained", "true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0", "random", "none"}:
+        return False
+    raise ValueError(f"Unsupported pretrained flag: {value!r}")
+
+
+def _attach_dinov2_normalization(
+    backbone: nn.Module,
+    *,
+    mean: Iterable[float] = DINOV2_IMAGE_MEAN,
+    std: Iterable[float] = DINOV2_IMAGE_STD,
+) -> None:
+    mean_tensor = torch.tensor(tuple(float(m) for m in mean), dtype=torch.float32).view(1, -1, 1, 1)
+    std_tensor = torch.tensor(tuple(float(s) for s in std), dtype=torch.float32).view(1, -1, 1, 1)
+    # Use unique buffer names to avoid interfering with the underlying model state dict.
+    backbone.register_buffer("_pixel_mean", mean_tensor, persistent=False)
+    backbone.register_buffer("_pixel_std", std_tensor, persistent=False)
+    backbone.pixel_mean = mean_tensor  # type: ignore[assignment]
+    backbone.pixel_std = std_tensor  # type: ignore[assignment]
+    backbone.image_normalization = {
+        "mean": tuple(float(m) for m in mean_tensor.flatten().tolist()),
+        "std": tuple(float(s) for s in std_tensor.flatten().tolist()),
+    }
+
+
+def _instantiate_dinov2_architecture(
+    model_name: str,
+    *,
+    map_location: Optional[Union[str, torch.device]] = None,
+    trust_repo: bool = True,
+) -> nn.Module:
+    device = _resolve_map_location(map_location)
+    if tv_get_model is not None:
+        try:
+            model = tv_get_model(model_name, weights=None)
+        except Exception:
+            model = None
+        else:
+            if device is not None:
+                model = model.to(device)
+            return model
+
+    try:
+        model = torch.hub.load(
+            DINOV2_DEFAULT_REPO,
+            model_name,
+            pretrained=False,
+            trust_repo=trust_repo,
+        )
+    except Exception as exc:  # pragma: no cover - defensive.
+        raise RuntimeError(
+            f"Unable to instantiate DINOv2 architecture '{model_name}': {exc}"
+        ) from exc
+
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
+def _load_dinov2_from_hub(
+    repo: str,
+    model_name: str,
+    *,
+    pretrained: bool,
+    map_location: Optional[Union[str, torch.device]],
+    trust_repo: bool,
+) -> nn.Module:
+    try:
+        backbone = torch.hub.load(
+            repo,
+            model_name,
+            pretrained=pretrained,
+            trust_repo=trust_repo,
+        )
+    except Exception as exc:  # pragma: no cover - defensive.
+        raise RuntimeError(
+            f"Unable to load TorchHub model '{repo}:{model_name}': {exc}"
+        ) from exc
+
+    device = _resolve_map_location(map_location)
+    if device is not None:
+        backbone = backbone.to(device)
+    return backbone
 
 
 def load_dinov2_backbone(
@@ -330,6 +489,7 @@ def load_dinov2_backbone(
     """Load a DINOv2 backbone from Torch Hub, HuggingFace or local checkpoints."""
 
     source, parsed = _parse_backbone_spec(spec)
+    device = _resolve_map_location(map_location)
 
     if source == "torchvision":
         if tv_get_model is None or tv_get_model_weights is None:
@@ -345,6 +505,24 @@ def load_dinov2_backbone(
             raise RuntimeError(
                 f"Unable to instantiate torchvision model '{model_name}': {exc}"
             ) from exc
+        if device is not None:
+            backbone = backbone.to(device)
+        _attach_dinov2_normalization(backbone)
+        _apply_freeze(backbone, freeze)
+        return backbone
+
+    if source == "torchhub":
+        repo = parsed.get("repo", DINOV2_DEFAULT_REPO)
+        model_name = parsed["model"]
+        pretrained = _interpret_pretrained_flag(parsed.get("pretrained"))
+        backbone = _load_dinov2_from_hub(
+            repo,
+            model_name,
+            pretrained=pretrained,
+            map_location=device,
+            trust_repo=trust_repo,
+        )
+        _attach_dinov2_normalization(backbone)
         _apply_freeze(backbone, freeze)
         return backbone
 
@@ -357,12 +535,14 @@ def load_dinov2_backbone(
         filename = parsed["filename"]
         model = parsed["model"]
         checkpoint_path = hf_hub_download(repo_id, filename)
-        checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        config = None
-        if model == "slt_vitsmall_patch16":
-            config = _extract_stub_config(checkpoint)
-        backbone = _build_torchvision_model(model, config)
+        checkpoint = torch.load(checkpoint_path, map_location=device or "cpu")
+        backbone = _instantiate_dinov2_architecture(
+            model,
+            map_location=device,
+            trust_repo=trust_repo,
+        )
         _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
+        _attach_dinov2_normalization(backbone)
         _apply_freeze(backbone, freeze)
         return backbone
 
@@ -370,12 +550,14 @@ def load_dinov2_backbone(
         checkpoint_path = Path(parsed["path"]).expanduser().resolve()
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu")
-        config = None
-        if parsed["model"] == "slt_vitsmall_patch16":
-            config = _extract_stub_config(checkpoint)
-        backbone = _build_torchvision_model(parsed["model"], config)
+        checkpoint = torch.load(checkpoint_path, map_location=device or "cpu")
+        backbone = _instantiate_dinov2_architecture(
+            parsed["model"],
+            map_location=device,
+            trust_repo=trust_repo,
+        )
         _load_checkpoint(checkpoint, backbone, convert=_convert_dinov2_state_dict)
+        _attach_dinov2_normalization(backbone)
         _apply_freeze(backbone, freeze)
         return backbone
 
@@ -525,270 +707,3 @@ def _resolve_torchvision_weights(model_name: str, spec: str | None) -> Optional[
     raise ValueError(f"Unknown weight specification '{spec}' for model '{model_name}'")
 
 
-def _build_torchvision_model(model_name: str, config: Optional[dict[str, Any]] = None) -> nn.Module:
-    if model_name == "slt_vitsmall_patch16":
-        vit_config = ViTConfig(**config) if config else None
-        return ViTSmallPatch16(vit_config)
-    if tv_get_model is None:
-        try:
-            return torch.hub.load(
-                "facebookresearch/dinov2", model_name, pretrained=False, trust_repo=True
-            )
-        except Exception as exc:  # pragma: no cover - graceful fallback
-            raise ImportError(
-                "torchvision>=0.16 is required to instantiate DINOv2 models from checkpoints"
-            ) from exc
-    try:
-        return tv_get_model(model_name, weights=None)
-    except Exception as exc:  # pragma: no cover - defensive.
-        raise RuntimeError(
-            f"Unable to instantiate torchvision model '{model_name}' without weights: {exc}"
-        ) from exc
-
-
-@dataclass
-class ViTConfig:
-    """Lightweight configuration container for :class:`ViTSmallPatch16`.
-
-    Attributes
-    ----------
-    image_size:
-        Expected input image resolution (height == width). The model can
-        interpolate positional encodings at inference time for different
-        resolutions, but the initial positional parameters are created using
-        this value.
-    patch_size:
-        Square patch size used by the convolutional patch embedding layer.
-    in_channels:
-        Number of channels in the input image (``3`` for RGB inputs).
-    embed_dim:
-        Size of the token embedding.
-    depth:
-        Number of transformer encoder layers.
-    num_heads:
-        Number of attention heads per layer.
-    mlp_ratio:
-        Expansion factor applied to the feed-forward network hidden size.
-    dropout:
-        Dropout probability applied to token embeddings and feed-forward
-        blocks.
-    attention_dropout:
-        Dropout probability used inside the attention mechanism.
-    stochastic_dropout:
-        Dropout probability applied to residual connections (stochastic depth).
-    """
-
-    image_size: int = 224
-    patch_size: int = 16
-    in_channels: int = 3
-    embed_dim: int = 384
-    depth: int = 12
-    num_heads: int = 6
-    mlp_ratio: float = 4.0
-    dropout: float = 0.0
-    attention_dropout: float = 0.0
-    stochastic_dropout: float = 0.0
-
-
-class PatchEmbed(nn.Module):
-    """Convert an image into a sequence of patch embeddings."""
-
-    def __init__(self, in_channels: int, embed_dim: int, patch_size: int) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        if x.dim() != 4:
-            raise ValueError(
-                "PatchEmbed expects input in BCHW format, received tensor with "
-                f"shape {tuple(x.shape)}"
-            )
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
-        return x
-
-
-class StochasticDepth(nn.Module):
-    """Implement stochastic depth with per-sample masking."""
-
-    def __init__(self, p: float) -> None:
-        super().__init__()
-        self.p = p
-
-    def forward(self, x: Tensor, residual: Tensor) -> Tensor:
-        if not self.training or self.p == 0.0:
-            return x + residual
-        keep_prob = 1.0 - self.p
-        shape = (x.size(0),) + (1,) * (x.dim() - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return residual + x * random_tensor / keep_prob
-
-
-class TransformerEncoderLayer(nn.Module):
-    """A ViT-style encoder layer using ``nn.MultiheadAttention``."""
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        mlp_ratio: float,
-        dropout: float,
-        attention_dropout: float,
-        stochastic_dropout: float,
-    ) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim,
-            num_heads,
-            dropout=attention_dropout,
-            batch_first=True,
-        )
-        self.drop_path = StochasticDepth(stochastic_dropout)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.norm1(x)
-        x, _ = self.attn(x, x, x)
-        x = self.drop_path(x, residual)
-        residual = x
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = self.drop_path(x, residual)
-        return x
-
-
-class ViTSmallPatch16(nn.Module):
-    """A minimal ViT-S/16 backbone compatible with PyTorch.
-
-    The implementation intentionally mirrors the behaviour of the ViT-S/16 model
-    popularised by DINO/DINOv2 while keeping the dependency surface minimal.
-    It exposes a small configuration dataclass to simplify experimentation and
-    provides hooks that make swapping this stub for an actual DINOv2 backbone in
-    production straightforward.
-    """
-
-    def __init__(self, config: Optional[ViTConfig] = None) -> None:
-        super().__init__()
-        self.config = config or ViTConfig()
-        self.patch_embed = PatchEmbed(
-            self.config.in_channels,
-            self.config.embed_dim,
-            self.config.patch_size,
-        )
-        num_patches = (self.config.image_size // self.config.patch_size) ** 2
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.config.embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.config.embed_dim))
-        self.pos_drop = nn.Dropout(self.config.dropout)
-        self.blocks = nn.ModuleList(
-            [
-                TransformerEncoderLayer(
-                    self.config.embed_dim,
-                    self.config.num_heads,
-                    self.config.mlp_ratio,
-                    self.config.dropout,
-                    self.config.attention_dropout,
-                    self.config.stochastic_dropout,
-                )
-                for _ in range(self.config.depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(self.config.embed_dim)
-
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
-
-    def _interpolate_positional_encoding(self, x: Tensor) -> Tensor:
-        n_patches = x.size(1) - 1
-        n_pos_tokens = self.pos_embed.size(1) - 1
-        if n_patches == n_pos_tokens:
-            return self.pos_embed
-
-        class_pos_embed = self.pos_embed[:, 0:1]
-        patch_pos_embed = self.pos_embed[:, 1:]
-        dim = x.size(-1)
-        h = w = int(math.sqrt(n_patches))
-        orig_h = orig_w = int(math.sqrt(n_pos_tokens))
-        if h * w != n_patches:
-            raise ValueError(
-                "The number of patches must form a square grid for positional "
-                f"interpolation, received {n_patches} patches."
-            )
-        patch_pos_embed = patch_pos_embed.reshape(1, orig_h, orig_w, dim).permute(0, 3, 1, 2)
-        patch_pos_embed = torch.nn.functional.interpolate(
-            patch_pos_embed,
-            size=(h, w),
-            mode="bicubic",
-            align_corners=False,
-        )
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).reshape(1, h * w, dim)
-        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
-
-    def forward_features(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        pos_embed = self._interpolate_positional_encoding(x)
-        x = x + pos_embed[:, : x.size(1)]
-        x = self.pos_drop(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        return x[:, 0], x[:, 1:]
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Return the class token embedding for convenience."""
-        cls_token, _ = self.forward_features(x)
-        return cls_token
-
-    def forward_with_patches(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Return both the pooled class token and patch embeddings."""
-        return self.forward_features(x)
-
-    # ---------------------------------------------------------------------
-    # Extension hooks
-    # ---------------------------------------------------------------------
-    def load_pretrained_weights(self, state_dict: dict[str, Tensor]) -> None:
-        """Load weights trained elsewhere.
-
-        The method is intentionally lightweight so that production code can
-        replace it with custom DINOv2 checkpoint loading logic.
-        """
-
-        self.load_state_dict(state_dict, strict=False)
-
-    def as_backbone(self) -> "ViTSmallPatch16":
-        """Return the module itself.
-
-        This hook mirrors the API provided by DINOv2 models, making it trivial
-        to swap the stub implementation with ``dinov2.vits14`` or similar
-        architectures when running in production.
-        """
-
-        return self

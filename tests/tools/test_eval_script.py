@@ -107,6 +107,16 @@ def test_eval_script_generates_stub_csv(
         decoder_dropout=0.0,
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir))
+    class DummyEncoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+
+        def forward(self, face, hand_l, hand_r, pose, *, pad_mask=None, miss_mask_hl=None, miss_mask_hr=None):
+            batch, time = face.shape[:2]
+            return torch.zeros(batch, time, config.d_model, device=face.device)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(module, "MultiStreamEncoder", lambda *args, **kwargs: DummyEncoder())
     model = module.MultiStreamClassifier(config, tokenizer)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
@@ -174,7 +184,10 @@ def test_eval_script_generates_stub_csv(
         reader = csv.reader(fh)
         rows = list(reader)
 
-    assert rows[0] == ["video_id", "prediction", "reference"]
+    assert rows[0] == ["video_id", "prediction", "reference", "latency_ms"]
     assert len(rows) == 2
     assert rows[1][0] == "vid001"
     assert isinstance(rows[1][1], str)
+    assert rows[1][2] == "hola mundo"
+    assert float(rows[1][3]) >= 0.0
+    patch.undo()

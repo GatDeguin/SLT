@@ -35,7 +35,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
-from slt.models.backbones import ViTConfig, ViTSmallPatch16
+from slt.models.backbones import ViTConfig, load_dinov2_backbone
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -366,14 +366,20 @@ class IBOTLoss(nn.Module):
 @dataclass
 class BackboneConfig:
     image_size: int = 224
-    patch_size: int = 16
+    patch_size: int = 14
     embed_dim: int = 384
     depth: int = 12
     num_heads: int = 6
     mlp_ratio: float = 4.0
+    model_name: str = ViTConfig().model_name
+    repo: str = ViTConfig().repo
+    pretrained: bool = True
 
     def to_vit_config(self) -> ViTConfig:
         return ViTConfig(
+            model_name=self.model_name,
+            repo=self.repo,
+            pretrained=self.pretrained,
             image_size=self.image_size,
             patch_size=self.patch_size,
             embed_dim=self.embed_dim,
@@ -395,8 +401,9 @@ class CheckpointState:
     metadata: dict[str, object]
 
 
-def build_vit_backbone(config: BackboneConfig) -> ViTSmallPatch16:
-    return ViTSmallPatch16(config.to_vit_config())
+def build_vit_backbone(config: BackboneConfig) -> nn.Module:
+    vit_config = config.to_vit_config()
+    return load_dinov2_backbone(vit_config.to_spec(), map_location="cpu")
 
 
 def cosine_scheduler(base_lr: float, warmup_steps: int, total_steps: int) -> Iterator[float]:

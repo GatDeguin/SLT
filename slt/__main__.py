@@ -14,7 +14,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
-from .data import LsaTMultiStream
+from .data import LsaTMultiStream, collate_fn
 from .training.configuration import resolve_configs
 from .training.data import create_dataloader, normalise_mix_spec
 from .training.models import MultiStreamClassifier
@@ -22,6 +22,46 @@ from .training.optim import create_optimizer
 from .training.loops import eval_epoch, train_epoch
 from .utils.general import set_seed
 from .utils.text import create_tokenizer
+
+_DemoModel = MultiStreamClassifier
+
+
+def _build_collate(tokenizer, *, max_length: int):
+    """Return a collate function that tokenizes targets using ``tokenizer``."""
+
+    def collate(batch):
+        collated = collate_fn(batch)
+        inputs = {
+            "face": collated["face"],
+            "hand_left": collated["hand_l"],
+            "hand_right": collated["hand_r"],
+            "pose": collated["pose"],
+            "pose_conf_mask": collated["pose_conf_mask"],
+            "pad_mask": collated["pad_mask"],
+            "encoder_attention_mask": collated["pad_mask"].to(torch.long),
+            "lengths": collated["lengths"],
+            "miss_mask_hl": collated.get("miss_mask_hl"),
+            "miss_mask_hr": collated.get("miss_mask_hr"),
+        }
+        tokenized = tokenizer(
+            collated["texts"],
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        targets = {
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+        }
+        return {
+            "inputs": inputs,
+            "targets": targets,
+            "texts": collated["texts"],
+            "video_ids": collated["video_ids"],
+        }
+
+    return collate
 
 
 def _select_device(device_flag: str) -> torch.device:
@@ -177,7 +217,8 @@ def _parse_mix_streams(raw: list[str]) -> Dict[str, float]:
 
 def main() -> None:
     args = parse_args()
-    mix_streams = _parse_mix_streams(args.mix_streams) if args.mix_streams else None
+    mix_streams_arg = getattr(args, "mix_streams", None)
+    mix_streams = _parse_mix_streams(mix_streams_arg) if mix_streams_arg else None
 
     base_defaults = {
         "data": {
@@ -201,9 +242,9 @@ def main() -> None:
     cli_overrides = _build_cli_overrides(args, mix_streams)
 
     data_config, model_config, optim_config, training_config, _ = resolve_configs(
-        config_path=args.config,
+        config_path=getattr(args, "config", None),
         cli_overrides=cli_overrides,
-        set_overrides=args.overrides,
+        set_overrides=getattr(args, "overrides", []),
         base=base_defaults,
     )
 
@@ -220,7 +261,7 @@ def main() -> None:
         precision_flag == "amp"
         and device.type == "cuda"
         and torch.cuda.is_available()
-        and not args.no_amp
+        and not getattr(args, "no_amp", False)
     )
     if device.type.startswith("cuda") and not torch.cuda.is_available():  # pragma: no cover - depende del entorno
         device = torch.device("cpu")
@@ -271,7 +312,7 @@ def main() -> None:
         max_length=data_config.max_target_length,
     )
 
-    model = MultiStreamClassifier(model_config, tokenizer).to(device)
+    model = _DemoModel(model_config, tokenizer).to(device)
 
     optim_cfg = {
         "type": optim_config.optimizer,

@@ -20,11 +20,12 @@ python tools/pretrain_dino_face.py \
 ```
 
 Cambia `--train-dir` por `data/single_signer/processed/hand_l` o
-`hand_r` para entrenar proyectores específicos de manos. El stub utiliza
-`ViTSmallPatch16`, configurable mediante banderas como `--image-size`,
-`--patch-size`, `--vit-depth` o `--vit-embed-dim`. El script admite *warmup* de
-`learning rate`, programaciones cosenoidales, actualización EMA del maestro,
-*gradient clipping* y máscaras de parches para iBOT.
+`hand_r` para entrenar proyectores específicos de manos. El backbone por
+defecto replica la arquitectura `DINOv2-S/14` y mantiene compatibilidad con
+banderas como `--image-size`, `--patch-size`, `--vit-depth` o
+`--vit-embed-dim`. El script admite *warmup* de `learning rate`,
+programaciones cosenoidales, actualización EMA del maestro, *gradient
+clipping* y máscaras de parches para iBOT.
 
 ### Configuración declarativa
 
@@ -79,7 +80,7 @@ python tools/train_slt_multistream_v9.py \
   --metadata-csv meta.csv \
   --train-index data/single_signer/index/train.csv \
   --val-index data/single_signer/index/val.csv \
-  --model.backbones.face file::work_dirs/dino_face/backbone.pt:slt_vitsmall_patch16
+  --model.backbones.face file::work_dirs/dino_face/backbone.pt:dinov2_vits14
 ```
 
 Tras el entrenamiento, evalúa y exporta el encoder siguiendo las instrucciones
