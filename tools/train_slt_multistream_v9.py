@@ -581,6 +581,7 @@ def main() -> None:
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
         mix_streams=train_mix,
+        seed=data_config.seed,
     )
     val_loader = create_dataloader(
         val_dataset,
@@ -591,6 +592,7 @@ def main() -> None:
         tokenizer=tokenizer,
         max_length=data_config.max_target_length,
         mix_streams=None,
+        seed=data_config.seed,
     )
 
     model = MultiStreamClassifier(model_config, tokenizer).to(device)
