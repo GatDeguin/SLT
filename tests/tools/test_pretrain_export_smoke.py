@@ -11,14 +11,35 @@ from tools.pretrain_utils import BackboneConfig, build_vit_backbone, export_for_
 
 
 def test_exported_backbone_loads_with_stub(tmp_path: Path) -> None:
-    config = BackboneConfig(image_size=32, patch_size=8, embed_dim=64, depth=4, num_heads=4, mlp_ratio=2.0)
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_dim = 384
+            self.linear = torch.nn.Linear(10, self.embed_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.linear(x)
+
+    config = BackboneConfig()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "tools.pretrain_utils.load_dinov2_backbone", lambda *args, **kwargs: DummyBackbone()
+    )
     backbone = build_vit_backbone(config)
+    monkeypatch.undo()
     export_path = tmp_path / "backbone.pt"
 
     metadata = {"backbone": asdict(config), "note": "test"}
     export_for_dinov2(export_path, backbone=backbone, metadata=metadata)
 
-    reloaded = load_dinov2_backbone(f"file::{export_path}:slt_vitsmall_patch16", map_location="cpu")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "slt.models.backbones._instantiate_dinov2_architecture",
+        lambda *args, **kwargs: DummyBackbone(),
+    )
+    reloaded = load_dinov2_backbone(f"file::{export_path}:dinov2_vits14", map_location="cpu")
+    monkeypatch.undo()
 
     assert set(backbone.state_dict().keys()) == set(reloaded.state_dict().keys())
     for key, value in backbone.state_dict().items():

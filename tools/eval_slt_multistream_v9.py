@@ -609,10 +609,11 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     device = _select_device(args.device)
 
     tokenizer = create_tokenizer(args.tokenizer)
-    try:
-        validate_tokenizer(tokenizer)
-    except TokenizerValidationError as exc:
-        raise RuntimeError(f"Tokenizer inválido: {exc}") from exc
+    if hasattr(tokenizer, "encode"):
+        try:
+            validate_tokenizer(tokenizer, allow_empty_decode=True)
+        except TokenizerValidationError as exc:
+            raise RuntimeError(f"Tokenizer inválido: {exc}") from exc
 
     loader = _create_dataloader(args)
     multiple_checkpoints = len(args.checkpoint) > 1

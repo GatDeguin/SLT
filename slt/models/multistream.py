@@ -10,7 +10,7 @@ from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional
 import torch
 from torch import Tensor
 
-from .backbones import BackboneSpec, ViTConfig, ViTSmallPatch16, load_backbone
+from .backbones import BackboneSpec, ViTConfig, load_backbone
 from .modules import FuseConcatLinear, PositionalEncodingLearned, StreamProjector
 from .temporal import TemporalEncoder
 
@@ -23,7 +23,7 @@ class MultiStreamEncoder(torch.nn.Module):
     def __init__(
         self,
         *,
-        backbone_config: Optional[ViTConfig] = None,
+        backbone_config: Optional[Union[ViTConfig, BackboneSpec]] = None,
         projector_dim: int = 256,
         d_model: int = 512,
         pose_dim: int = 39,
@@ -426,14 +426,21 @@ class MultiStreamEncoder(torch.nn.Module):
     def _register_initial_backbones(
         self,
         backbones: Mapping[str, BackboneSpec],
-        config: Optional[ViTConfig],
+        config: Optional[Union[ViTConfig, BackboneSpec]],
     ) -> None:
         for stream, attr in self._stream_to_attr.items():
             candidate: BackboneSpec
             if stream in backbones:
                 candidate = backbones[stream]
             else:
-                candidate = ViTSmallPatch16(config)
+                if isinstance(config, ViTConfig):
+                    candidate = config.to_spec()
+                elif isinstance(config, Mapping):
+                    candidate = dict(config)
+                elif config is not None:
+                    candidate = config
+                else:
+                    candidate = ViTConfig().to_spec()
             self.register_backbone(stream, "default", candidate)
             self.activate_backbone(stream, "default")
         # Ensure bookkeeping emits signals for initial selection

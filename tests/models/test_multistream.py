@@ -9,26 +9,35 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from slt.models.backbones import ViTConfig, load_dinov2_backbone
+from slt.models.backbones import load_dinov2_backbone
 from slt.models.multistream import MultiStreamEncoder
 
 
-def _tiny_vit_config() -> ViTConfig:
-    return ViTConfig(
-        image_size=16,
-        patch_size=8,
-        in_channels=3,
-        embed_dim=32,
-        depth=1,
-        num_heads=4,
-        mlp_ratio=2.0,
-    )
+IMAGE_SIZE = 32
+
+
+class ConstantBackbone(torch.nn.Module):
+    def __init__(self, value: float = 0.0, embed_dim: int = 384) -> None:
+        super().__init__()
+        self.value = value
+        self.embed_dim = embed_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.size(0)
+        return torch.full((batch, self.embed_dim), self.value, device=x.device, dtype=x.dtype)
+
+
+def _make_encoder(**kwargs) -> MultiStreamEncoder:
+    backbones = {
+        "face": ConstantBackbone(),
+        "hand_left": ConstantBackbone(),
+        "hand_right": ConstantBackbone(),
+    }
+    return MultiStreamEncoder(backbones=backbones, **kwargs)
 
 
 def test_forward_pass_returns_temporal_sequence() -> None:
-    config = _tiny_vit_config()
-    model = MultiStreamEncoder(
-        backbone_config=config,
+    model = _make_encoder(
         projector_dim=16,
         d_model=32,
         pose_dim=39,
@@ -37,7 +46,7 @@ def test_forward_pass_returns_temporal_sequence() -> None:
     )
 
     batch, time = 2, 4
-    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand_l = torch.randn_like(face)
     hand_r = torch.randn_like(face)
     pose = torch.randn(batch, time, 39)
@@ -80,18 +89,21 @@ def test_missing_hand_masks_trigger_hook() -> None:
             self.calls.append((stream, mask.clone()))
             return features
 
-    config = _tiny_vit_config()
     model = RecordingEncoder(
-        backbone_config=config,
         projector_dim=8,
         d_model=16,
         pose_dim=39,
         positional_num_positions=16,
         temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+        backbones={
+            "face": ConstantBackbone(),
+            "hand_left": ConstantBackbone(),
+            "hand_right": ConstantBackbone(),
+        },
     )
 
     batch, time = 1, 2
-    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand_l = torch.randn_like(face)
     hand_r = torch.randn_like(face)
     pose = torch.randn(batch, time, 39)
@@ -117,9 +129,7 @@ def test_missing_hand_masks_trigger_hook() -> None:
 
 
 def test_missing_hand_frames_affect_only_masked_positions() -> None:
-    config = _tiny_vit_config()
-    model = MultiStreamEncoder(
-        backbone_config=config,
+    model = _make_encoder(
         projector_dim=8,
         d_model=16,
         pose_dim=39,
@@ -216,37 +226,33 @@ def test_missing_hand_frames_affect_only_masked_positions() -> None:
 
 
 def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
-    config = _tiny_vit_config()
-
     class DummyBackbone(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.embed_dim = 32
-            self.proj = torch.nn.Linear(3 * config.image_size * config.image_size, self.embed_dim)
+            self.embed_dim = 384
+            self.linear = torch.nn.Linear(3 * IMAGE_SIZE * IMAGE_SIZE, self.embed_dim)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             if x.dim() != 4:
                 raise AssertionError("Backbone inputs must be BCHW tensors")
-            batch = x.size(0)
-            flat = x.view(batch, -1)
-            return self.proj(flat)
+            flat = x.view(x.size(0), -1)
+            return self.linear(flat)
 
     reference = DummyBackbone()
     checkpoint_path = tmp_path / "dummy.pt"
-    torch.save(reference.state_dict(), checkpoint_path)
+    torch.save({"model": reference.state_dict()}, checkpoint_path)
 
     calls = []
 
-    def fake_torchhub_load(repo, model, pretrained=True, trust_repo=True):
-        calls.append((repo, model, pretrained))
-        module = DummyBackbone()
-        if pretrained:
-            module.load_state_dict(reference.state_dict())
-        return module
+    def fake_instantiate(model_name, *, map_location=None, trust_repo=True):
+        calls.append((model_name, map_location))
+        return DummyBackbone()
 
-    monkeypatch.setattr(torch.hub, "load", fake_torchhub_load)
+    monkeypatch.setattr(
+        "slt.models.backbones._instantiate_dinov2_architecture", fake_instantiate
+    )
 
-    spec = f"file::{checkpoint_path}:dummy"
+    spec = f"file::{checkpoint_path}:dinov2_vits14"
     backbones = {
         "face": load_dinov2_backbone(spec),
         "hand_left": load_dinov2_backbone(spec),
@@ -254,7 +260,6 @@ def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
     }
 
     encoder = MultiStreamEncoder(
-        backbone_config=config,
         projector_dim=16,
         d_model=32,
         pose_dim=39,
@@ -264,7 +269,7 @@ def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
     )
 
     batch, time = 2, 3
-    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand_l = torch.randn_like(face)
     hand_r = torch.randn_like(face)
     pose = torch.randn(batch, time, 39)
@@ -279,20 +284,7 @@ def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
 
 
 def test_register_and_switch_backbones() -> None:
-    config = _tiny_vit_config()
-
-    class ConstantBackbone(torch.nn.Module):
-        def __init__(self, value: float) -> None:
-            super().__init__()
-            self.value = value
-            self.embed_dim = config.embed_dim
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            batch = x.size(0)
-            return torch.full((batch, self.embed_dim), self.value, device=x.device)
-
-    encoder = MultiStreamEncoder(
-        backbone_config=config,
+    encoder = _make_encoder(
         projector_dim=8,
         d_model=16,
         pose_dim=39,
@@ -307,7 +299,7 @@ def test_register_and_switch_backbones() -> None:
     assert "const" in encoder.available_backbones("face")["face"]
 
     batch, time = 1, 2
-    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand = torch.randn_like(face)
     pose = torch.randn(batch, time, 39)
 
@@ -316,9 +308,7 @@ def test_register_and_switch_backbones() -> None:
 
 
 def test_hand_masks_emitted_and_tracked() -> None:
-    config = _tiny_vit_config()
-    encoder = MultiStreamEncoder(
-        backbone_config=config,
+    encoder = _make_encoder(
         projector_dim=8,
         d_model=16,
         pose_dim=39,
@@ -336,7 +326,7 @@ def test_hand_masks_emitted_and_tracked() -> None:
     encoder.register_observer("hand.mask", hook)
 
     batch, time = 1, 3
-    face = torch.randn(batch, time, 3, config.image_size, config.image_size)
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand_l = torch.randn_like(face)
     hand_r = torch.randn_like(face)
     pose = torch.randn(batch, time, 39)

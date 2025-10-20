@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -58,11 +59,45 @@ def test_dino_pretraining_and_multistream_integration(tmp_path: Path) -> None:
         "--export-backbone",
         str(export_path),
     ]
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self, embed_dim: int) -> None:
+            super().__init__()
+            self.embed_dim = embed_dim
+            self.linear = torch.nn.Linear(3 * 64 * 64, embed_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            flat = x.view(x.size(0), -1)
+            return self.linear(flat)
+
+        def forward_with_patches(self, x: torch.Tensor):
+            cls = self.forward(x)
+            patches = torch.zeros(x.size(0), 1, self.embed_dim, device=x.device, dtype=x.dtype)
+            return cls, patches
+
+    patches = pytest.MonkeyPatch()
+    patches.setattr(
+        "tools.pretrain_utils.build_vit_backbone",
+        lambda cfg: DummyBackbone(cfg.embed_dim),
+    )
+    patches.setattr(
+        "tools._pretrain_dino.build_vit_backbone",
+        lambda cfg: DummyBackbone(cfg.embed_dim),
+    )
+    patches.setattr(
+        "slt.models.backbones._instantiate_dinov2_architecture",
+        lambda *args, **kwargs: DummyBackbone(64),
+    )
     run_pretraining(argv, default_stream="face")
+    patches.undo()
 
     assert export_path.exists()
 
-    spec = f"file::{export_path}:slt_vitsmall_patch16"
+    spec = f"file::{export_path}:dinov2_vits14"
+    reload_patch = pytest.MonkeyPatch()
+    reload_patch.setattr(
+        "slt.models.backbones._instantiate_dinov2_architecture",
+        lambda *args, **kwargs: DummyBackbone(64),
+    )
     face_backbone = load_dinov2_backbone(spec)
     hand_backbone = load_dinov2_backbone(spec)
     encoder = MultiStreamEncoder(
@@ -72,6 +107,7 @@ def test_dino_pretraining_and_multistream_integration(tmp_path: Path) -> None:
             "hand_right": load_dinov2_backbone(spec),
         }
     )
+    reload_patch.undo()
 
     batch, time = 1, 2
     face = torch.randn(batch, time, 3, 64, 64)

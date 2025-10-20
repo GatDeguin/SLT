@@ -136,8 +136,16 @@ def test_run_generates_predictions_and_metrics(tmp_path, monkeypatch):
     assert output_csv.exists()
     with output_csv.open() as csv_file:
         rows = list(csv.reader(csv_file))
-    assert rows[0] == ["video_id", "prediction", "reference"]
-    assert rows[1:] == [["vid1", "hola mundo", "hola mundo"], ["vid2", "adios mundo", "adios mundo"]]
+    assert rows[0] == ["video_id", "prediction", "reference", "latency_ms"]
+    assert len(rows) == 3
+    assert rows[1][0] == "vid1"
+    assert rows[1][1] == "hola mundo"
+    assert rows[1][2] == "hola mundo"
+    assert float(rows[1][3]) >= 0.0
+    assert rows[2][0] == "vid2"
+    assert rows[2][1] == "adios mundo"
+    assert rows[2][2] == "adios mundo"
+    assert float(rows[2][3]) >= 0.0
 
     report_json = output_csv.parent / "report.json"
     report_csv = output_csv.parent / "report.csv"
@@ -145,20 +153,30 @@ def test_run_generates_predictions_and_metrics(tmp_path, monkeypatch):
     assert report_csv.exists()
 
     data = json.loads(report_json.read_text(encoding="utf-8"))
+    assert "aggregate" in data
+    assert "checkpoints" in data
+    assert len(data["checkpoints"]) == 1
+    metrics = data["checkpoints"][0]["metrics"]
     if eval_module.BLEU is None or eval_module.CHRF is None:
-        assert data["metrics"]["bleu"] == pytest.approx(0.0)
-        assert data["metrics"]["chrf"] == pytest.approx(0.0)
+        assert metrics["bleu"] == pytest.approx(0.0)
+        assert metrics["chrf"] == pytest.approx(0.0)
     else:
-        assert data["metrics"]["bleu"] == pytest.approx(100.0)
-        assert data["metrics"]["chrf"] == pytest.approx(100.0)
-    assert data["metrics"]["cer"] == pytest.approx(0.0)
-    assert len(data["examples"]) == 2
-    assert data["examples"][0]["prediction"] == "hola mundo"
+        assert metrics["bleu"] == pytest.approx(100.0)
+        assert metrics["chrf"] == pytest.approx(100.0)
+    assert metrics["cer"] == pytest.approx(0.0)
+    examples = data["checkpoints"][0]["examples"]
+    assert len(examples) == 2
+    assert examples[0]["prediction"] == "hola mundo"
+    assert examples[1]["prediction"] == "adios mundo"
+    for example in examples:
+        assert float(example["latency_ms"]) >= 0.0
 
     with report_csv.open() as csv_file:
         reader = list(csv.reader(csv_file))
-    assert reader[0] == ["type", "name", "value", "reference"]
+    assert reader[0] == ["type", "checkpoint", "name", "value", "reference"]
     metric_rows = [row for row in reader[1:] if row[0] == "metric"]
     example_rows = [row for row in reader[1:] if row[0] == "example"]
-    assert {row[1] for row in metric_rows} == {"bleu", "chrf", "cer"}
-    assert any(row[1] == "vid1" and row[2] == "hola mundo" for row in example_rows)
+    metric_names = {row[2] for row in metric_rows}
+    assert {"bleu", "chrf", "cer"}.issubset(metric_names)
+    assert any(row[2] == "vid1" and row[3] == "hola mundo" for row in example_rows)
+    assert any(row[2] == "vid2" and row[3] == "adios mundo" for row in example_rows)
