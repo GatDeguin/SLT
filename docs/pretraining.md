@@ -1,43 +1,40 @@
-# Preentrenamiento DINO/iBOT
+# Preentrenamiento de backbones con DINO/iBOT
 
 Los scripts `tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py`
-permiten ejecutar experimentos de auto-supervisión ligeros sobre los recortes de
-rostro y manos obtenidos en `data/single_signer/processed/`. Ambos comparten la
-misma implementación y aceptan configuraciones declarativas en JSON o TOML para
-reproducir los experimentos.
+permiten entrenar pesos auto-supervisados sobre los recortes generados en
+`data/single_signer/processed/`. Ambos comparten la misma interfaz y producen
+backbones compatibles con `load_dinov2_backbone`.
 
-## Ejemplo rápido
+## Flujo recomendado
 
-```bash
-python tools/pretrain_dino_face.py \
-  --train-dir data/single_signer/processed/face \
-  --output-dir work_dirs/dino_face \
-  --epochs 100 \
-  --batch-size 64 \
-  --learning-rate 1e-3 \
-  --algorithm dino \
-  --export-backbone work_dirs/dino_face/backbone.pt
-```
+1. Ejecuta `tools/extract_rois_v2.py` y verifica la estructura documentada en el
+   contrato de datos.
+2. Selecciona el stream a preentrenar (`face`, `hand_l` o `hand_r`).
+3. Lanza el entrenamiento con los parámetros deseados. Ejemplo básico:
+   ```bash
+   python tools/pretrain_dino_face.py \
+     --train-dir data/single_signer/processed/face \
+     --output-dir work_dirs/dino_face \
+     --epochs 100 \
+     --batch-size 64 \
+     --learning-rate 1e-3 \
+     --algorithm dino \
+     --export-backbone work_dirs/dino_face/backbone.pt
+   ```
+4. Repite el proceso para manos con `tools/pretrain_dino_hands.py` ajustando
+   `--train-dir` a `hand_l` o `hand_r`.
+5. Carga los backbones exportados desde `tools/train_slt_multistream_v9.py`
+   mediante `--face-backbone`, `--hand-left-backbone` o `--hand-right-backbone`.
 
-Cambia `--train-dir` por `data/single_signer/processed/hand_l` o
-`hand_r` para entrenar proyectores específicos de manos. El backbone por
-defecto replica la arquitectura `DINOv2-S/14` y mantiene compatibilidad con
-banderas como `--image-size`, `--patch-size`, `--vit-depth` o
-`--vit-embed-dim`. El script admite *warmup* de `learning rate`,
-programaciones cosenoidales, actualización EMA del maestro, *gradient
-clipping* y máscaras de parches para iBOT.
+## Configuración declarativa
 
-### Configuración declarativa
-
-Los parámetros de dataset, augmentations, checkpoints y metadatos pueden
-centralizarse en un archivo TOML/JSON mediante la bandera `--config`. El
-siguiente ejemplo reutiliza los recortes generados en el flujo `single_signer`:
+Ambos scripts aceptan archivos TOML/JSON vía `--config`. Ejemplo en TOML:
 
 ```toml
 train_dir = ["data/single_signer/processed/face"]
 output_dir = "work_dirs/dino_face"
-epochs = 50
 algorithm = "ibot"
+epochs = 50
 
 [dataset]
 batch_size = 48
@@ -52,77 +49,47 @@ mean = [0.481, 0.457, 0.408]
 std = [0.268, 0.261, 0.276]
 
 [checkpointing]
-best_name = "best.pt"
-last_name = "last.pt"
-history_file = "training_metrics.jsonl"
+last_name = "checkpoint_last.pt"
+best_name = "checkpoint_best.pt"
+history_file = "metrics.jsonl"
 
 [experiment]
 name = "face-ibot-baseline"
-tags = ["face", "ibot", "baseline"]
-notes = "Entrenamiento inicial con augmentations más agresivos."
+tags = ["face", "ibot"]
+notes = "Primer experimento con augmentations agresivos."
 ```
 
-El archivo actúa como valores por defecto; cualquier argumento de línea de
-comandos lo sobrescribe. Las banderas `--dataset-pin-memory`,
-`--dataset-persistent-workers`, `--aug-*` y `--checkpoint-*` permiten ajustar los
-componentes sin editar código.
+Los parámetros definidos en el archivo actúan como defaults y pueden
+sobrescribirse desde la CLI.
 
-## Exportación e integración
+## Artefactos generados
 
-Cuando se especifica `--export-backbone`, se escribe un archivo compatible con
-`load_dinov2_backbone`. Para cargar los pesos en el encoder multi-stream, apunta
-al archivo exportado desde la configuración de entrenamiento:
+- `params.json`: resumen de hiperparámetros y rutas utilizadas.
+- `metrics.jsonl`: historial de pérdidas y métricas por iteración/época.
+- `artifacts.json`: registro de checkpoints y pesos exportados.
+- `checkpoint_last.pt` y `checkpoint_best.pt`: incluyen modelo, optimizador y
+  estado EMA (si aplica), listos para reanudar con `--resume`.
+
+## Integración con el pipeline principal
+
+Para reutilizar los pesos en el entrenamiento multi-stream:
 
 ```bash
 python tools/train_slt_multistream_v9.py \
-  --config configs/single_signer.yaml \
-  --face-dir data/single_signer/processed/face \
-  --metadata-csv meta.csv \
-  --train-index data/single_signer/index/train.csv \
-  --val-index data/single_signer/index/val.csv \
-  --model.backbones.face file::work_dirs/dino_face/backbone.pt:dinov2_vits14
+  --config configs/single_signer.yml \
+  --set model.face_backbone "file::work_dirs/dino_face/backbone.pt:dinov2_vits14" \
+  --set model.freeze_face_backbone true
 ```
 
-Tras el entrenamiento, evalúa y exporta el encoder siguiendo las instrucciones
-actualizadas en `docs/train_slt_multistream_v9.md`. Este flujo permite validar
-que el backbone preentrenado se integra correctamente en los experimentos
-multi-stream.
+El prefijo `file::` indica que se cargará un checkpoint local. Es posible
+combinarlo con backbones distintos para cada mano.
 
-## Reanudar y checkpoints
+## Buenas prácticas
 
-Cada época genera `checkpoint_last.pt` y se mantiene automáticamente el mejor
-checkpoint (`checkpoint_best.pt`). Ambos incluyen el estado del optimizador, el
-*global step*, los proyectores y los pesos del maestro, lo que facilita la
-reanudación con `--resume`. Los nombres y la ruta del historial (`metrics.jsonl`)
-pueden personalizarse con `--checkpoint-last-name`, `--checkpoint-best-name` y
-`--checkpoint-history-file` o a través del archivo de configuración.
-
-## Conjuntos de datos
-
-Los datasets de entrenamiento se esperan como carpetas con imágenes sueltas
-(PNG, JPG, JPEG, BMP, TIFF). Las utilidades de `tools/pretrain_utils.py`
-proporcionan el `DataLoader` y las transformaciones multi-crop necesarias para
-DINO/iBOT sin depender de `torchvision`.
-
-## Seguimiento de experimentos
-
-La carpeta de `output_dir` mantiene tres artefactos clave:
-
-- `params.json`: parámetros del experimento (modelo, augmentations, dataset,
-  rutas utilizadas y metadatos declarados).
-- `metrics.jsonl`: historial en formato JSONL con las pérdidas por iteración,
-  época y los eventos de *best model*.
-- `artifacts.json`: registro de checkpoints y pesos exportados con su ruta y
-  metadatos asociados.
-
-Estos archivos permiten reproducir y auditar cada corrida sin depender de
-servicios externos.
-
-## Mejores prácticas
-
-- Versiona los archivos de configuración junto con los pesos exportados.
-- Documenta cambios relevantes en `params.json` usando `--experiment-notes`.
-- Reutiliza `--experiment-tag` para etiquetar variantes (por ejemplo `face`,
-  `hands`, `ibot`).
-- Al usar múltiples workers, activa `--dataset-persistent-workers` para reducir
-  el overhead de creación de procesos.
+- Versiona los archivos de configuración junto a los pesos exportados.
+- Documenta notas del experimento con `--experiment-notes` y etiquetas usando
+  `--experiment-tag`.
+- Activa `--dataset-persistent-workers` en sistemas con múltiples núcleos para
+  reducir la sobrecarga de `DataLoader`.
+- Ajusta `--algorithm` (`dino` o `ibot`) y sus hiperparámetros asociados según el
+  objetivo del preentrenamiento.
