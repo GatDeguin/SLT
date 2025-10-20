@@ -24,17 +24,21 @@ from tools.demo_realtime_multistream import (
     build_tokenizer,
     decode_sequences,
     draw_overlays,
+    validate_model_arguments,
 )
 
 
 def run_offline(args: argparse.Namespace) -> None:
     if mp is None:
         raise RuntimeError(
-            "MediaPipe no está disponible. Instala el paquete 'mediapipe' para ejecutar la prueba offline."
+            "MediaPipe no está disponible. Instala el paquete 'mediapipe' "
+            "para ejecutar la prueba offline."
         )
     video_path = Path(args.video)
     if not video_path.exists():
         raise FileNotFoundError(f"No se encontró el video: {video_path}")
+
+    validate_model_arguments(args.model, args.model_format)
 
     config = DemoConfig(
         sequence_length=args.sequence_length,
@@ -83,7 +87,11 @@ def run_offline(args: argparse.Namespace) -> None:
     if args.display:
         cv2.namedWindow("Offline SLT", cv2.WINDOW_NORMAL)
 
-    face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
+    face_mesh = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+    )
     hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2)
     pose = mp.solutions.pose.Pose(static_image_mode=False, model_complexity=1)
 
@@ -112,7 +120,14 @@ def run_offline(args: argparse.Namespace) -> None:
                 hands_result = hands.process(rgb)
                 pose_result = pose.process(rgb)
 
-                face_tensor, hand_l_tensor, hand_r_tensor, pose_tensor, detections, boxes = processor.process(
+                (
+                    face_tensor,
+                    hand_l_tensor,
+                    hand_r_tensor,
+                    pose_tensor,
+                    detections,
+                    boxes,
+                ) = processor.process(
                     frame,
                     face_result=face_result,
                     hands_result=hands_result,
@@ -159,10 +174,28 @@ def run_offline(args: argparse.Namespace) -> None:
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", type=Path, help="Ruta al video MP4/MKV a procesar")
-    parser.add_argument("--output", type=Path, default=None, help="Ruta para guardar un video con overlay")
-    parser.add_argument("--display", action="store_true", help="Muestra el resultado en una ventana de OpenCV")
-    parser.add_argument("--wait-ms", type=int, default=1, help="Retardo en ms para cv2.waitKey cuando --display está activo")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Ruta para guardar un video con overlay",
+    )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Muestra el resultado en una ventana de OpenCV",
+    )
+    parser.add_argument(
+        "--wait-ms",
+        type=int,
+        default=1,
+        help="Retardo en ms para cv2.waitKey cuando --display está activo",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
     parser.add_argument(
         "--sequence-length",
         type=int,
@@ -175,9 +208,24 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=13,
         help="Cantidad de landmarks de pose a considerar (MediaPipe Holistic)",
     )
-    parser.add_argument("--bbox-scale", type=float, default=1.2, help="Factor de expansión del bounding box")
-    parser.add_argument("--smoothing", type=float, default=0.4, help="Factor de suavizado para el tracking de ROI")
-    parser.add_argument("--max-misses", type=int, default=5, help="Frames sin detección antes de reiniciar la ROI")
+    parser.add_argument(
+        "--bbox-scale",
+        type=float,
+        default=1.2,
+        help="Factor de expansión del bounding box",
+    )
+    parser.add_argument(
+        "--smoothing",
+        type=float,
+        default=0.4,
+        help="Factor de suavizado para el tracking de ROI",
+    )
+    parser.add_argument(
+        "--max-misses",
+        type=int,
+        default=5,
+        help="Frames sin detección antes de reiniciar la ROI",
+    )
 
     add_model_cli_arguments(parser)
     return parser.parse_args(argv)

@@ -20,7 +20,12 @@ except Exception:  # pragma: no cover - MediaPipe es opcional
 
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
 from slt.runtime import FrameDetections, HolisticFrameProcessor, TemporalBuffer
-from slt.utils.text import create_tokenizer, decode
+from slt.utils.text import (
+    TokenizerValidationError,
+    create_tokenizer,
+    decode,
+    validate_tokenizer,
+)
 
 
 @dataclass
@@ -170,7 +175,8 @@ class ModelRunner:
                 import onnxruntime as ort
             except ImportError as exc:  # pragma: no cover - dependencia opcional
                 raise RuntimeError(
-                    "onnxruntime no está disponible. Instala el extra 'export' o la librería manualmente."
+                    "onnxruntime no está disponible. Instala el extra 'export' "
+                    "o la librería manualmente."
                 ) from exc
 
             providers = None
@@ -207,7 +213,11 @@ class ModelRunner:
 
         tensor_inputs = {}
         for key, value in inputs.items():
-            tensor_inputs[key] = value if isinstance(value, torch.Tensor) else torch.from_numpy(value).to(self.device)
+            tensor_inputs[key] = (
+                value
+                if isinstance(value, torch.Tensor)
+                else torch.from_numpy(value).to(self.device)
+            )
 
         if self.generate_method is not None:
             try:
@@ -228,27 +238,22 @@ class ModelRunner:
         raise RuntimeError("El modelo TorchScript devolvió una salida inesperada")
 
 
-def decode_token_ids_stub(sequences: torch.Tensor) -> str:
-    """Decodificador placeholder que expone los IDs generados."""
-
-    if sequences.dim() == 2:
-        seq = sequences[0]
-    else:
-        seq = sequences
-    for token_id in seq.tolist():
-        if token_id not in (0,):
-            return f"<token_{int(token_id)}>"
-    return "<token_0>"
-
-
 def decode_sequences(sequences: torch.Tensor, tokenizer) -> str:
     if tokenizer is None:
-        return decode_token_ids_stub(sequences)
+        raise ValueError(
+            "La demo requiere un tokenizador válido. Proporciona --tokenizer con un modelo"
+            " compatible de HuggingFace."
+        )
     texts = decode(tokenizer, sequences, skip_special_tokens=True)
     return texts[0] if texts else ""
 
 
-def draw_overlays(frame: np.ndarray, boxes: Dict[str, Optional[Tuple[int, int, int, int]]], detections: FrameDetections, text: str) -> None:
+def draw_overlays(
+    frame: np.ndarray,
+    boxes: Dict[str, Optional[Tuple[int, int, int, int]]],
+    detections: FrameDetections,
+    text: str,
+) -> None:
     colors = {
         "face": (0, 255, 0),
         "hand_l": (255, 0, 0),
@@ -276,9 +281,41 @@ def draw_overlays(frame: np.ndarray, boxes: Dict[str, Optional[Tuple[int, int, i
 
 
 def build_tokenizer(args: argparse.Namespace):
-    if not getattr(args, "tokenizer", None):
-        return None
-    return create_tokenizer(args.tokenizer, revision=getattr(args, "tokenizer_revision", None))
+    tokenizer_name = getattr(args, "tokenizer", None)
+    if not tokenizer_name:
+        raise ValueError(
+            "Debes especificar --tokenizer con el identificador de un tokenizador compatible"
+            " de HuggingFace."
+        )
+
+    revision = getattr(args, "tokenizer_revision", None)
+    try:
+        tokenizer = create_tokenizer(tokenizer_name, revision=revision)
+    except Exception as exc:  # pragma: no cover - errores de disco/red
+        raise RuntimeError(
+            "No se pudo cargar el tokenizador. Verifica el nombre proporcionado o la conexión"
+            " a internet."
+        ) from exc
+
+    try:
+        validate_tokenizer(tokenizer)
+    except TokenizerValidationError as exc:
+        raise RuntimeError(f"El tokenizador cargado no es válido: {exc}") from exc
+
+    return tokenizer
+
+
+def validate_model_arguments(model_path: Optional[Path], model_format: str) -> None:
+    if model_path is None:
+        if model_format == "auto":
+            raise ValueError(
+                "Debes proporcionar --model con la ruta al modelo exportado o indicar"
+                " explícitamente --model-format stub para usar la versión integrada."
+            )
+        if model_format != "stub":
+            raise ValueError(
+                f"--model es obligatorio cuando --model-format es '{model_format}'."
+            )
 
 
 def infer_model_format(model_path: Optional[Path], model_format: str) -> str:
@@ -295,7 +332,12 @@ def infer_model_format(model_path: Optional[Path], model_format: str) -> str:
 
 
 def add_model_cli_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model", type=Path, help="Ruta al modelo TorchScript/ONNX exportado", default=None)
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Ruta al modelo TorchScript/ONNX exportado",
+    )
     parser.add_argument(
         "--model-format",
         choices=("auto", "stub", "torchscript", "onnx"),
@@ -308,15 +350,33 @@ def add_model_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Longitud máxima para generación autoregresiva",
     )
-    parser.add_argument("--beam-size", type=int, default=1, help="Número de beams para la búsqueda autoregresiva")
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=1,
+        help="Número de beams para la búsqueda autoregresiva",
+    )
     parser.add_argument(
         "--onnx-provider",
         type=str,
         default=None,
-        help="Proveedor preferido de ejecución para onnxruntime (por ejemplo CUDAExecutionProvider)",
+        help=(
+            "Proveedor preferido de ejecución para onnxruntime"
+            " (por ejemplo CUDAExecutionProvider)"
+        ),
     )
-    parser.add_argument("--tokenizer", type=str, help="Nombre o ruta del tokenizador HuggingFace", default=None)
-    parser.add_argument("--tokenizer-revision", type=str, help="Revisión del tokenizador (tag/commit)", default=None)
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Nombre o ruta del tokenizador HuggingFace",
+    )
+    parser.add_argument(
+        "--tokenizer-revision",
+        type=str,
+        default=None,
+        help="Revisión del tokenizador (tag/commit)",
+    )
 
 
 def run_demo(args: argparse.Namespace) -> None:
@@ -324,6 +384,8 @@ def run_demo(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "MediaPipe no está disponible. Instala el paquete 'mediapipe' para ejecutar la demo."
         )
+
+    validate_model_arguments(args.model, args.model_format)
 
     config = DemoConfig(
         sequence_length=args.sequence_length,
@@ -363,7 +425,11 @@ def run_demo(args: argparse.Namespace) -> None:
     if not args.no_window:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
+    face_mesh = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+    )
     hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2)
     pose = mp.solutions.pose.Pose(static_image_mode=False, model_complexity=1)
 
@@ -391,7 +457,14 @@ def run_demo(args: argparse.Namespace) -> None:
                 hands_result = hands.process(rgb)
                 pose_result = pose.process(rgb)
 
-                face_tensor, hand_l_tensor, hand_r_tensor, pose_tensor, detections, boxes = processor.process(
+                (
+                    face_tensor,
+                    hand_l_tensor,
+                    hand_r_tensor,
+                    pose_tensor,
+                    detections,
+                    boxes,
+                ) = processor.process(
                     frame,
                     face_result=face_result,
                     hands_result=hands_result,
@@ -434,7 +507,11 @@ def run_demo(args: argparse.Namespace) -> None:
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0, help="Índice de la cámara a utilizar")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
     parser.add_argument(
         "--sequence-length",
         type=int,
@@ -447,10 +524,29 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=13,
         help="Cantidad de landmarks de pose a considerar (MediaPipe Holistic)",
     )
-    parser.add_argument("--bbox-scale", type=float, default=1.2, help="Factor de expansión del bounding box")
-    parser.add_argument("--smoothing", type=float, default=0.4, help="Factor de suavizado para el tracking de ROI")
-    parser.add_argument("--max-misses", type=int, default=5, help="Cantidad de frames sin detección antes de descartar la ROI")
-    parser.add_argument("--no-window", action="store_true", help="Ejecuta la demo sin mostrar overlay de OpenCV")
+    parser.add_argument(
+        "--bbox-scale",
+        type=float,
+        default=1.2,
+        help="Factor de expansión del bounding box",
+    )
+    parser.add_argument(
+        "--smoothing",
+        type=float,
+        default=0.4,
+        help="Factor de suavizado para el tracking de ROI",
+    )
+    parser.add_argument(
+        "--max-misses",
+        type=int,
+        default=5,
+        help="Cantidad de frames sin detección antes de descartar la ROI",
+    )
+    parser.add_argument(
+        "--no-window",
+        action="store_true",
+        help="Ejecuta la demo sin mostrar overlay de OpenCV",
+    )
 
     add_model_cli_arguments(parser)
     return parser.parse_args(argv)

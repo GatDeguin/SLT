@@ -175,9 +175,9 @@ python tools/export_onnx_encoder_v9.py \
 ```
 
 Valida los artefactos con `tools/demo_realtime_multistream.py` (webcam) o
-`tools/test_realtime_pipeline.py` (video en disco). Ambos aceptan modelos
-TorchScript/ONNX y tokenizadores de HuggingFace. Si no se especifica un modelo,
-utilizarán el preset validado (asegúrate de tener el checkpoint descargado).
+`tools/test_realtime_pipeline.py` (video en disco). Ambos requieren un modelo
+exportado (`--model`) o declarar `--model-format stub`, además de un tokenizador
+de HuggingFace (`--tokenizer`).
 
 ## Preentrenamiento de backbones
 
