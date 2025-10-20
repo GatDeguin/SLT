@@ -156,6 +156,12 @@ python tools/eval_slt_multistream_v9.py \
   --output-csv work_dirs/single_signer_demo/predictions/preds.csv
 ```
 
+El script valida el tokenizador con `slt.utils.validate_tokenizer` antes de
+procesar los videos, evitando ejecuciones largas con configuraciones inválidas.
+Los reportes incluyen métricas BLEU, ChrF, CER y WER; estas últimas se calculan
+mediante `slt.utils.character_error_rate` y `slt.utils.word_error_rate` para
+facilitar comparaciones con referencias externas.
+
 Los archivos `report.json` y `report.csv` resultantes pueden integrarse en
 herramientas analíticas mediante `docs/metrics_dashboard_integration.py`.
 
@@ -192,7 +198,7 @@ Los tests automatizados validan piezas clave del pipeline:
 
 | Escenario | Prueba | Resultado esperado |
 |-----------|--------|--------------------|
-| Datos sintéticos end-to-end | `tests/test_pipeline_end_to_end.py` | Pérdida cae y exporta encoder. |
+| Datos sintéticos end-to-end | `tests/test_pipeline_end_to_end.py` | Pérdida cae y exporta. |
 | CLI de demo | `tests/test_cli_main.py` | Ejecuta entrenamiento corto sin errores. |
 | Exportación | `tests/test_export.py` | Genera y valida ONNX/TorchScript. |
 | Calidad de datos | `tests/data/test_dataset_quality.py` | Detecta frames faltantes y FPS. |
