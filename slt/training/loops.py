@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Iterable, MutableMapping, Optional, Sequ
 import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
+from torch.optim import Optimizer
 
 try:  # pragma: no cover - CUDA may be unavailable in CI
     from torch.cuda.amp import GradScaler, autocast  # type: ignore
@@ -22,6 +23,9 @@ Batch = Union[Dict[str, Any], Sequence[Any]]
 Inputs = Union[torch.Tensor, Sequence[Any], MutableMapping[str, Any]]
 LossFn = Callable[[torch.Tensor, Any], torch.Tensor]
 MetricFn = Callable[[Any, Any], Union[float, torch.Tensor]]
+GradClipValue = Optional[Union[float, Callable[[int, torch.Tensor, Optimizer], Optional[float]]]]
+GradAccumulation = Union[int, Callable[[int, torch.Tensor, Batch, int], bool]]
+AmpFailureHandler = Callable[[RuntimeError, int], bool]
 
 
 @dataclass
@@ -157,11 +161,12 @@ def train_epoch(
     device: Union[str, torch.device] = "cuda",
     scaler: Optional["GradScaler"] = None,
     autocast_dtype: Optional[torch.dtype] = torch.float16,
-    grad_clip_norm: Optional[float] = None,
+    grad_clip_norm: GradClipValue = None,
     grad_clip_norm_type: Union[float, int] = 2.0,
-    grad_accum_steps: int = 1,
+    grad_accum_steps: GradAccumulation = 1,
     metrics: Optional[Dict[str, MetricFn]] = None,
     forward_fn: Optional[Callable[..., torch.Tensor]] = None,
+    amp_failure_handler: Optional[AmpFailureHandler] = None,
 ) -> LoopResult:
     """Run a single training epoch and return aggregated metrics."""
 
@@ -170,13 +175,110 @@ def train_epoch(
     total_items = 0
     metric_sums: Dict[str, float] = {}
 
-    if grad_accum_steps <= 0:
-        raise ValueError("grad_accum_steps must be a positive integer")
+    if isinstance(grad_accum_steps, int):
+        if grad_accum_steps <= 0:
+            raise ValueError("grad_accum_steps must be a positive integer")
+        current_accum_target = grad_accum_steps
+    elif callable(grad_accum_steps):
+        current_accum_target = 1
+    else:
+        raise TypeError("grad_accum_steps must be an int or a callable strategy")
 
     use_amp = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
 
     optimizer.zero_grad(set_to_none=True)
     step_index = 0
+    pending_backward = 0
+    last_raw_loss: Optional[torch.Tensor] = None
+
+    def _resolve_clip_value(step: int, loss_value: torch.Tensor) -> Optional[float]:
+        value: Optional[float]
+        if callable(grad_clip_norm):
+            value_candidate = grad_clip_norm(step, loss_value, optimizer)
+            if value_candidate is None:
+                return None
+            value = float(value_candidate)
+        else:
+            value = grad_clip_norm
+        if value is None:
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    def _parse_accumulation_directive(
+        step: int,
+        loss_value: torch.Tensor,
+        batch_obj: Batch,
+        pending_after: int,
+    ) -> Tuple[bool, int]:
+        nonlocal current_accum_target
+        if isinstance(grad_accum_steps, int):
+            return False, current_accum_target
+
+        directive = grad_accum_steps(step, loss_value, batch_obj, pending_after)
+        should_step = False
+        if isinstance(directive, tuple):
+            if len(directive) != 2:
+                raise ValueError(
+                    "grad_accum_steps callable must return (should_step, accumulation_steps)"
+                )
+            should_step = bool(directive[0])
+            if directive[1] is not None:
+                current_accum_target = int(directive[1])
+        elif isinstance(directive, bool):
+            should_step = directive
+        elif isinstance(directive, int):
+            current_accum_target = directive
+        else:
+            raise TypeError(
+                "grad_accum_steps callable must return bool, int or (bool, int)"
+            )
+
+        if current_accum_target <= 0:
+            raise ValueError("Accumulation steps provided by strategy must be positive")
+
+        return should_step, current_accum_target
+
+    def _handle_amp_failure(error: RuntimeError) -> bool:
+        handled = True
+        if amp_failure_handler is not None:
+            handled = bool(amp_failure_handler(error, step_index))
+        return handled
+
+    def _is_amp_overflow(error: RuntimeError) -> bool:
+        message = str(error).lower()
+        return "inf" in message or "nan" in message
+
+    def _perform_step(loss_value: torch.Tensor) -> None:
+        clip_value = _resolve_clip_value(step_index, loss_value)
+        if use_amp:
+            clip_gradients(
+                optimizer,
+                clip_value,
+                scaler=scaler,
+                parameters=model.parameters(),
+                norm_type=grad_clip_norm_type,
+            )
+            try:
+                scaler.step(optimizer)  # type: ignore[arg-type]
+            except RuntimeError as error:
+                if _is_amp_overflow(error) and _handle_amp_failure(error):
+                    scaler.update()  # type: ignore[arg-type]
+                    optimizer.zero_grad(set_to_none=True)
+                    return
+                raise
+            scaler.update()  # type: ignore[arg-type]
+        else:
+            clip_gradients(
+                optimizer,
+                clip_value,
+                scaler=None,
+                parameters=model.parameters(),
+                norm_type=grad_clip_norm_type,
+            )
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
     for step_index, batch in enumerate(loader, start=1):
         inputs, targets = _split_batch(batch)
@@ -193,19 +295,6 @@ def train_epoch(
                     else _execute_forward(forward_fn, inputs)
                 )
                 raw_loss = loss_fn(outputs, targets)
-            loss = raw_loss / grad_accum_steps
-            scaler.scale(loss).backward()  # type: ignore[arg-type]
-            if step_index % grad_accum_steps == 0:
-                clip_gradients(
-                    optimizer,
-                    grad_clip_norm,
-                    scaler=scaler,
-                    parameters=model.parameters(),
-                    norm_type=grad_clip_norm_type,
-                )
-                scaler.step(optimizer)  # type: ignore[arg-type]
-                scaler.update()  # type: ignore[arg-type]
-                optimizer.zero_grad(set_to_none=True)
         else:
             outputs = (
                 _call_model(model, inputs)
@@ -213,45 +302,36 @@ def train_epoch(
                 else _execute_forward(forward_fn, inputs)
             )
             raw_loss = loss_fn(outputs, targets)
-            loss = raw_loss / grad_accum_steps
+
+        pending_after = pending_backward + 1
+        should_step, current_target = _parse_accumulation_directive(
+            step_index, raw_loss, batch, pending_after
+        )
+
+        loss_divisor = current_target
+        if use_amp and autocast_dtype is not None:
+            loss = raw_loss / loss_divisor
+            scaler.scale(loss).backward()  # type: ignore[arg-type]
+        else:
+            loss = raw_loss / loss_divisor
             loss.backward()
-            if step_index % grad_accum_steps == 0:
-                clip_gradients(
-                    optimizer,
-                    grad_clip_norm,
-                    scaler=None,
-                    parameters=model.parameters(),
-                    norm_type=grad_clip_norm_type,
-                )
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+
+        pending_backward = pending_after
+        last_raw_loss = raw_loss
+
+        if not should_step:
+            should_step = pending_backward >= current_target
+
+        if should_step:
+            _perform_step(raw_loss)
+            pending_backward = 0
 
         total_loss += raw_loss.detach().item() * batch_items
         total_items += batch_items
         _update_metric_sums(metric_sums, outputs, targets, metrics, batch_items)
 
-    remainder = step_index % grad_accum_steps if step_index else 0
-    if remainder != 0:
-        if use_amp:
-            clip_gradients(
-                optimizer,
-                grad_clip_norm,
-                scaler=scaler,
-                parameters=model.parameters(),
-                norm_type=grad_clip_norm_type,
-            )
-            scaler.step(optimizer)  # type: ignore[arg-type]
-            scaler.update()  # type: ignore[arg-type]
-        else:
-            clip_gradients(
-                optimizer,
-                grad_clip_norm,
-                scaler=None,
-                parameters=model.parameters(),
-                norm_type=grad_clip_norm_type,
-            )
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+    if pending_backward > 0 and last_raw_loss is not None:
+        _perform_step(last_raw_loss)
 
     if total_items == 0:
         raise RuntimeError("Empty training loader provided.")

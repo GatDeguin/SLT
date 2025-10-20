@@ -1,6 +1,8 @@
 import math
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -107,6 +109,43 @@ def test_clip_gradients_invokes_norm(monkeypatch):
     assert captured["max_norm"] == 0.5
 
 
+def test_conditional_clip_callable(monkeypatch):
+    device = torch.device("cpu")
+    dataset = LinearDataset(n_samples=48)
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    model = SimpleRegressor(dataset.x.size(1)).to(device)
+    optimizer = create_optimizer(model.parameters(), {"lr": 0.01, "type": "sgd"})
+    loss_fn = nn.MSELoss()
+
+    recorded = []
+
+    def _fake_clip_gradients(optimizer, max_norm, *, scaler=None, parameters=None, norm_type=2.0):
+        recorded.append(max_norm)
+        if max_norm is not None:
+            return torch.tensor(max_norm)
+        return None
+
+    monkeypatch.setattr("slt.training.loops.clip_gradients", _fake_clip_gradients)
+
+    def _clip_schedule(step: int, loss: torch.Tensor, opt: torch.optim.Optimizer):
+        if step == 1:
+            return None
+        return 0.25 * step
+
+    train_epoch(
+        model,
+        loader,
+        optimizer,
+        loss_fn,
+        device=device,
+        grad_clip_norm=_clip_schedule,
+    )
+
+    # The callable returns None for the first step (skip clipping) and positive afterwards.
+    assert recorded[0] is None
+    assert any(value and value > 0 for value in recorded[1:])
+
+
 def test_clip_gradients_helper():
     model = SimpleRegressor(4)
     optimizer = create_optimizer(model.parameters(), {"lr": 0.01, "type": "sgd"})
@@ -144,6 +183,123 @@ def test_gradient_accumulation_matches_large_batch():
 
     for param_large, param_accum in zip(model_large.parameters(), model_accum.parameters()):
         assert torch.allclose(param_large, param_accum, atol=1e-6)
+
+
+def test_dynamic_accumulation_strategy(monkeypatch):
+    device = torch.device("cpu")
+    torch.manual_seed(0)
+    dataset = LinearDataset(n_samples=96)
+    loader = DataLoader(dataset, batch_size=8, shuffle=False)
+    model = SimpleRegressor(dataset.x.size(1)).to(device)
+    optimizer = create_optimizer(model.parameters(), {"lr": 0.05, "type": "adamw"})
+    loss_fn = nn.MSELoss()
+
+    step_calls = 0
+    original_step = optimizer.step
+
+    def counting_step(*args, **kwargs):
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "step", counting_step)
+
+    def strategy(step: int, loss: torch.Tensor, batch: Any, pending: int):
+        # Use a different accumulation length depending on the step index.
+        if step == 1:
+            return 2  # accumulate two micro-batches
+        if step == 3:
+            return (False, 3)  # start a window of three
+        if step == 5:
+            return True  # force an early step regardless of pending count
+        return False
+
+    result = train_epoch(
+        model,
+        loader,
+        optimizer,
+        loss_fn,
+        device=device,
+        grad_accum_steps=strategy,
+    )
+
+    assert isinstance(result, LoopResult)
+    # We expect at least three optimizer steps: one for the initial pair, one for the forced
+    # step, and a final flush.
+    assert step_calls >= 3
+
+
+def test_amp_overflow_recovery():
+    device = torch.device("cpu")
+    torch.manual_seed(0)
+    dataset = LinearDataset(n_samples=32)
+    loader = DataLoader(dataset, batch_size=8, shuffle=False)
+    model = SimpleRegressor(dataset.x.size(1)).to(device)
+    optimizer = create_optimizer(model.parameters(), {"lr": 0.05, "type": "sgd"})
+    loss_fn = nn.MSELoss()
+
+    class DummyScaler:
+        def __init__(self, fail_on: int = 1):
+            self.fail_on = fail_on
+            self.calls = 0
+            self.stepped = 0
+
+        def is_enabled(self):
+            return True
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            self.calls += 1
+            if self.calls == self.fail_on:
+                raise RuntimeError("inf or nan encountered in gradients")
+            optimizer.step()
+            self.stepped += 1
+
+        def update(self):
+            pass
+
+    scaler = DummyScaler()
+
+    weights_before = [param.detach().clone() for param in model.parameters()]
+
+    train_epoch(
+        model,
+        loader,
+        optimizer,
+        loss_fn,
+        device=device,
+        scaler=scaler,  # type: ignore[arg-type]
+        autocast_dtype=torch.float32,
+    )
+
+    weights_after = list(model.parameters())
+
+    assert scaler.calls >= 1
+    assert scaler.stepped >= 1
+    assert any(not torch.allclose(before, after) for before, after in zip(weights_before, weights_after))
+
+
+def test_train_epoch_throughput():
+    device = torch.device("cpu")
+    dataset = LinearDataset(n_samples=64)
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    model = SimpleRegressor(dataset.x.size(1)).to(device)
+    optimizer = create_optimizer(model.parameters(), {"lr": 0.05, "type": "adamw"})
+    loss_fn = nn.MSELoss()
+
+    start = time.perf_counter()
+    result = train_epoch(model, loader, optimizer, loss_fn, device=device)
+    elapsed = time.perf_counter() - start
+
+    throughput = len(dataset) / max(elapsed, 1e-6)
+
+    assert throughput > 0
+    assert math.isfinite(result.loss)
 
 
 def test_metric_aggregation():
