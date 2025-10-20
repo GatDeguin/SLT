@@ -32,3 +32,7 @@ jobs:
         run: pytest --cov=slt --cov-report=term-missing
       - name: Export smoke test
         run: python -m pytest tests/test_export.py::test_main_export_generates_onnx_and_torchscript
+      - name: Validate data contract fixtures
+        run: python tools/ci_validate_data_contract.py
+      - name: Validate README reference metrics
+        run: python tools/ci_validate_metrics.py
