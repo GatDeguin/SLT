@@ -53,6 +53,9 @@ class MultiStreamEncoder(torch.nn.Module):
         fusion_bias: bool = True,
         temporal_kwargs: Optional[Dict[str, Any]] = None,
         backbones: Optional[Mapping[str, torch.nn.Module]] = None,
+        mask_combiner: Optional[
+            Callable[[Optional[Tensor], Optional[Tensor]], Optional[Tensor]]
+        ] = None,
     ) -> None:
         super().__init__()
         temporal_kwargs = temporal_kwargs or {}
@@ -103,6 +106,7 @@ class MultiStreamEncoder(torch.nn.Module):
         self._last_combined_hand_mask: Optional[Tensor] = None
         self._last_padding_mask: Optional[Tensor] = None
         self._last_pose_mask: Optional[Tensor] = None
+        self._mask_combiner = mask_combiner or self._default_mask_combiner
         self._stream_assemblies: Dict[str, _StreamAssembly] = {
             stream: _StreamAssembly(
                 name=stream,
@@ -124,7 +128,8 @@ class MultiStreamEncoder(torch.nn.Module):
     ) -> "MultiStreamEncoder":
         """Instantiate the encoder with the validated single-signer weights."""
 
-        if preset != "single_signer":
+        normalized = preset.replace("-", "_").strip().lower()
+        if normalized != "single_signer":
             raise ValueError(
                 f"Unknown pretrained preset '{preset}'. Available options: 'single_signer'"
             )
@@ -493,15 +498,37 @@ class MultiStreamEncoder(torch.nn.Module):
     def _combine_missing_masks(
         self, left: Optional[Tensor], right: Optional[Tensor]
     ) -> Optional[Tensor]:
+        combined = self._mask_combiner(left, right)
+        if combined is None:
+            return None
+        return combined.to(dtype=torch.bool)
+
+    @staticmethod
+    def _default_mask_combiner(
+        left: Optional[Tensor], right: Optional[Tensor]
+    ) -> Optional[Tensor]:
         if left is None and right is None:
             return None
         if left is None:
-            combined = right.clone()
-        elif right is None:
-            combined = left.clone()
+            return right.clone()
+        if right is None:
+            return left.clone()
+        return torch.logical_or(left, right)
+
+    def set_mask_combiner(
+        self,
+        combiner: Optional[
+            Callable[[Optional[Tensor], Optional[Tensor]], Optional[Tensor]]
+        ],
+    ) -> None:
+        """Configure how the left/right hand masks are combined."""
+
+        if combiner is None:
+            self._mask_combiner = self._default_mask_combiner
+        elif not callable(combiner):
+            raise TypeError("Mask combiner must be callable or None")
         else:
-            combined = torch.logical_or(left, right)
-        return combined.to(dtype=torch.bool)
+            self._mask_combiner = combiner
 
     def _call_fusion(
         self, streams: Sequence[Tensor], mask: Optional[Tensor]
