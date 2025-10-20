@@ -15,18 +15,18 @@ class ModelConfig:
     """Model hyper-parameters exposed in the CLIs."""
 
     image_size: int = 224
-    projector_dim: int = 256
-    d_model: int = 512
+    projector_dim: int = 128
+    d_model: int = 128
     pose_landmarks: int = 13
-    projector_dropout: float = 0.0
-    fusion_dropout: float = 0.0
-    temporal_nhead: int = 8
-    temporal_layers: int = 6
-    temporal_dim_feedforward: int = 2048
-    temporal_dropout: float = 0.1
+    projector_dropout: float = 0.05
+    fusion_dropout: float = 0.05
+    temporal_nhead: int = 4
+    temporal_layers: int = 3
+    temporal_dim_feedforward: int = 384
+    temporal_dropout: float = 0.05
     sequence_length: int = 128
     decoder_layers: int = 2
-    decoder_heads: int = 8
+    decoder_heads: int = 4
     decoder_dropout: float = 0.1
     decoder_model: Optional[str] = None
     decoder_config: Optional[str] = None
@@ -38,6 +38,8 @@ class ModelConfig:
     freeze_face_backbone: bool = False
     freeze_hand_left_backbone: bool = False
     freeze_hand_right_backbone: bool = False
+    pretrained: Optional[str] = "single_signer"
+    pretrained_checkpoint: Optional[Path] = None
 
 
 @dataclass

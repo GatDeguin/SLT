@@ -115,6 +115,8 @@ def test_main_runs_training_loop(
         decoder_heads=2,
         decoder_dropout=0.0,
         no_amp=True,
+        pretrained="none",
+        pretrained_checkpoint=None,
     )
 
     def fake_parse_args():

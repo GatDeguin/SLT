@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the multi-stream encoder stub and heads to ONNX/TorchScript."""
+"""Export the validated multi-stream encoder and heads to ONNX/TorchScript."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ import torch
 from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
+from slt.models.single_signer import (
+    load_single_signer_encoder,
+    resolve_single_signer_checkpoint_path,
+)
 
 IMAGENET_STATS = {
     "mean": [0.485, 0.456, 0.406],
@@ -26,18 +30,35 @@ METADATA_VERSION = 1
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to the PyTorch checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="single_signer",
+        help=(
+            "Path to the PyTorch checkpoint or 'single_signer' to use the validated preset "
+            "(requires a downloaded file)"
+        ),
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the downloaded single_signer checkpoint used when --checkpoint"
+            " is set to the preset"
+        ),
+    )
     parser.add_argument("--onnx", type=Path, help="Destination ONNX file")
     parser.add_argument("--torchscript", type=Path, help="Destination TorchScript file")
     parser.add_argument("--image-size", type=int, default=224, help="Input image resolution expected by the ViT backbones")
-    parser.add_argument("--projector-dim", type=int, default=256, help="Dimensionality of the per-stream projectors")
-    parser.add_argument("--d-model", type=int, default=512, help="Temporal encoder embedding dimension")
+    parser.add_argument("--projector-dim", type=int, default=128, help="Dimensionality of the per-stream projectors")
+    parser.add_argument("--d-model", type=int, default=128, help="Temporal encoder embedding dimension")
     parser.add_argument("--pose-landmarks", type=int, default=13, help="Number of pose landmarks present in the pose stream")
     parser.add_argument("--sequence-length", type=int, default=128, help="Temporal length used to build the dummy inputs")
-    parser.add_argument("--projector-dropout", type=float, default=0.0, help="Dropout applied inside the projectors")
-    parser.add_argument("--fusion-dropout", type=float, default=0.0, help="Dropout applied before stream fusion")
-    parser.add_argument("--temporal-nhead", type=int, default=8, help="Number of attention heads in the temporal encoder")
-    parser.add_argument("--temporal-layers", type=int, default=6, help="Number of transformer layers in the temporal encoder")
+    parser.add_argument("--projector-dropout", type=float, default=0.05, help="Dropout applied inside the projectors")
+    parser.add_argument("--fusion-dropout", type=float, default=0.05, help="Dropout applied before stream fusion")
+    parser.add_argument("--temporal-nhead", type=int, default=4, help="Number of attention heads in the temporal encoder")
+    parser.add_argument("--temporal-layers", type=int, default=3, help="Number of transformer layers in the temporal encoder")
     parser.add_argument(
         "--temporal-dim-feedforward",
         type=int,
@@ -135,7 +156,59 @@ class EncoderExportModule(torch.nn.Module):
         )
 
 
-def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
+def _build_encoder(args: argparse.Namespace) -> Tuple[MultiStreamEncoder, Dict[str, Any]]:
+    preset = (args.checkpoint or "").lower()
+    if preset in {"single_signer", "single-signer"}:
+        resolved_checkpoint = resolve_single_signer_checkpoint_path(
+            args.pretrained_checkpoint
+        )
+        encoder, metadata, _ = load_single_signer_encoder(
+            checkpoint_path=resolved_checkpoint,
+            map_location=torch.device("cpu"),
+            strict=True,
+        )
+        setattr(args, "resolved_checkpoint", resolved_checkpoint)
+        encoder_kwargs = dict(metadata.encoder_kwargs)
+        temporal_kwargs = dict(encoder_kwargs.get("temporal_kwargs", {}))
+        args.projector_dim = int(encoder_kwargs.get("projector_dim", args.projector_dim))
+        args.d_model = int(encoder_kwargs.get("d_model", args.d_model))
+        args.sequence_length = int(
+            encoder_kwargs.get("positional_num_positions", args.sequence_length)
+        )
+        args.projector_dropout = float(encoder_kwargs.get("projector_dropout", args.projector_dropout))
+        args.fusion_dropout = float(encoder_kwargs.get("fusion_dropout", args.fusion_dropout))
+        args.temporal_nhead = int(temporal_kwargs.get("nhead", args.temporal_nhead))
+        args.temporal_layers = int(temporal_kwargs.get("nlayers", args.temporal_layers))
+        args.temporal_dim_feedforward = int(
+            temporal_kwargs.get("dim_feedforward", args.temporal_dim_feedforward)
+        )
+        args.temporal_dropout = float(temporal_kwargs.get("dropout", args.temporal_dropout))
+        pose_dim = int(encoder_kwargs.get("pose_dim", 3 * args.pose_landmarks))
+        args.pose_landmarks = max(1, pose_dim // 3)
+        extra = dict(metadata.extra)
+        extra.setdefault("schema_version", metadata.schema_version)
+        extra.setdefault("task", metadata.task)
+        extra.setdefault("encoder_kwargs", encoder_kwargs)
+        extra.setdefault("checkpoint_source", preset)
+        extra.setdefault("checkpoint_path", str(resolved_checkpoint))
+        extra.update(
+            {
+                "image_size": args.image_size,
+                "projector_dim": args.projector_dim,
+                "d_model": args.d_model,
+                "pose_landmarks": args.pose_landmarks,
+                "sequence_length": args.sequence_length,
+                "projector_dropout": args.projector_dropout,
+                "fusion_dropout": args.fusion_dropout,
+                "temporal_nhead": args.temporal_nhead,
+                "temporal_layers": args.temporal_layers,
+                "temporal_dim_feedforward": args.temporal_dim_feedforward,
+                "temporal_dropout": args.temporal_dropout,
+                "pose_dim": pose_dim,
+            }
+        )
+        return encoder, extra
+
     vit_config = ViTConfig(image_size=args.image_size)
     temporal_kwargs = {
         "nhead": args.temporal_nhead,
@@ -153,7 +226,7 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         fusion_dropout=args.fusion_dropout,
         temporal_kwargs=temporal_kwargs,
     )
-    return encoder
+    return encoder, {}
 
 
 def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEncoder) -> OrderedDict[str, torch.Tensor]:
@@ -175,7 +248,12 @@ def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEnco
     )
 
 
-def _load_encoder_weights(path: Path, model: MultiStreamEncoder) -> Dict[str, Any]:
+def _load_encoder_weights(identifier: str, model: MultiStreamEncoder) -> Dict[str, Any]:
+    preset = (identifier or "").lower()
+    if preset in {"single_signer", "single-signer"}:
+        return {}
+
+    path = Path(identifier)
     raw_checkpoint = torch.load(path, map_location="cpu")
 
     metadata: Dict[str, Any] = {}
@@ -286,8 +364,9 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
     if args.metadata is not None and args.metadata.suffix != ".json":
         raise ValueError("Metadata file must use the .json extension")
 
-    encoder = _build_encoder(args).to(device)
-    checkpoint_meta = _load_encoder_weights(args.checkpoint, encoder)
+    encoder, packaged_meta = _build_encoder(args)
+    encoder = encoder.to(device)
+    checkpoint_meta = packaged_meta or _load_encoder_weights(args.checkpoint, encoder)
     _validate_checkpoint_metadata(checkpoint_meta, args)
     encoder.eval()
 
@@ -376,7 +455,12 @@ def _build_metadata(
     *, args: argparse.Namespace, checkpoint_meta: Mapping[str, Any], dynamic_axes: Mapping[str, Mapping[int, str]]
 ) -> Dict[str, Any]:
     timestamp = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat()
-    checkpoint_hash = _sha256(args.checkpoint)
+    resolved_checkpoint = getattr(args, "resolved_checkpoint", args.checkpoint)
+    if isinstance(resolved_checkpoint, Path):
+        checkpoint_path = resolved_checkpoint
+    else:
+        checkpoint_path = Path(resolved_checkpoint)
+    checkpoint_hash = _sha256(checkpoint_path)
     model_config = {
         "image_size": args.image_size,
         "projector_dim": args.projector_dim,
@@ -431,7 +515,7 @@ def _build_metadata(
         "artifact_version": args.version,
         "generated_at": timestamp,
         "checkpoint": {
-            "path": str(args.checkpoint.resolve()),
+            "path": str(checkpoint_path.resolve()),
             "sha256": checkpoint_hash,
             "config": dict(checkpoint_meta),
         },

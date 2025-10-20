@@ -105,6 +105,7 @@ def test_eval_script_generates_stub_csv(
         decoder_layers=1,
         decoder_heads=2,
         decoder_dropout=0.0,
+        pretrained="none",
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(str(tiny_tokenizer_dir))
     class DummyEncoder(torch.nn.Module):
@@ -165,6 +166,8 @@ def test_eval_script_generates_stub_csv(
         "2",
         "--decoder-dropout",
         "0.0",
+        "--pretrained",
+        "none",
         "--tokenizer",
         str(tiny_tokenizer_dir),
         "--max-target-length",

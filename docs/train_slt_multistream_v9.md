@@ -2,9 +2,13 @@
 
 El script `tools/train_slt_multistream_v9.py` entrena el encoder multi-stream y
 un decoder seq2seq compatible con HuggingFace utilizando los datos preparados en
-`data/single_signer/processed/` y los índices derivados de `meta.csv`. Esta guía
-resume los argumentos más importantes, patrones de uso avanzados y recomendaciones
-para reproducir experimentos.
+`data/single_signer/processed/` y los índices derivados de `meta.csv`. De forma
+predeterminada el modelo se inicializa con el checkpoint validado
+`single_signer` cuando el archivo descargado está disponible (en
+`data/single_signer/` o vía `SLT_SINGLE_SIGNER_CHECKPOINT`), aunque puedes
+deshabilitarlo con `--pretrained none`. Esta guía resume los argumentos más
+importantes, patrones de uso avanzados y recomendaciones para reproducir
+experimentos.
 
 ## Requisitos previos
 
@@ -60,6 +64,8 @@ Artefactos generados en `--work-dir`:
 | `--decoder-layers`, `--decoder-heads`, `--decoder-dropout` | Arquitectura del decoder. |
 | `--decoder-model`, `--decoder-config` | Modelos/configs HuggingFace precargados. |
 | `--decoder-class`, `--decoder-kwargs` | Decoder Python personalizado vía módulo/clase. |
+| `--pretrained` | Selecciona `single_signer` (default) o `none` para inicializar pesos. |
+| `--pretrained-checkpoint` | Ruta al checkpoint `single_signer` descargado. |
 
 ### Optimización y ejecución
 

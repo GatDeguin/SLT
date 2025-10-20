@@ -3,7 +3,10 @@
 El módulo ejecuta un entrenamiento corto utilizando los mismos componentes que
 la CLI completa de ``tools/train_slt_multistream_v9.py``. Acepta archivos de
 configuración externos (JSON/YAML) y permite sobreescribir parámetros mediante
-la bandera ``--set`` para facilitar experimentos rápidos."""
+la bandera ``--set`` para facilitar experimentos rápidos. De forma
+predeterminada el modelo se inicializa con los pesos validados para el flujo
+``single_signer`` siempre que el checkpoint haya sido descargado y esté
+disponible localmente."""
 
 from __future__ import annotations
 
@@ -121,6 +124,12 @@ def _build_cli_overrides(
         model_section["decoder_heads"] = args.decoder_heads
     if args.decoder_dropout is not None:
         model_section["decoder_dropout"] = args.decoder_dropout
+    pretrained = getattr(args, "pretrained", None)
+    if pretrained is not None:
+        model_section["pretrained"] = pretrained
+    checkpoint = getattr(args, "pretrained_checkpoint", None)
+    if checkpoint is not None:
+        model_section["pretrained_checkpoint"] = checkpoint
 
     if args.lr is not None:
         overrides["optim"]["lr"] = args.lr
@@ -131,7 +140,7 @@ def _build_cli_overrides(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Entrenamiento corto del stub multi-stream (demo).",
+        description="Entrenamiento corto del modelo multi-stream validado (demo).",
     )
     parser.add_argument("--config", type=Path, help="Plantilla de configuración JSON o YAML")
     parser.add_argument(
@@ -185,6 +194,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Dropout aplicado dentro del decoder seq2seq",
+    )
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+        help="Identificador de pesos pre-entrenados (single_signer o none)",
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Ruta al checkpoint single_signer ya descargado. Se usa cuando --pretrained"
+            " está activo."
+        ),
     )
     parser.add_argument(
         "--mix-stream",

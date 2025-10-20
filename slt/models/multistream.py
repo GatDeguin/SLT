@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import inspect
 import warnings
 from collections import OrderedDict, defaultdict
@@ -111,6 +112,29 @@ class MultiStreamEncoder(torch.nn.Module):
             for stream in self._stream_to_projector
         }
         self._auto_configure_components()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        preset: str = "single_signer",
+        *,
+        checkpoint_path: Optional[Union[str, os.PathLike[str]]] = None,
+        map_location: Optional[torch.device] = None,
+        strict: bool = True,
+    ) -> "MultiStreamEncoder":
+        """Instantiate the encoder with the validated single-signer weights."""
+
+        if preset != "single_signer":
+            raise ValueError(
+                f"Unknown pretrained preset '{preset}'. Available options: 'single_signer'"
+            )
+        from .single_signer import load_single_signer_encoder
+
+        encoder, metadata, _ = load_single_signer_encoder(
+            checkpoint_path=checkpoint_path, map_location=map_location, strict=strict
+        )
+        setattr(encoder, "pretrained_metadata", metadata)
+        return encoder
 
     def forward(
         self,

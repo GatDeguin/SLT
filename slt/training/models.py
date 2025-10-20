@@ -10,6 +10,7 @@ from torch import nn
 from transformers import AutoConfig, PreTrainedTokenizerBase
 
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig, load_dinov2_backbone
+from slt.models.single_signer import load_single_signer_components
 
 from .configuration import ModelConfig
 
@@ -35,6 +36,23 @@ class MultiStreamClassifier(nn.Module):
 
     def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
         super().__init__()
+
+        pretrained = (config.pretrained or "").strip().lower()
+        if pretrained and pretrained not in {"none", "false"}:
+            if pretrained not in {"single_signer", "single-signer"}:
+                raise ValueError(
+                    "Unsupported pretrained identifier. Only 'single_signer' is available."
+                )
+            encoder, decoder, metadata = load_single_signer_components(
+                tokenizer,
+                checkpoint_path=config.pretrained_checkpoint,
+                map_location=torch.device("cpu"),
+                strict=True,
+            )
+            self.encoder = encoder
+            self.decoder = decoder
+            setattr(self, "pretrained_metadata", metadata)
+            return
 
         vit_config = ViTConfig(image_size=config.image_size)
         temporal_kwargs = {

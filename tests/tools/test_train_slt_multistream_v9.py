@@ -55,6 +55,7 @@ def test_multistream_classifier_forward_with_custom_decoder_config(tmp_path, bat
         decoder_heads=4,
         decoder_dropout=0.0,
         decoder_config=str(config_dir),
+        pretrained="none",
     )
 
     class DummyEncoder(torch.nn.Module):

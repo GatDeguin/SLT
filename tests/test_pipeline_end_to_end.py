@@ -154,6 +154,7 @@ def test_synthetic_pipeline_roundtrip(
         decoder_layers=1,
         decoder_heads=training_cfg["decoder_heads"],
         decoder_dropout=0.0,
+        pretrained="none",
     )
 
     torch.manual_seed(0)

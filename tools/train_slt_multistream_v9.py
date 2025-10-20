@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Command line entry-point to train the multi-stream SLT stub model.
+"""Command line entry-point to fine-tune the validated multi-stream SLT model.
 
 The script wires together the reusable components from :mod:`slt` to
-instantiate the dataset, encoder/decoder pair and the optimisation loop.
-Tokenizer and decoder functionality rely on HuggingFace ``transformers`` so the
-package must be installed alongside PyTorch.
+instantiate the dataset, encoder/decoder pair and the optimisation loop. Por
+defecto intenta cargar los pesos validados del flujo ``single_signer`` cuando el
+checkpoint descargado está disponible localmente; puedes desactivarlos mediante
+``--pretrained none`` o indicar otra ruta con ``--pretrained-checkpoint``.
+Tokenizer y decoder dependen de ``transformers``, por lo que el paquete debe
+estar instalado junto con PyTorch.
 """
 
 from __future__ import annotations
@@ -197,6 +200,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-face-backbone", action="store_true", help="Freeze the face backbone")
     parser.add_argument("--freeze-hand-left-backbone", action="store_true", help="Freeze the left hand backbone")
     parser.add_argument("--freeze-hand-right-backbone", action="store_true", help="Freeze the right hand backbone")
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        help="Pretrained encoder/decoder weights to load (single_signer or none)",
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=Path,
+        help=(
+            "Path to the downloaded single_signer checkpoint used when --pretrained"
+            " is enabled"
+        ),
+    )
     parser.add_argument("--decoder-model", type=str, help="Pretrained decoder model name or path")
     parser.add_argument("--decoder-config", type=str, help="Decoder configuration name or path")
     parser.add_argument(
