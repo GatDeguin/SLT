@@ -129,8 +129,8 @@ el entorno está correctamente configurado.
 
 | Escenario | Métrica | Valor esperado |
 |-----------|---------|----------------|
-| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida inicial (`eval_epoch`) | ≈ 30.09 |
-| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida final tras 3 épocas | ≈ 0.60 |
+| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida inicial (`eval_epoch`) | ≈ 16.10 |
+| Entrenamiento lineal sintético (`tests/training/test_short_loop.py`) | Pérdida final tras 3 épocas | ≈ 0.57 |
 | Exportación encoder (`tests/test_export.py`) | Archivos generados | `encoder_*.onnx`, `encoder_*.ts` |
 
 ## Sustituir los stubs por modelos reales
