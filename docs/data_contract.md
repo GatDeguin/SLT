@@ -1,101 +1,95 @@
-# Contrato de datos LSA-T Multi-Stream
+# Contrato de datos para `single_signer`
 
-Este documento describe los supuestos y requisitos que debe cumplir el pipeline de datos
-para que los componentes de entrenamiento funcionen correctamente.
+Este documento describe los requisitos que debe cumplir el pipeline de datos
+para que las herramientas de entrenamiento, evaluación y exportación funcionen
+sin ajustes manuales. Todas las rutas se asumen relativas a la raíz del
+repositorio, utilizando `data/single_signer/` y el CSV `meta.csv`.
 
-## Estructura de directorios
+## Distribución de carpetas
 
-Cada split debe exponer una carpeta raíz con las siguientes subcarpetas y archivos:
+Cada split debe exponerse con la siguiente estructura:
 
-- `face/`: imágenes RGB (JPEG) con nombre `<video_id>_fXXXXXX.jpg`.
-- `hand_l/` y `hand_r/`: recortes cuadrados de las manos con el mismo patrón de nombre.
-- `pose/`: archivos comprimidos `.npz` con la clave `pose` que almacena un tensor
-  `(num_frames, 3 * landmark_count)` en formato `float32`.
-- CSV principal con columnas `video_id` y `texto` (separadas por `;`).
-- CSV de índices con la lista de `video_id` pertenecientes al split.
+```text
+data/
+  single_signer/
+    processed/
+      face/      # JPEG RGB con patrón <video_id>_fXXXXXX.jpg
+      hand_l/    # Recortes cuadrados de mano izquierda
+      hand_r/    # Recortes cuadrados de mano derecha
+      pose/      # Archivos .npz con tensores (T, 3 * landmarks)
+    index/
+      train.csv
+      val.csv
+      test.csv
+meta.csv          # CSV semicolon con columnas id;texto
+```
 
-Los índices de frame (`XXXXXX`) deben ser consecutivos desde `000000` sin huecos. El
-pipeline de calidad reportará cualquier frame faltante.
+Los índices de frame (`XXXXXX`) deben comenzar en `000000` y avanzar sin huecos.
+Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
 
-## Metadata esperada
+## Metadata obligatoria en `meta.csv`
 
-El CSV principal puede incluir metadatos adicionales por video. Si están presentes, se
-utilizan para controles de calidad:
+- `id`: identificador único del video (coincide con los nombres de archivo).
+- `texto`: transcripción o glosa asociada.
+
+Campos adicionales admitidos y utilizados por los *quality checks* del dataset:
 
 - `fps`: FPS nominal del video original.
-- `duration`: duración del clip (en segundos).
-- `frame_count`: cantidad total de frames generados por el extractor.
+- `duration`: duración en segundos.
+- `frame_count`: cantidad total de frames generados.
 
-Cuando `fps` no está disponible pero `duration` y `frame_count` sí lo están, se infiere
+Cuando `fps` está ausente pero `duration` y `frame_count` existen, se calcula
 `fps = frame_count / duration`.
 
-## Contenido del `SampleItem`
+## Elementos devueltos por `LsaTMultiStream`
 
-El dataset `LsaTMultiStream` devuelve instancias con los siguientes campos:
+Cada ejemplo entregado por el dataset incluye:
 
-- `face`, `hand_l`, `hand_r`: tensores `(T, 3, H, W)` normalizados con ImageNet.
-- `pose`: tensor `(T, 3 * landmarks)` con coordenadas normalizadas.
-- `pose_conf_mask`: máscara booleana `(T, landmarks)` con `True` cuando la confianza
-  supera `min_conf`.
-- `pad_mask`: máscara booleana `(T,)` que marca los pasos de tiempo válidos.
-- `length`: longitud efectiva (`pad_mask.sum()`) considerando todos los streams.
-- `miss_mask_hl` / `miss_mask_hr`: máscaras booleanas que indican frames con detección
-  válida de mano izquierda/derecha.
-- `quality`: diccionario con `effective_length`, métricas de FPS y frames faltantes.
-- `text`: glosa asociada.
-- `video_id`: identificador del clip.
+- `face`, `hand_l`, `hand_r`: tensores `(T, 3, H, W)` normalizados con medias y
+  desviaciones de ImageNet.
+- `pose`: tensor `(T, 3 * landmarks)` con poses reescaladas a `[-1, 1]`.
+- `pose_conf_mask`: máscara booleana `(T, landmarks)` para filtrar poses
+  inestables.
+- `pad_mask`: máscara booleana `(T,)` con los frames válidos tras truncado.
+- `length`: longitud efectiva calculada como `pad_mask.sum()`.
+- `miss_mask_hl` / `miss_mask_hr`: marcan frames sin detección confiable de
+  manos.
+- `quality`: diccionario con métricas de FPS, frames perdidos y longitud
+  efectiva.
+- `text` y `video_id`: valores originales del CSV.
 
-## Controles de calidad
+## Validaciones automáticas
 
-El dataset ejecuta validaciones automáticas:
+El dataset ejecuta controles de calidad al cargar cada video:
 
-- **Frames faltantes**: detecta saltos en la numeración por stream. Dependiendo de la
-  configuración (`quality_strict`), puede emitir `warnings` o detener la carga.
-- **FPS**: calcula FPS efectivo a partir de la metadata y lo compara con el FPS esperado.
-  Si la diferencia supera `fps_tolerance`, se genera una alerta.
-- **Longitud efectiva**: se calcula como el mínimo número de frames disponible entre
-  los streams (cara, manos, pose) acotado por `T`.
+1. **Frames faltantes:** detecta saltos en la numeración de cada stream y decide
+   si continuar (modo laxo) o lanzar una excepción (`quality_strict=True`).
+2. **FPS efectivo:** compara el FPS estimado (`frame_count / duration`) con el
+   declarado en metadata. Las discrepancias mayores a la tolerancia generan
+   advertencias.
+3. **Longitud efectiva:** sincroniza cara, manos y pose tomando el mínimo número
+   de frames válido y aplicando `T` como límite superior.
+4. **Máscaras de confianza:** recalcula `pose_conf_mask` según el umbral
+   configurado (`pose_min_conf`).
 
-El campo `quality` permite registrar los resultados de estas validaciones para
-post-procesamiento o auditoría.
+Los resultados se almacenan en `quality` para auditoría posterior.
 
-## Augmentations
+## Recomendaciones para extracción de ROIs
 
-El flip horizontal sincronizado entre cara, manos y pose se activa únicamente cuando
-`enable_flip=True` y se aplica con probabilidad `flip_prob`. El flip intercambia manos,
-refleja el esqueleto y reordena la máscara de confianza.
+- Utiliza `tools/extract_rois_v2.py` con los videos en
+  `data/single_signer/videos/` y el CSV `meta.csv`.
+- Define `--output data/single_signer/processed` para que los nombres coincidan
+  con este contrato.
+- Guarda el `metadata.jsonl` generado: permite reintentar videos fallidos y
+  verificar métricas como FPS de origen, `stride` aplicado y cantidad de frames
+  escritos.
 
-## Persistencia generada por el extractor
+## Validación en CI o entornos limpios
 
-El script `tools/extract_rois_v2.py` genera crops y un archivo `metadata.jsonl` por
-sesión (ruta configurable). Cada entrada de metadata contiene:
-
-- nombre del video y ruta original,
-- FPS origen, objetivo y límite aplicado,
-- `stride` usado para muestreo,
-- cantidad de frames escritos y vectores de pose,
-- bandera `success` y descripción de error si aplica.
-
-Esta metadata permite reanudar ejecuciones (`--resume`) y auditar errores puntuales.
-
-## Flujo de trabajo recomendado
-
-1. **Instalación**: crea un entorno virtual e instala `requirements-dev.txt` para
-   disponer del paquete `slt`, PyTorch y las herramientas de desarrollo
-   utilizadas en CI (`pytest`, `ruff`, `black`, `mypy`, `onnx`).
-2. **Preparación de datos**: ejecuta `tools/extract_rois_v2.py` con los videos
-   brutos para generar `face/`, `hand_l/`, `hand_r/` y `pose/`; construye los
-   CSV de metadata y splits siguiendo la estructura anterior.
-3. **Entrenamiento**: utiliza `python -m slt` para un *smoke test* rápido o
-   `tools/train_slt_multistream_v9.py` para sesiones largas. Ambos scripts
-   consumen `LsaTMultiStream` y respetan los campos detallados en este contrato.
-4. **Evaluación**: ejecuta `tools/eval_slt_multistream_v9.py` con el checkpoint y
-   los splits de validación/prueba para obtener CER, BLEU y pérdida agregada.
-5. **Exportación y despliegue**: genera artefactos ONNX/TorchScript con
-   `tools/export_onnx_encoder_v9.py` y valida la inferencia en tiempo real usando
-   `tools/demo_realtime_multistream.py` o `tools/test_realtime_pipeline.py`.
-
-Los tests automatizados (`tests/data/`, `tests/models/`, `tests/training/` y
-`tests/test_cli_main.py`) replican este flujo a escala reducida. Consulta la
-tabla de métricas en el `README.md` para conocer los valores esperados que
-servirán como referencia durante la verificación del entorno.
+1. Ejecuta `python tools/ci_validate_data_contract.py` para generar un dataset
+   sintético que replica la estructura anterior y confirma que los *quality
+   checks* permanecen activos.
+2. Corre `pytest tests/data/test_dataset_quality.py` para asegurar que los
+   avisos y excepciones se comportan como lo documentado.
+3. Mantén sincronizados los ejemplos de rutas con el README cuando cambies
+   directorios o nombres de archivos.

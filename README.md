@@ -1,139 +1,121 @@
-# SLT — Demo de entrenamiento
+# SLT — Pipeline multi-stream para `single_signer`
 
-Este repositorio reúne los componentes mínimos para entrenar y evaluar el stub
-multi-stream sobre el conjunto `single_signer`. El paquete expone una CLI
-(`python -m slt`) que arma el dataset a partir de `meta.csv`, ejecuta un ciclo
-de entrenamiento breve y guarda los checkpoints resultantes. La documentación
-en `docs/` amplía cada etapa y el archivo [AGENTS.md](AGENTS.md) resume las
-normas de contribución.
+Este repositorio agrupa las utilidades necesarias para preparar datos, entrenar,
+evaluar y exportar el stub multi-stream incluido en el paquete `slt`. Los
+scripts están pensados como un flujo de referencia sobre el dataset
+`single_signer`, cuyo CSV de subtítulos principal es `meta.csv`.
+
+## Contenido del repositorio
+
+- Paquete `slt/` con el dataset `LsaTMultiStream`, el encoder
+  `MultiStreamEncoder`, envoltorios de entrenamiento y funciones auxiliares.
+- Herramientas en `tools/` para extracción de ROIs, entrenamiento completo,
+  evaluación, exportación y demos en tiempo real.
+- Documentación detallada en `docs/` con contratos de datos, guías operativas y
+  manuales de preentrenamiento.
+- Tests de humo en `tests/` que cubren el pipeline extremo a extremo utilizando
+  datasets sintéticos.
+
+Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
+`docs/pretraining.md` para ampliar cada etapa.
 
 ## Instalación
 
-Configura un entorno virtual y utiliza el archivo de requisitos para instalar
-las dependencias obligatorias y opcionales.
+Configura un entorno virtual, instala PyTorch compatible con tu hardware y
+aplica los requisitos de desarrollo.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # En Windows utiliza `.venv\Scripts\activate`
+source .venv/bin/activate  # En Windows usa .venv\\Scripts\\activate
 python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
-`requirements-dev.txt` instala el paquete en modo editable y habilita los extras
-registrados en `pyproject.toml`:
+`requirements-dev.txt` instala el paquete en modo editable junto con las
+siguientes dependencias opcionales:
 
 | Extra | Propósito |
 |-------|-----------|
-| `media` | Seguimiento facial y de manos con MediaPipe para extracción de ROI. |
-| `metrics` | Cálculo de métricas (BLEU, CHRF, CER) durante la evaluación. |
-| `export` | Exportación del encoder a ONNX y TorchScript. |
+| `media` | Seguimiento facial/manos con MediaPipe para `tools/extract_rois_v2.py`. |
+| `metrics` | Cálculo de BLEU, ChrF, CER y WER durante la evaluación. |
+| `export` | Exportación ONNX/TorchScript y validación en tiempo real. |
 
-Si prefieres instalarlos de forma explícita puedes ejecutar
-`pip install .[media,metrics,export]` tras la instalación base.
+También puedes instalarlos en pasos separados con `pip install .[media,metrics,export]`.
 
-## Flujo completo con `single_signer`
+## Preparación de datos (`data/single_signer`)
 
-Los ejemplos utilizan el directorio `data/single_signer/` como destino para los
-artefactos intermedios. Asegúrate de que `meta.csv` (incluido en el repositorio)
-se encuentre en la raíz del proyecto o ajusta las rutas según tu estructura.
-
-1. **Organiza los vídeos fuente** en `data/single_signer/videos/`.
-2. **Extrae las regiones de interés** con MediaPipe para generar los streams
-   sincronizados:
-
+1. Crea la estructura base dentro de `data/single_signer/`:
+   ```text
+   data/
+     single_signer/
+       videos/           # Clips fuente en MP4/MKV
+       processed/
+         face/
+         hand_l/
+         hand_r/
+         pose/
+       index/
+         train.csv
+         val.csv
+         test.csv
+   meta.csv              # CSV con columnas id;texto
+   ```
+2. Copia los videos originales en `data/single_signer/videos/`.
+3. Ejecuta la extracción de regiones de interés para rostro, manos y pose:
    ```bash
    python tools/extract_rois_v2.py \
      --videos data/single_signer/videos \
      --output data/single_signer/processed \
      --metadata meta.csv
    ```
-
-   Este paso crea las carpetas `face/`, `hand_l/`, `hand_r/` y `pose/` dentro de
-   `data/single_signer/processed/` y normaliza los recortes.
-3. **Construye los splits** a partir de `meta.csv`. Un ejemplo rápido para
-   generar particiones pequeñas es:
-
+   El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
+   `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
+   fuese necesario.
+4. Construye los splits desde `meta.csv` según tus criterios. Un ejemplo mínimo:
    ```bash
    python - <<'PY'
    from pathlib import Path
-
    import pandas as pd
 
    meta = pd.read_csv('meta.csv', sep=';')
-   ids = meta['id'].unique()[:12]
-   train, val, test = ids[:8], ids[8:10], ids[10:12]
-
+   ids = meta['id'].unique()
    out_dir = Path('data/single_signer/index')
    out_dir.mkdir(parents=True, exist_ok=True)
-
-   for split, values in {'train': train, 'val': val, 'test': test}.items():
-       pd.Series(values, name='video_id').to_csv(out_dir / f'{split}.csv', index=False)
+   pd.Series(ids[:80]).to_csv(out_dir / 'train.csv', index=False)
+   pd.Series(ids[80:90]).to_csv(out_dir / 'val.csv', index=False)
+   pd.Series(ids[90:]).to_csv(out_dir / 'test.csv', index=False)
    PY
    ```
 
-4. **Ejecuta el entrenamiento demo** con la CLI empaquetada:
+El contrato de datos completo se detalla en `docs/data_contract.md`.
 
-   ```bash
-   python -m slt \
-     --face-dir data/single_signer/processed/face \
-     --hand-left-dir data/single_signer/processed/hand_l \
-     --hand-right-dir data/single_signer/processed/hand_r \
-     --pose-dir data/single_signer/processed/pose \
-     --metadata-csv meta.csv \
-     --train-index data/single_signer/index/train.csv \
-     --val-index data/single_signer/index/val.csv \
-     --work-dir work_dirs/single_signer_demo \
-     --epochs 2 --batch-size 2 --sequence-length 32
-   ```
+## Entrenamiento rápido (`python -m slt`)
 
-   El comando crea `last.pt` y `best.pt` en el directorio indicado, junto con un
-   `config.json` que captura los parámetros efectivos.
-
-Para configuraciones más extensas utiliza `tools/train_slt_multistream_v9.py`.
-La guía en `docs/train_slt_multistream_v9.md` cubre los parámetros disponibles y
-las recomendaciones de optimización.
-
-## Plantillas de configuración y `--set`
-
-La CLI acepta plantillas JSON/YAML mediante `--config`. Esto permite conservar un
-esquema reproducible y versionar hiperparámetros junto con el código. Por
-ejemplo, guarda el siguiente contenido como `configs/demo.yml`:
-
-```yaml
-data:
-  face_dir: data/single_signer/processed/face
-  hand_left_dir: data/single_signer/processed/hand_l
-  hand_right_dir: data/single_signer/processed/hand_r
-  pose_dir: data/single_signer/processed/pose
-  metadata_csv: meta.csv
-  train_index: data/single_signer/index/train.csv
-  val_index: data/single_signer/index/val.csv
-  work_dir: work_dirs/single_signer_demo
-  batch_size: 2
-model:
-  sequence_length: 32
-  image_size: 224
-optim:
-  lr: 0.001
-training:
-  epochs: 2
-```
-
-Ejecuta el entrenamiento leyendo la plantilla y sobreescribe parámetros puntuales
-con `--set seccion.clave=valor` cuando necesites probar variantes rápidas:
+La CLI empaquetada ejecuta un entrenamiento corto para verificar el pipeline:
 
 ```bash
-python -m slt --config configs/demo.yml --set optim.batch_size=4 --set optim.lr=5e-4
+python -m slt \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --pose-dir data/single_signer/processed/pose \
+  --metadata-csv meta.csv \
+  --train-index data/single_signer/index/train.csv \
+  --val-index data/single_signer/index/val.csv \
+  --work-dir work_dirs/single_signer_demo \
+  --epochs 2 --batch-size 2 --sequence-length 32 \
+  --tokenizer hf-internal-testing/tiny-random-T5
 ```
 
-Los cambios efectivos quedan registrados en `work_dir/config.json`, lo que
-facilita auditar el origen de cada experimento. Consulta `docs/data_contract.md`
-para revisar la estructura de datos esperada por estos comandos.
+El comando guarda `last.pt`, `best.pt` y `config.json` dentro de `work_dir`.
+
+Para sesiones largas utiliza `tools/train_slt_multistream_v9.py`, que expone
+reanudación, *mixup* por stream y compatibilidad con plantillas YAML/JSON.
+Consulta `docs/train_slt_multistream_v9.md` para conocer todos los parámetros.
 
 ## Evaluación
 
-Evalúa el checkpoint más reciente y genera predicciones alineadas con los textos
-referencia del CSV.
+Evalúa uno o varios checkpoints y genera predicciones, métricas y reportes:
 
 ```bash
 python tools/eval_slt_multistream_v9.py \
@@ -148,18 +130,12 @@ python tools/eval_slt_multistream_v9.py \
   --output-csv work_dirs/single_signer_demo/predictions/preds.csv
 ```
 
-Además del CSV de predicciones, la carpeta de salida contiene `report.json` y
-`report.csv` con BLEU, CHRF y CER cuando se instala el extra `metrics`.
+Los archivos `report.json` y `report.csv` resultantes pueden integrarse en
+herramientas analíticas mediante `docs/metrics_dashboard_integration.py`.
 
-> **Nota:** el decoder textual debe provenir de un checkpoint T5/BART entrenado
-> para la tarea. El tamaño oculto (`d_model`) del checkpoint tiene que coincidir
-> con el `--d-model` del encoder multi-stream; de lo contrario la carga del
-> modelo fallará.
+## Exportación y demos en tiempo real
 
-## Exportación y despliegue
-
-Exporta el encoder multi-stream a formatos ligeros para integrarlo en demos en
-vivo o servicios de inferencia.
+Convierte el encoder a ONNX o TorchScript para ejecutarlo fuera de PyTorch:
 
 ```bash
 python tools/export_onnx_encoder_v9.py \
@@ -169,40 +145,49 @@ python tools/export_onnx_encoder_v9.py \
   --image-size 224 --sequence-length 64 --d-model 512
 ```
 
-Valida los artefactos con `tools/demo_realtime_multistream.py` o
-`tools/test_realtime_pipeline.py`. Ambos aceptan modelos TorchScript u ONNX y un
-tokenizer de HuggingFace para reconstruir los textos.
+Valida los artefactos con `tools/demo_realtime_multistream.py` (webcam) o
+`tools/test_realtime_pipeline.py` (video en disco). Ambos aceptan modelos
+TorchScript/ONNX y tokenizadores de HuggingFace. Si no se especifica un modelo,
+usarán el stub embebido para depuración rápida.
 
-## Métricas de control
+## Preentrenamiento de backbones
 
-Las pruebas automatizadas actúan como chequeos de humo para verificar el
-pipeline completo:
+`tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py` permiten obtener
+pesos auto-supervisados compatibles con `load_dinov2_backbone`. Sigue la guía en
+`docs/pretraining.md` para exportar los backbones y conectarlos con el flujo de
+entrenamiento principal.
 
-| Escenario | Archivo de prueba | Resultado |
-|-----------|-------------------|-----------|
-| Entrenamiento sintético | `tests/training/test_short_loop.py` | Pérdida cae tras 3 épocas. |
-| Exportación de encoder | `tests/test_export.py` | ONNX y TorchScript generados en disco. |
-| Eval. multistream | `tests/tools/test_eval_slt_multistream_v9.py` | Predicciones y BLEU. |
+## Control de calidad y pruebas
 
-Ejecuta `pytest`, `ruff check .`, `black --check .` y `mypy` antes de enviar
-cambios para garantizar consistencia con la CI.
+Los tests automatizados validan piezas clave del pipeline:
 
-## Demos en tiempo real y pruebas offline
+| Escenario | Prueba | Resultado esperado |
+|-----------|--------|--------------------|
+| Datos sintéticos end-to-end | `tests/test_pipeline_end_to_end.py` | Pérdida cae y exporta encoder. |
+| CLI de demo | `tests/test_cli_main.py` | Ejecuta entrenamiento corto sin errores. |
+| Exportación | `tests/test_export.py` | Genera y valida ONNX/TorchScript. |
+| Calidad de datos | `tests/data/test_dataset_quality.py` | Detecta frames faltantes y FPS. |
 
-Los scripts en `tools/` permiten ejecutar el encoder y decoder entrenados sobre
-videos en vivo o grabados:
+Ejecuta `pytest`, `ruff check .`, `black --check .` y `mypy` antes de subir
+cambios.
 
-- `tools/demo_realtime_multistream.py`: captura desde cámara web, realiza el
-  seguimiento con MediaPipe y muestra la traducción en un overlay de OpenCV.
-- `tools/test_realtime_pipeline.py`: procesa un archivo de vídeo y puede crear
-  un MP4 anotado para depurar el pipeline sin cámara.
+## Estructura de carpetas
 
-Ambos scripts aceptan modelos TorchScript u ONNX exportados desde el pipeline y
-tokenizers de HuggingFace para decodificar el texto.
+```text
+slt/                 # Paquete instalable con encoder, dataset y utilidades
+  data/
+  models/
+  training/
+  runtime/
+  utils/
+tools/               # Scripts CLI para extracción, entrenamiento, evaluación, demos
+docs/                # Guías de datos, operación, preentrenamiento y métricas
+tests/               # Suite de smoke tests y fixtures sintéticas
+meta.csv             # CSV de subtítulos de `single_signer`
+```
 
-## Preentrenamiento con DINO/iBOT
+## Soporte y aportes
 
-`tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py` permiten generar
-pesos auto-supervisados compatibles con `load_dinov2_backbone`. La guía en
-`docs/pretraining.md` detalla las configuraciones disponibles y la integración
-con `MultiStreamEncoder`.
+Abre *issues* o PRs describiendo claramente el componente afectado (datos,
+entrenamiento, exportación, demos). Acompaña los cambios con actualizaciones en
+la documentación cuando modifiques rutas, argumentos o artefactos generados.

@@ -1,7 +1,7 @@
-# Paquete editable con extras opcionales
+# Instalación editable del paquete con extras comunes
 -e .[media,metrics,export]
 
-# Pruebas y control de calidad
+# Herramientas de pruebas y formato utilizadas en CI
 pytest>=7.4
 pytest-cov>=4.1
 black>=24.0
