@@ -1,93 +1,174 @@
 """Utilities to build optimizers and learning-rate schedulers."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import importlib
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Type
 
 import torch
 from torch.optim import Optimizer
+from torch.optim import lr_scheduler as schedulers
+
+OptimizerConfig = Mapping[str, Any]
+SchedulerConfig = Mapping[str, Any]
+
+_OPTIMIZER_ALIASES: Dict[str, str] = {
+    "adamw": "AdamW",
+    "adam": "Adam",
+    "sgd": "SGD",
+    "adamax": "Adamax",
+    "adadelta": "Adadelta",
+    "adagrad": "Adagrad",
+    "rmsprop": "RMSprop",
+}
+
+_SCHEDULER_ALIASES: Dict[str, str] = {
+    "steplr": "StepLR",
+    "multistep": "MultiStepLR",
+    "multisteplr": "MultiStepLR",
+    "cosine": "CosineAnnealingLR",
+    "cosineannealing": "CosineAnnealingLR",
+    "cosineannealinglr": "CosineAnnealingLR",
+    "onecycle": "OneCycleLR",
+    "onecyclelr": "OneCycleLR",
+}
+
+
+def _import_object(path: str) -> Any:
+    module_name, _, attribute = path.rpartition(".")
+    if not module_name:
+        raise ValueError(f"Fully qualified path required, got '{path}'")
+    module = importlib.import_module(module_name)
+    try:
+        return getattr(module, attribute)
+    except AttributeError as exc:  # pragma: no cover - defensive
+        raise AttributeError(f"Module '{module_name}' has no attribute '{attribute}'") from exc
+
+
+def _resolve_class(
+    name: str,
+    base_module: Any,
+    aliases: Mapping[str, str],
+) -> Type[Any]:
+    candidate = name
+    if "." in name:
+        return _import_object(name)
+
+    lookup = name.lower()
+    if lookup in aliases:
+        candidate = aliases[lookup]
+
+    if hasattr(base_module, candidate):
+        return getattr(base_module, candidate)
+
+    for attr in dir(base_module):
+        if attr.lower() == lookup:
+            return getattr(base_module, attr)
+
+    raise ValueError(f"Unknown class '{name}' in module '{base_module.__name__}'")
+
+
+def _normalize_config(config: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
+    if config is None:
+        return {}
+    if not isinstance(config, Mapping):
+        raise TypeError("Configuration must be a mapping")
+    return config
+
+
+def _build_optimizer(
+    params: Any,
+    config: Mapping[str, Any],
+) -> Optimizer:
+    config = dict(config)
+    opt_name = config.pop("target", config.pop("type", "adamw"))
+    if not isinstance(opt_name, str):
+        raise TypeError("Optimizer 'type' must be a string")
+
+    optimizer_cls = _resolve_class(opt_name, torch.optim, _OPTIMIZER_ALIASES)
+
+    param_groups = config.pop("param_groups", None)
+    kwargs = config
+
+    if param_groups is not None:
+        if not isinstance(param_groups, Iterable):
+            raise TypeError("'param_groups' must be an iterable of dicts")
+        groups = []
+        for group in param_groups:
+            if not isinstance(group, Mapping):
+                raise TypeError("Each param_group must be a mapping")
+            group_dict = dict(group)
+            if "params" not in group_dict:
+                raise KeyError("Each param_group must define 'params'")
+            groups.append(group_dict)
+        return optimizer_cls(groups, **kwargs)
+
+    return optimizer_cls(params, **kwargs)
+
+
+def _build_scheduler(
+    optimizer: Optimizer,
+    config: Optional[Mapping[str, Any]],
+):
+    if not config:
+        return None
+
+    cfg = dict(config)
+    sched_name = cfg.pop("target", cfg.pop("type", None))
+    if sched_name is None:
+        return None
+    if not isinstance(sched_name, str):
+        raise TypeError("Scheduler 'type' must be a string")
+
+    scheduler_cls = _resolve_class(sched_name, schedulers, _SCHEDULER_ALIASES)
+    kwargs = cfg
+    return scheduler_cls(optimizer, **kwargs)
+
+
+def build_optimizer_and_scheduler(
+    params: Any,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Optimizer, Optional[Any]]:
+    """Create optimizer and scheduler from a declarative configuration.
+
+    Parameters
+    ----------
+    params:
+        Iterable of parameters or parameter groups for the optimizer.
+    config:
+        Mapping with ``optimizer`` and optional ``scheduler`` sections. The
+        structure is designed to be JSON/YAML friendly and supports either
+        built-in optimizer names (``"adamw"``) or fully-qualified targets such
+        as ``"torch.optim.AdamW"``.
+    """
+
+    config = _normalize_config(config)
+    if "optimizer" in config:
+        optimizer_cfg = config["optimizer"]
+    else:
+        optimizer_cfg = config
+
+    optimizer = _build_optimizer(params, _normalize_config(optimizer_cfg))
+
+    scheduler_cfg = config.get("scheduler") if isinstance(config, Mapping) else None
+    scheduler = _build_scheduler(optimizer, _normalize_config(scheduler_cfg))
+
+    return optimizer, scheduler
 
 
 def create_optimizer(
     params: Any,
-    config: Optional[Dict[str, Any]] = None,
+    config: Optional[OptimizerConfig] = None,
 ) -> Optimizer:
     """Instantiate an optimizer based on a configuration dictionary."""
-    if config is None:
-        config = {}
-    opt_type = config.get("type", "adamw").lower()
-    lr = config.get("lr", 1e-3)
-    weight_decay = config.get("weight_decay", 0.0)
 
-    if opt_type == "adamw":
-        betas = config.get("betas", (0.9, 0.999))
-        eps = config.get("eps", 1e-8)
-        return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-    if opt_type == "adam":
-        betas = config.get("betas", (0.9, 0.999))
-        eps = config.get("eps", 1e-8)
-        return torch.optim.Adam(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-    if opt_type == "sgd":
-        momentum = config.get("momentum", 0.0)
-        nesterov = config.get("nesterov", False)
-        dampening = config.get("dampening", 0.0)
-        return torch.optim.SGD(
-            params,
-            lr=lr,
-            momentum=momentum,
-            dampening=dampening,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-        )
-    raise ValueError(f"Unsupported optimizer type: {config['type']!r}")
+    optimizer, _ = build_optimizer_and_scheduler(params, _normalize_config(config))
+    return optimizer
 
 
 def create_scheduler(
     optimizer: Optimizer,
-    config: Optional[Dict[str, Any]] = None,
+    config: Optional[SchedulerConfig] = None,
 ):
-    """Create a scheduler from configuration.
+    """Create a scheduler from configuration."""
 
-    Returns ``None`` when no scheduler type is supplied.
-    """
-    if not config:
-        return None
-
-    sched_type = config.get("type")
-    if sched_type is None:
-        return None
-    sched_type = sched_type.lower()
-
-    if sched_type == "steplr":
-        step_size = config.get("step_size", 1)
-        gamma = config.get("gamma", 0.1)
-        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-    if sched_type == "multistep":
-        milestones = config.get("milestones")
-        if milestones is None:
-            raise ValueError("'milestones' must be provided for MultiStepLR")
-        gamma = config.get("gamma", 0.1)
-        return torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
-    if sched_type == "cosine":
-        t_max = config.get("t_max")
-        if t_max is None:
-            raise ValueError("'t_max' must be provided for CosineAnnealingLR")
-        eta_min = config.get("eta_min", 0.0)
-        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
-    if sched_type == "onecycle":
-        max_lr = config.get("max_lr")
-        steps_per_epoch = config.get("steps_per_epoch")
-        epochs = config.get("epochs")
-        if None in {max_lr, steps_per_epoch, epochs}:
-            raise ValueError("'max_lr', 'steps_per_epoch', and 'epochs' are required for OneCycleLR")
-        pct_start = config.get("pct_start", 0.3)
-        anneal_strategy = config.get("anneal_strategy", "cos")
-        return torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lr,
-            steps_per_epoch=steps_per_epoch,
-            epochs=epochs,
-            pct_start=pct_start,
-            anneal_strategy=anneal_strategy,
-        )
-
-    raise ValueError(f"Unsupported scheduler type: {config['type']!r}")
+    return _build_scheduler(optimizer, _normalize_config(config))
