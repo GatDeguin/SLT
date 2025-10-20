@@ -2,22 +2,45 @@
 
 from __future__ import annotations
 
+import ctypes
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, Sequence, Tuple
 
 import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("cv2", exc_type=ImportError, reason="cv2 runtime dependencies not available")
+if "cv2" not in sys.modules:
+    mock_cv2 = types.ModuleType("cv2")
+    mock_cv2.COLOR_BGR2RGB = 0
+    mock_cv2.INTER_LINEAR = 1
+
+    def _mock_cvt_color(image: np.ndarray, code: int) -> np.ndarray:
+        if code != mock_cv2.COLOR_BGR2RGB:  # pragma: no cover - defensive
+            raise ValueError("Unsupported conversion code")
+        return image[..., ::-1]
+
+    def _mock_resize(image: np.ndarray, size: Sequence[int], interpolation: int | None = None) -> np.ndarray:
+        width, height = size
+        if image.ndim == 3:
+            channels = image.shape[2]
+            return np.zeros((height, width, channels), dtype=image.dtype)
+        return np.zeros((height, width), dtype=image.dtype)
+
+    mock_cv2.cvtColor = _mock_cvt_color
+    mock_cv2.resize = _mock_resize
+    sys.modules["cv2"] = mock_cv2
 
 from slt.runtime.realtime import (
     OnnxRuntimeEncoderRunner,
     TemporalBuffer,
+    TensorRTEncoderRunner,
     TorchScriptEncoderRunner,
     load_export_metadata,
 )
-from tools.export_onnx_encoder_v9 import EncoderExportModule, _build_encoder, main_export
 
 
 def _encoder_args() -> SimpleNamespace:
@@ -72,6 +95,15 @@ def test_temporal_buffer_latency_masks() -> None:
 
 
 def test_runtime_backends_integration(tmp_path: Path) -> None:
+    pytest.importorskip("cv2", exc_type=ImportError, reason="cv2 runtime dependencies not available")
+    try:
+        from tools.export_onnx_encoder_v9 import (
+            EncoderExportModule,
+            _build_encoder,
+            main_export,
+        )
+    except Exception as exc:  # pragma: no cover - entorno sin dependencias de exportación
+        pytest.skip(f"Export tooling unavailable: {exc}")
     encoder_args = _encoder_args()
     encoder = _build_encoder(encoder_args)
     encoder.eval()
@@ -190,3 +222,214 @@ def test_runtime_backends_integration(tmp_path: Path) -> None:
     assert len(onnx_outputs) == len(reference)
     for ref_tensor, ort_out in zip(reference, onnx_outputs):
         np.testing.assert_allclose(ort_out, ref_tensor.detach().cpu().numpy(), rtol=1e-4, atol=1e-4)
+
+
+def test_tensorrt_runner_with_mock_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ejecuta el runner TensorRT con motores simulados y verifica conversiones."""
+
+    memory: Dict[int, bytearray] = {}
+    next_ptr = 1
+
+    cuda_pkg = types.ModuleType("cuda")
+    cudart_mod = types.ModuleType("cuda.cudart")
+
+    class _MemcpyKind:
+        cudaMemcpyHostToDevice = 1
+        cudaMemcpyDeviceToHost = 2
+
+    def _cuda_stream_create() -> Tuple[int, int]:
+        return 0, 7
+
+    def _cuda_stream_sync(stream: int) -> int:
+        assert stream == 7
+        return 0
+
+    def _cuda_malloc(size: int) -> Tuple[int, int]:
+        nonlocal next_ptr
+        ptr = next_ptr
+        next_ptr += 1
+        memory[ptr] = bytearray(size)
+        return 0, ptr
+
+    def _cuda_free(ptr: int) -> int:
+        memory.pop(ptr, None)
+        return 0
+
+    def _cuda_memcpy_async(dst: int, src: int, size: int, kind: int, stream: int) -> int:
+        assert stream == 7
+        if kind == _MemcpyKind.cudaMemcpyHostToDevice:
+            data = ctypes.string_at(src, size)
+            memory[dst][:] = data
+        elif kind == _MemcpyKind.cudaMemcpyDeviceToHost:
+            data = bytes(memory[src][:size])
+            ctypes.memmove(dst, data, size)
+        else:  # pragma: no cover - defensive
+            raise AssertionError("Unsupported memcpy direction")
+        return 0
+
+    cudart_mod.cudaMemcpyKind = _MemcpyKind
+    cudart_mod.cudaStreamCreate = _cuda_stream_create
+    cudart_mod.cudaStreamSynchronize = _cuda_stream_sync
+    cudart_mod.cudaMalloc = _cuda_malloc
+    cudart_mod.cudaFree = _cuda_free
+    cudart_mod.cudaMemcpyAsync = _cuda_memcpy_async
+    cudart_mod._memory = memory
+    cuda_pkg.cudart = cudart_mod
+
+    monkeypatch.setitem(sys.modules, "cuda", cuda_pkg)
+    monkeypatch.setitem(sys.modules, "cuda.cudart", cudart_mod)
+
+    trt_mod = types.ModuleType("tensorrt")
+
+    class _FakeLogger:
+        WARNING = 1
+
+        def __init__(self, level: int) -> None:
+            self.level = level
+
+    class _FakeRuntime:
+        def __init__(self, logger: _FakeLogger) -> None:
+            self.logger = logger
+
+        def deserialize_cuda_engine(self, _: bytes) -> "_FakeEngine":
+            return _FakeEngine()
+
+    class _DataType:
+        FLOAT = "float32"
+        BOOL = "bool"
+
+    def _nptype(dtype: str) -> np.dtype[Any]:
+        return np.float32 if dtype == _DataType.FLOAT else np.bool_
+
+    def _volume(shape: Sequence[int]) -> int:
+        prod = 1
+        for dim in shape:
+            prod *= dim
+        return prod
+
+    class _FakeContext:
+        def __init__(self, engine: "_FakeEngine") -> None:
+            self.engine = engine
+            self._binding_shapes = dict(engine._binding_shapes)
+            self.captured_inputs: Dict[str, np.ndarray] = {}
+
+        def set_binding_shape(self, index: int, shape: Sequence[int]) -> bool:
+            self._binding_shapes[index] = tuple(shape)
+            return True
+
+        def get_binding_shape(self, index: int) -> Tuple[int, ...]:
+            return self._binding_shapes[index]
+
+        def execute_async_v2(self, bindings: Sequence[int], stream_handle: int) -> bool:
+            assert stream_handle == 7
+            for index, (name, is_input, dtype, _) in enumerate(self.engine._bindings):
+                buffer = cudart_mod._memory[bindings[index]]
+                np_dtype = _nptype(dtype)
+                shape = self._binding_shapes[index]
+                if is_input:
+                    array = np.frombuffer(buffer, dtype=np_dtype).reshape(shape).copy()
+                    self.captured_inputs[name] = array
+                else:
+                    value = np.full(shape, index, dtype=np_dtype)
+                    buffer[: value.nbytes] = value.tobytes()
+            return True
+
+    class _FakeEngine:
+        _bindings = [
+            ("face", True, _DataType.FLOAT, (1, 4, 3, 8, 8)),
+            ("hand_l", True, _DataType.FLOAT, (1, 4, 3, 8, 8)),
+            ("hand_r", True, _DataType.FLOAT, (1, 4, 3, 8, 8)),
+            ("pose", True, _DataType.FLOAT, (1, 4, 15)),
+            ("pad_mask", True, _DataType.BOOL, (1, 4)),
+            ("miss_mask_hl", True, _DataType.BOOL, (1, 4)),
+            ("miss_mask_hr", True, _DataType.BOOL, (1, 4)),
+            ("encoded", False, _DataType.FLOAT, (1, 4, 16)),
+            ("face_head", False, _DataType.FLOAT, (1, 4, 8)),
+            ("hand_left_head", False, _DataType.FLOAT, (1, 4, 8)),
+            ("hand_right_head", False, _DataType.FLOAT, (1, 4, 8)),
+            ("pose_head", False, _DataType.FLOAT, (1, 4, 8)),
+            ("hand_mask", False, _DataType.FLOAT, (1, 4)),
+            ("padding_mask", False, _DataType.FLOAT, (1, 4)),
+        ]
+
+        def __init__(self) -> None:
+            self.num_bindings = len(self._bindings)
+            self._binding_shapes = {
+                index: binding[3] for index, binding in enumerate(self._bindings)
+            }
+
+        def create_execution_context(self) -> _FakeContext:
+            return _FakeContext(self)
+
+        def get_binding_name(self, index: int) -> str:
+            return self._bindings[index][0]
+
+        def binding_is_input(self, index: int) -> bool:
+            return self._bindings[index][1]
+
+        def get_binding_dtype(self, index: int) -> str:
+            return self._bindings[index][2]
+
+        def get_binding_shape(self, index: int) -> Tuple[int, ...]:
+            return self._binding_shapes[index]
+
+    trt_mod.Logger = _FakeLogger
+    trt_mod.Runtime = _FakeRuntime
+    trt_mod.DataType = _DataType
+    trt_mod.nptype = _nptype
+    trt_mod.volume = _volume
+
+    monkeypatch.setitem(sys.modules, "tensorrt", trt_mod)
+
+    engine_path = tmp_path / "encoder.plan"
+    engine_path.write_bytes(b"fake-tensorrt-engine")
+
+    metadata = {
+        "inputs": {
+            "face": {"dtype": "float32"},
+            "hand_l": {"dtype": "float32"},
+            "hand_r": {"dtype": "float32"},
+            "pose": {"dtype": "float32"},
+            "pad_mask": {"dtype": "bool"},
+            "miss_mask_hl": {"dtype": "bool"},
+            "miss_mask_hr": {"dtype": "bool"},
+        },
+        "outputs": {
+            "encoded": {"dtype": "float32"},
+            "face_head": {"dtype": "float32"},
+            "hand_left_head": {"dtype": "float32"},
+            "hand_right_head": {"dtype": "float32"},
+            "pose_head": {"dtype": "float32"},
+            "hand_mask": {"dtype": "float32"},
+            "padding_mask": {"dtype": "float32"},
+        },
+    }
+
+    runner = TensorRTEncoderRunner(engine_path, metadata)
+
+    inputs = {
+        "face": torch.randn(1, 4, 3, 8, 8, dtype=torch.float32),
+        "hand_l": torch.randn(1, 4, 3, 8, 8, dtype=torch.float32),
+        "hand_r": torch.randn(1, 4, 3, 8, 8, dtype=torch.float32),
+        "pose": torch.randn(1, 4, 15, dtype=torch.float32),
+        "pad_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.int32),
+        "miss_mask_hl": torch.tensor([[0, 1, 0, 1]], dtype=torch.int32),
+        "miss_mask_hr": torch.tensor([[1, 0, 1, 0]], dtype=torch.int32),
+    }
+
+    outputs = runner(inputs)
+
+    assert len(outputs) == len(metadata["outputs"])
+    np.testing.assert_array_equal(
+        outputs[0],
+        np.full((1, 4, 16), 7, dtype=np.float32),
+    )
+    assert outputs[-1].dtype == np.float32
+
+    captured_pad = runner.context.captured_inputs["pad_mask"]
+    assert captured_pad.dtype == np.bool_
+    np.testing.assert_array_equal(
+        captured_pad,
+        np.array([[True, True, False, False]], dtype=np.bool_),
+    )
+    assert not memory
