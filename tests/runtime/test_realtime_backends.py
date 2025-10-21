@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import sys
 import types
 from pathlib import Path
@@ -17,6 +18,7 @@ if "cv2" not in sys.modules:
     mock_cv2 = types.ModuleType("cv2")
     mock_cv2.COLOR_BGR2RGB = 0
     mock_cv2.INTER_LINEAR = 1
+    mock_cv2.__spec__ = types.SimpleNamespace()
 
     def _mock_cvt_color(image: np.ndarray, code: int) -> np.ndarray:
         if code != mock_cv2.COLOR_BGR2RGB:  # pragma: no cover - defensive
@@ -58,6 +60,28 @@ def _encoder_args() -> SimpleNamespace:
         sequence_length=4,
         opset=17,
     )
+
+
+class _AssertingBackbone(torch.nn.Module):
+    def __init__(self, *, patch_size: int = 7, embed_dim: int = 8) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_embed = torch.nn.Module()
+        self.patch_embed.proj = torch.nn.Conv2d(
+            3,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.last_input_shape: Tuple[int, ...] | None = None
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        self.last_input_shape = tuple(images.shape)
+        kernel_h, kernel_w = self.patch_embed.proj.kernel_size
+        if images.shape[-2] % kernel_h != 0 or images.shape[-1] % kernel_w != 0:
+            raise AssertionError("Backbone received incompatible spatial dimensions")
+        tokens = self.patch_embed.proj(images)
+        return tokens.flatten(2).mean(dim=-1)
 
 
 def test_temporal_buffer_latency_masks() -> None:
@@ -222,6 +246,100 @@ def test_runtime_backends_integration(tmp_path: Path) -> None:
     assert len(onnx_outputs) == len(reference)
     for ref_tensor, ort_out in zip(reference, onnx_outputs):
         np.testing.assert_allclose(ort_out, ref_tensor.detach().cpu().numpy(), rtol=1e-4, atol=1e-4)
+
+
+def test_torchscript_runner_handles_non_divisible_image_size(tmp_path: Path) -> None:
+    try:
+        from tools.export_onnx_encoder_v9 import EncoderExportModule
+    except Exception as exc:  # pragma: no cover - entorno sin dependencias de exportación
+        pytest.skip(f"Export tooling unavailable: {exc}")
+
+    from slt.models import MultiStreamEncoder
+
+    args = _encoder_args()
+    patch_size = 7
+
+    def _make_backbone() -> _AssertingBackbone:
+        return _AssertingBackbone(patch_size=patch_size, embed_dim=args.projector_dim)
+
+    encoder = MultiStreamEncoder(
+        backbones={
+            "face": _make_backbone(),
+            "hand_left": _make_backbone(),
+            "hand_right": _make_backbone(),
+        },
+        projector_dim=args.projector_dim,
+        d_model=args.d_model,
+        pose_dim=3 * args.pose_landmarks,
+        positional_num_positions=args.sequence_length,
+        projector_dropout=args.projector_dropout,
+        fusion_dropout=args.fusion_dropout,
+        temporal_kwargs={
+            "nhead": args.temporal_nhead,
+            "nlayers": args.temporal_layers,
+            "dim_feedforward": args.temporal_dim_feedforward,
+            "dropout": args.temporal_dropout,
+        },
+    )
+    encoder.eval()
+    export_module = EncoderExportModule(encoder)
+
+    device = torch.device("cpu")
+    batch = 1
+    seq = args.sequence_length
+    image_size = args.image_size
+    pose_dim = 3 * args.pose_landmarks
+
+    face = torch.randn(batch, seq, 3, image_size, image_size, device=device)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, seq, pose_dim, device=device)
+    pad_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
+    miss_mask = torch.zeros(batch, seq, dtype=torch.bool, device=device)
+
+    example_inputs = (face, hand_l, hand_r, pose, pad_mask, miss_mask, miss_mask)
+
+    with torch.no_grad():
+        reference = export_module(*example_inputs)
+
+    target_dim = math.ceil(image_size / patch_size) * patch_size
+    for attr in ("face_backbone", "hand_backbone_left", "hand_backbone_right"):
+        recorded = getattr(encoder, attr).last_input_shape
+        assert recorded is not None
+        assert recorded[-2:] == (target_dim, target_dim)
+
+    traced = torch.jit.trace(export_module, example_inputs, check_trace=False)
+    ts_path = tmp_path / "encoder_padding.ts"
+    traced.save(str(ts_path))
+
+    metadata = {
+        "inputs": {
+            "face": {"dtype": "float32"},
+            "hand_l": {"dtype": "float32"},
+            "hand_r": {"dtype": "float32"},
+            "pose": {"dtype": "float32"},
+            "pad_mask": {"dtype": "bool"},
+            "miss_mask_hl": {"dtype": "bool"},
+            "miss_mask_hr": {"dtype": "bool"},
+        }
+    }
+
+    runner_inputs = {
+        "face": face,
+        "hand_l": hand_l,
+        "hand_r": hand_r,
+        "pose": pose,
+        "pad_mask": pad_mask,
+        "miss_mask_hl": miss_mask,
+        "miss_mask_hr": miss_mask,
+    }
+
+    ts_runner = TorchScriptEncoderRunner(ts_path, metadata, device=device)
+    ts_outputs = ts_runner(runner_inputs)
+
+    assert len(ts_outputs) == len(reference)
+    for ref_tensor, ts_tensor in zip(reference, ts_outputs):
+        torch.testing.assert_close(ts_tensor, ref_tensor)
 
 
 def test_tensorrt_runner_with_mock_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
