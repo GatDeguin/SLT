@@ -19,7 +19,7 @@ from tokenizers.pre_tokenizers import Whitespace
 
 from slt.models import TextSeq2SeqDecoder
 from slt.training.evaluation import EvaluationOutputs, evaluate_model
-from slt.training.loops import LoopResult
+from slt.training.loops import LoopResult, _split_batch
 from slt.training.utils import freeze_module, load_tokenizer, unfreeze_module
 
 
@@ -184,3 +184,19 @@ def test_evaluate_model_returns_predictions(tmp_path: Path) -> None:
     assert isinstance(result.loop_result, LoopResult)
     assert len(result.predictions) == len(result.references) == 2
     assert list(result.video_ids) == ["video-0", "video-1"]
+
+
+def test_split_batch_prefers_inputs_and_ignores_metadata() -> None:
+    batch_inputs = {"face": torch.randn(2, 3, 4)}
+    labels = torch.randint(0, 10, (2, 5))
+    batch = {
+        "inputs": batch_inputs,
+        "labels": labels,
+        "video_ids": ["video-0", "video-1"],
+    }
+
+    inputs, targets = _split_batch(batch)
+
+    assert inputs is batch_inputs
+    assert targets is labels
+    assert "video_ids" not in inputs
