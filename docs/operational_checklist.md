@@ -1,22 +1,25 @@
 # Checklist operativo para liberaciones
 
-Esta guía resume los pasos necesarios para validar el pipeline multi-stream antes
-de publicar un release. Úsala como complemento del README y las guías técnicas.
+Esta guía resume los pasos necesarios para validar el pipeline multi-stream
+antes de publicar un release. Úsala como complemento del README y las guías
+técnicas; cada ítem enlaza con la documentación correspondiente.
 
 ## Reproducir errores y validar fixes
 
-1. **Contrato de datos**: ejecuta `python tools/ci_validate_data_contract.py` para
-   generar un dataset sintético y confirmar que los checks de calidad coinciden
-   con `docs/data_contract.md`.
+1. **Contrato de datos**: ejecuta `python tools/ci_validate_data_contract.py`
+   para generar un dataset sintético y confirmar que los checks de calidad
+   coinciden con `docs/data_contract.md`.
 2. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
    para comprobar que los componentes de datos, entrenamiento y exportación
-   funcionan integrados.
+   funcionan integrados. Si trabajas con flujos basados en keypoints, valida
+   también `tools/train_slt_lsa_mska_v13.py` con un fragmento representativo.
 3. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
    producido por la demo y revisa los reportes con
    `docs/metrics_dashboard_integration.py`.
 4. **Exportación**: ejecuta `pytest tests/test_export.py` o el script
    `tools/export_onnx_encoder_v9.py` con el checkpoint de referencia para
-   asegurar que ONNX y TorchScript son válidos.
+   asegurar que ONNX y TorchScript son válidos. Complementa con
+   `tools/test_realtime_pipeline.py` cuando existan regresiones de latencia.
 
 ## Criterios de aceptación
 
@@ -28,6 +31,8 @@ de publicar un release. Úsala como complemento del README y las guías técnica
   de TorchScript incluidas en los tests.
 - Documentación actualizada con cualquier cambio en rutas, argumentos o
   dependencias.
+- Los ejemplos de configuración (`configs/*.yml`, `docs/*.md`) reflejan los
+  argumentos vigentes.
 
 ## Checklist previo a publicación
 
@@ -39,3 +44,7 @@ de publicar un release. Úsala como complemento del README y las guías técnica
       código.
 - [ ] Confirmar que `requirements-dev.txt` y `pyproject.toml` reflejan cualquier
       dependencia nueva o actualizada.
+- [ ] Validar que `tools/README.md` y `docs/pretraining.md` mencionan las nuevas
+      banderas o scripts añadidos.
+- [ ] Adjuntar capturas de los dashboards o reportes relevantes cuando cambien
+      las métricas de referencia.

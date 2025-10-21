@@ -21,15 +21,29 @@ data/
       train.csv
       val.csv
       test.csv
-meta.csv          # CSV semicolon con columnas id;texto
+meta.csv          # CSV semicolon con columnas video_id;texto
 ```
 
 Los índices de frame (`XXXXXX`) deben comenzar en `000000` y avanzar sin huecos.
 Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
 
+### Detalle por carpeta
+
+- `videos/`: clips originales en MP4/MKV; sólo se consumen durante la extracción
+  de ROIs.
+- `processed/face/`, `processed/hand_l/`, `processed/hand_r/`: recortes en JPEG
+  con patrón `<video_id>_fXXXXXX.jpg`, normalizados a RGB.
+- `processed/pose/`: archivos `.npz` que contienen un arreglo `pose` de forma
+  `(T, 3 * landmarks)` con `float32` y opcionalmente un `pose_conf`.
+- `index/*.csv`: listas de `video_id` (una columna, sin encabezado) utilizadas
+  para los splits de entrenamiento, validación y prueba.
+- `metadata.jsonl`: emitido por `tools/extract_rois_v2.py` con métricas por
+  video (duración efectiva, FPS medidos, cantidad de frames escritos por stream).
+
 ## Metadata obligatoria en `meta.csv`
 
-- `id`: identificador único del video (coincide con los nombres de archivo).
+- `video_id`: identificador único del video (coincide con los nombres de
+  archivo, sin sufijo de frame).
 - `texto`: transcripción o glosa asociada.
 
 Campos adicionales admitidos y utilizados por los *quality checks* del dataset:
@@ -37,9 +51,22 @@ Campos adicionales admitidos y utilizados por los *quality checks* del dataset:
 - `fps`: FPS nominal del video original.
 - `duration`: duración en segundos.
 - `frame_count`: cantidad total de frames generados.
+- `signer` / `subset`: etiquetas libres que pueden emplearse para análisis o
+  filtrado manual (se ignoran durante la carga, pero se preservan al unir
+  metadata).
 
 Cuando `fps` está ausente pero `duration` y `frame_count` existen, se calcula
 `fps = frame_count / duration`.
+
+### CSV de índices (`index/*.csv`)
+
+- Formato: una columna sin encabezado denominada `video_id`.
+- Codificación: UTF-8 (se admiten variantes como UTF-8 con BOM).
+- Contenido: los `video_id` deben existir en `meta.csv` y contar con streams en
+  `processed/`.
+- Uso: `tools/train_slt_multistream_v9.py`, `python -m slt` y
+  `tools/eval_slt_multistream_v9.py` utilizan estos archivos para crear
+  `DataLoader` consistentes entre ejecuciones.
 
 ## Elementos devueltos por `LsaTMultiStream`
 
@@ -58,6 +85,9 @@ Cada ejemplo entregado por el dataset incluye:
   efectiva.
 - `text` y `video_id`: valores originales del CSV.
 
+Los campos `quality` y las máscaras se almacenan en CPU para reducir la memoria
+requerida al mover los tensores principales a GPU.
+
 ## Validaciones automáticas
 
 El dataset ejecuta controles de calidad al cargar cada video:
@@ -73,6 +103,21 @@ El dataset ejecuta controles de calidad al cargar cada video:
    configurado (`pose_min_conf`).
 
 Los resultados se almacenan en `quality` para auditoría posterior.
+
+## Metadata derivada (`metadata.jsonl`)
+
+`tools/extract_rois_v2.py` genera un archivo `metadata.jsonl` con una entrada por
+video. Cada objeto JSON incluye:
+
+- `video_id`: identificador del clip procesado.
+- `frames_written`: cantidad de frames escritos por stream (`face`, `hand_l`,
+  `hand_r`, `pose`).
+- `duration`: duración estimada según timestamps del detector.
+- `fps_observed`: tasa derivada de `frames_written / duration`.
+- `status`: `"ok"` o detalles del error ocurrido durante la extracción.
+
+Guarda este archivo junto a los recortes para facilitar reintentos con
+`--resume` y comparar métricas entre ejecuciones.
 
 ## Recomendaciones para extracción de ROIs
 
@@ -93,3 +138,5 @@ Los resultados se almacenan en `quality` para auditoría posterior.
    avisos y excepciones se comportan como lo documentado.
 3. Mantén sincronizados los ejemplos de rutas con el README cuando cambies
    directorios o nombres de archivos.
+4. Revisa que los archivos `index/*.csv` no contengan IDs duplicados o filas
+   vacías; el dataset emite advertencias cuando detecta inconsistencias.

@@ -1,23 +1,40 @@
 # SLT — Pipeline multi-stream para `single_signer`
 
-Este repositorio agrupa las utilidades necesarias para preparar datos, entrenar,
-evaluar y exportar el modelo multi-stream validado para el flujo `single_signer`
-del paquete `slt`. Los scripts están pensados como un flujo de referencia sobre
-el dataset `single_signer`, cuyo CSV de subtítulos principal es `meta.csv`.
+Este repositorio centraliza las utilidades para preparar datos, entrenar,
+evaluar, exportar y monitorear el modelo multi-stream validado para el flujo
+`single_signer`. El pipeline opera sobre el dataset `single_signer`, cuyo CSV de
+subtítulos principal es `meta.csv`, y sirve como plantilla para reproducir
+experimentos o adaptar el flujo a nuevas variantes.
 
-## Contenido del repositorio
+## Tabla de contenidos
 
-- Paquete `slt/` con el dataset `LsaTMultiStream`, el encoder
-  `MultiStreamEncoder`, envoltorios de entrenamiento y funciones auxiliares.
-- Herramientas en `tools/` para extracción de ROIs, entrenamiento completo,
-  evaluación, exportación y demos en tiempo real.
-- Documentación detallada en `docs/` con contratos de datos, guías operativas y
-  manuales de preentrenamiento.
-- Tests de humo en `tests/` que cubren el pipeline extremo a extremo utilizando
-  datasets sintéticos.
+1. [Resumen del pipeline](#resumen-del-pipeline)
+2. [Instalación](#instalación)
+3. [Flujo recomendado de extremo a extremo](#flujo-recomendado-de-extremo-a-extremo)
+4. [Preparación de datos](#preparación-de-datos-datasingle_signer)
+5. [Entrenamiento y evaluación](#entrenamiento-y-evaluación)
+6. [Exportación y demos](#exportación-y-demos-en-tiempo-real)
+7. [Preentrenamiento de backbones](#preentrenamiento-de-backbones)
+8. [Control de calidad y pruebas](#control-de-calidad-y-pruebas)
+9. [Estructura de carpetas](#estructura-de-carpetas)
+10. [Soporte y aportes](#soporte-y-aportes)
+
+## Resumen del pipeline
+
+- **Paquete `slt/`**: expone el dataset `LsaTMultiStream`, el encoder
+  `MultiStreamEncoder`, un decoder seq2seq y utilidades para datos, métricas y
+  entrenamiento.
+- **Herramientas `tools/`**: scripts para extracción de ROIs, entrenamiento
+  completo, evaluación, exportación, validación de contratos y demos en tiempo
+  real (`docs/operational_checklist.md` lista los pasos sugeridos para releases).
+- **Documentación `docs/`**: contratos de datos, guías operativas, manuales de
+  preentrenamiento y resúmenes de papers que motivan el enfoque multi-stream.
+- **Tests `tests/`**: suites de humo que cubren datos sintéticos,
+  exportaciones y ejecuciones rápidas del pipeline.
 
 Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
-`docs/pretraining.md` para ampliar cada etapa.
+`docs/pretraining.md` para ampliar cada etapa. `tools/README.md` describe cada
+script CLI disponible.
 
 ### Pesos pre-entrenados
 
@@ -41,7 +58,8 @@ encoder = MultiStreamEncoder.from_pretrained(
 ## Instalación
 
 Configura un entorno virtual, instala PyTorch compatible con tu hardware y
-aplica los requisitos de desarrollo.
+aplica los requisitos de desarrollo. `requirements-dev.txt` instala el paquete
+en modo editable junto con herramientas de linting y pruebas.
 
 ```bash
 python -m venv .venv
@@ -50,8 +68,9 @@ python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
-`requirements-dev.txt` instala el paquete en modo editable junto con las
-siguientes dependencias opcionales:
+### Extras opcionales
+
+El paquete define grupos de extras que habilitan funcionalidades específicas:
 
 | Extra | Propósito |
 |-------|-----------|
@@ -59,7 +78,29 @@ siguientes dependencias opcionales:
 | `metrics` | Cálculo de BLEU, ChrF, CER y WER durante la evaluación. |
 | `export` | Exportación ONNX/TorchScript y validación en tiempo real. |
 
-También puedes instalarlos en pasos separados con `pip install .[media,metrics,export]`.
+Instálalos en bloque con `pip install .[media,metrics,export]` o agrega cada uno
+según tus necesidades. Consulta la sección de [control de calidad](#control-de-calidad-y-pruebas)
+para conocer las verificaciones recomendadas tras la instalación.
+
+## Flujo recomendado de extremo a extremo
+
+1. **Preparar datos** siguiendo el [contrato documentado](docs/data_contract.md).
+   Ejecuta `tools/extract_rois_v2.py` sobre los videos y construye los splits en
+   `data/single_signer/index/`.
+2. **Verificar la instalación** corriendo `pytest` y los linters (`ruff`,
+   `black`, `mypy`) para confirmar que el entorno está consistente.
+3. **Ejecutar un entrenamiento rápido** con `python -m slt` para validar que los
+   datos y el tokenizador son correctos. Define el `work_dir` donde se guardarán
+   los checkpoints temporales.
+4. **Lanzar experimentos completos** con `tools/train_slt_multistream_v9.py` o
+   `tools/train_slt_lsa_mska_v13.py` según el tipo de entrada (ROIs vs. keypoints).
+5. **Evaluar resultados** usando `tools/eval_slt_multistream_v9.py` y analiza los
+   reportes con `docs/metrics_dashboard_integration.py` o tus dashboards.
+6. **Exportar y validar** con `tools/export_onnx_encoder_v9.py` y las demos en
+   tiempo real (`tools/demo_realtime_multistream.py`,
+   `tools/test_realtime_pipeline.py`).
+7. **Documentar y publicar** apoyándote en `docs/operational_checklist.md` antes
+   de liberar artefactos o abrir un PR.
 
 ## Preparación de datos (`data/single_signer`)
 
@@ -77,7 +118,7 @@ También puedes instalarlos en pasos separados con `pip install .[media,metrics,
          train.csv
          val.csv
          test.csv
-   meta.csv              # CSV con columnas id;texto
+   meta.csv              # CSV con columnas video_id;texto
    ```
 2. Copia los videos originales en `data/single_signer/videos/`.
 3. Ejecuta la extracción de regiones de interés para rostro, manos y pose:
@@ -90,14 +131,15 @@ También puedes instalarlos en pasos separados con `pip install .[media,metrics,
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
    fuese necesario.
-4. Construye los splits desde `meta.csv` según tus criterios. Un ejemplo mínimo:
+4. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
+   contener un `video_id` por línea sin encabezado. Un ejemplo mínimo:
    ```bash
    python - <<'PY'
    from pathlib import Path
    import pandas as pd
 
    meta = pd.read_csv('meta.csv', sep=';')
-   ids = meta['id'].unique()
+   ids = meta['video_id'].unique()
    out_dir = Path('data/single_signer/index')
    out_dir.mkdir(parents=True, exist_ok=True)
    pd.Series(ids[:80]).to_csv(out_dir / 'train.csv', index=False)
@@ -105,10 +147,18 @@ También puedes instalarlos en pasos separados con `pip install .[media,metrics,
    pd.Series(ids[90:]).to_csv(out_dir / 'test.csv', index=False)
    PY
    ```
+5. Valida la estructura con `python tools/ci_validate_data_contract.py` o
+   ejecuta `pytest tests/data/test_dataset_quality.py` para comprobar los
+   avisos producidos ante inconsistencias de FPS, frames faltantes o splits
+   incompletos.
 
-El contrato de datos completo se detalla en `docs/data_contract.md`.
+El contrato de datos completo se detalla en `docs/data_contract.md`, donde se
+documentan los campos opcionales de `meta.csv`, las métricas registradas en
+`metadata.jsonl` y las convenciones de nomenclatura de archivos.
 
-## Entrenamiento rápido (`python -m slt`)
+## Entrenamiento y evaluación
+
+### Entrenamiento rápido (`python -m slt`)
 
 La CLI empaquetada ejecuta un entrenamiento corto para verificar el pipeline.
 Por defecto intenta inicializar con los pesos `single_signer` descargados, por
@@ -132,11 +182,46 @@ python -m slt \
 
 El comando guarda `last.pt`, `best.pt` y `config.json` dentro de `work_dir`.
 
-Para sesiones largas utiliza `tools/train_slt_multistream_v9.py`, que expone
-reanudación, *mixup* por stream y compatibilidad con plantillas YAML/JSON.
-Consulta `docs/train_slt_multistream_v9.md` para conocer todos los parámetros.
+### Entrenamiento completo multi-stream
 
-## Evaluación
+Para sesiones prolongadas utiliza `tools/train_slt_multistream_v9.py`, que
+expone reanudación, *mixup* por stream, configuración vía YAML/JSON y
+sobrescritura puntual con `--set`. La guía detallada está en
+`docs/train_slt_multistream_v9.md`.
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --config configs/single_signer.yml \
+  --set data.face_dir=data/single_signer/processed/face \
+  --set data.work_dir=work_dirs/single_signer_experiment \
+  --set training.epochs=40 \
+  --set optim.lr=5e-4
+```
+
+`config.json` dentro de `work_dir` refleja la configuración efectiva combinando
+defaults, archivo y banderas.
+
+### Entrenamiento basado en keypoints
+
+`tools/train_slt_lsa_mska_v13.py` entrena un modelo para variantes basadas en
+keypoints 2D/3D (por ejemplo flujos MSKA para lengua de señas argentina). Acepta
+archivos `.npy` estructurados como `(T, 79, {2,3})` o vectores planos por frame.
+
+```bash
+python tools/train_slt_lsa_mska_v13.py \
+  --kp_dir data/lsa_keypoints \
+  --csv meta.csv --csv_delim ';' \
+  --work_dir work_dirs/lsa_mska \
+  --tok_name facebook/mbart-large-50-many-to-many-mmt \
+  --tgt_lang es_XX \
+  --epochs 50 --batch_size 4 --xy_only true
+```
+
+El script puede congelar capas del decoder (`--unfreeze_last_n_dec_layers`),
+reporta BLEU con SacreBLEU cuando está instalado y ofrece *warm start* mediante
+`--resume` y `--init_checkpoint`.
+
+### Evaluación y reportes
 
 Evalúa uno o varios checkpoints y genera predicciones, métricas y reportes. Para
 usar el preset validado sin un checkpoint propio pasa `--checkpoint single_signer`
@@ -188,23 +273,28 @@ de HuggingFace (`--tokenizer`).
 ## Preentrenamiento de backbones
 
 `tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py` permiten obtener
-pesos auto-supervisados compatibles con `load_dinov2_backbone`. Sigue la guía en
-`docs/pretraining.md` para exportar los backbones y conectarlos con el flujo de
-entrenamiento principal.
+pesos auto-supervisados compatibles con `load_dinov2_backbone`. Soportan
+entrenamientos declarativos vía `--config`, exportación de backbones (`--export-backbone`)
+y registro de métricas en `metrics.jsonl`. Sigue la guía en `docs/pretraining.md`
+para elegir hiperparámetros, controlar augmentations y conectar los pesos
+resultantes con `tools/train_slt_multistream_v9.py`.
 
 ## Control de calidad y pruebas
 
 Los tests automatizados validan piezas clave del pipeline:
 
-| Escenario | Prueba | Resultado esperado |
-|-----------|--------|--------------------|
-| Datos sintéticos end-to-end | `tests/test_pipeline_end_to_end.py` | Pérdida cae y exporta. |
-| CLI de demo | `tests/test_cli_main.py` | Ejecuta entrenamiento corto sin errores. |
-| Exportación | `tests/test_export.py` | Genera y valida ONNX/TorchScript. |
-| Calidad de datos | `tests/data/test_dataset_quality.py` | Detecta frames faltantes y FPS. |
+| Escenario | Prueba | Resultado |
+|-----------|--------|-----------|
+| Contrato datos | `python tools/ci_validate_data_contract.py` | Replica estructura base. |
+| E2E sintético | `tests/test_pipeline_end_to_end.py` | Pérdida cae y exporta. |
+| CLI demo | `tests/test_cli_main.py` | Entrenamiento corto sin errores. |
+| Exportación | `tests/test_export.py` | ONNX y TorchScript válidos. |
+| Calidad datos | `tests/data/test_dataset_quality.py` | Detecta frames faltantes y FPS. |
+| Métricas regresión | `python tools/ci_validate_metrics.py` | Pérdidas dentro de tolerancias. |
 
 Ejecuta `pytest`, `ruff check .`, `black --check .` y `mypy` antes de subir
-cambios.
+cambios. `docs/operational_checklist.md` resume la secuencia recomendada de
+verificaciones previas a una release.
 
 ## Estructura de carpetas
 
