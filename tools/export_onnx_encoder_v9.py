@@ -10,7 +10,7 @@ import json
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn

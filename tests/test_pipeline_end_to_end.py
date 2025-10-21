@@ -5,12 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Mapping, Tuple
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 from transformers.tokenization_utils_base import BatchEncoding
 
 onnx = pytest.importorskip("onnx")
+onnxruntime = pytest.importorskip("onnxruntime")
 
 from slt.data.lsa_t_multistream import LsaTMultiStream
 from slt.training.configuration import ModelConfig
@@ -254,3 +256,21 @@ def test_synthetic_pipeline_roundtrip(
     assert len(scripted_out) == len(reference)
     for ref, out in zip(reference, scripted_out):
         torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+
+    session = onnxruntime.InferenceSession(
+        str(onnx_path), providers=["CPUExecutionProvider"]
+    )
+    onnx_inputs = {
+        "face": positional[0].detach().cpu().numpy(),
+        "hand_l": positional[1].detach().cpu().numpy(),
+        "hand_r": positional[2].detach().cpu().numpy(),
+        "pose": positional[3].detach().cpu().numpy(),
+        "pad_mask": kwargs["pad_mask"].detach().cpu().numpy(),
+        "miss_mask_hl": kwargs["miss_mask_hl"].detach().cpu().numpy(),
+        "miss_mask_hr": kwargs["miss_mask_hr"].detach().cpu().numpy(),
+    }
+    onnx_outputs = session.run(None, onnx_inputs)
+    assert len(onnx_outputs) == len(reference)
+    for ref, ort_out in zip(reference, onnx_outputs):
+        ort_tensor = torch.from_numpy(np.asarray(ort_out))
+        torch.testing.assert_close(ort_tensor, ref, atol=1e-4, rtol=1e-4)
