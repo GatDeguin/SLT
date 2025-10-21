@@ -476,8 +476,8 @@ def run_demo(args: argparse.Namespace) -> None:
                     hand_l_tensor,
                     hand_r_tensor,
                     pose_tensor,
-                    detected_left=detections.hand_l,
-                    detected_right=detections.hand_r,
+                    missing_left=not detections.hand_l,
+                    missing_right=not detections.hand_r,
                 )
 
                 inputs = buffer.as_model_inputs(device, backend=runner.backend)
