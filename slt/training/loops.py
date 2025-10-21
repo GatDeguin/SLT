@@ -50,18 +50,22 @@ def _move_to_device(data: Any, device: Union[str, torch.device]) -> Any:
 def _split_batch(batch: Batch) -> Tuple[Inputs, Any]:
     """Split a batch into inputs and targets."""
     if isinstance(batch, MutableMapping):
+        metadata_keys = {"video_ids"}
+        if "inputs" in batch:
+            if "targets" in batch:
+                return batch["inputs"], batch["targets"]
+            if "labels" in batch:
+                return batch["inputs"], batch["labels"]
+            if "y" in batch:
+                return batch["inputs"], batch["y"]
         if "targets" in batch:
-            inputs = {k: v for k, v in batch.items() if k != "targets"}
-            if "inputs" in inputs and len(inputs) == 1:
-                inputs = inputs["inputs"]
+            blocked = {"targets"} | metadata_keys
+            inputs = {k: v for k, v in batch.items() if k not in blocked}
             return inputs, batch["targets"]
         if "labels" in batch:
-            inputs = {k: v for k, v in batch.items() if k not in {"labels", "targets"}}
-            if "inputs" in inputs and len(inputs) == 1:
-                inputs = inputs["inputs"]
+            blocked = {"labels", "targets"} | metadata_keys
+            inputs = {k: v for k, v in batch.items() if k not in blocked}
             return inputs, batch["labels"]
-        if "inputs" in batch and "y" in batch:
-            return batch["inputs"], batch["y"]
         raise KeyError("Dictionary batch must contain 'targets' or 'labels'.")
     if isinstance(batch, (list, tuple)):
         if len(batch) < 2:
