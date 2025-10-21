@@ -104,13 +104,36 @@ class _TinyTokenizer:
                 "epochs": 5,
             },
         ),
+        (
+            SyntheticDatasetSpec(
+                sequence_length=5,
+                image_size=20,
+                pose_landmarks=6,
+                frames_per_video=5,
+                num_train=2,
+                num_val=1,
+                base_text="hola tres",
+            ),
+            {
+                "batch_size": 1,
+                "target_length": 6,
+                "projector_dim": 10,
+                "d_model": 16,
+                "temporal_nhead": 2,
+                "temporal_dim_feedforward": 32,
+                "decoder_heads": 2,
+                "lr": 7e-3,
+                "epochs": 3,
+            },
+        ),
     ],
-    ids=["tiny-seq4", "tiny-seq6"],
+    ids=["tiny-seq4", "tiny-seq6", "tiny-non-multiple"],
 )
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_synthetic_pipeline_roundtrip(
     tmp_path: Path, dataset_spec: SyntheticDatasetSpec, training_cfg: Mapping[str, float]
 ) -> None:
+    assert dataset_spec.image_size % 14 != 0
     data_root = tmp_path / "dataset"
     paths = generate_multistream_dataset(data_root, dataset_spec)
 
