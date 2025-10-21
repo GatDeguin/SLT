@@ -8,12 +8,12 @@ predeterminada el modelo se inicializa con el checkpoint validado
 `data/single_signer/` o vía `SLT_SINGLE_SIGNER_CHECKPOINT`), aunque puedes
 deshabilitarlo con `--pretrained none`. Esta guía resume los argumentos más
 importantes, patrones de uso avanzados y recomendaciones para reproducir
-experimentos.
+experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
 
 ## Requisitos previos
 
 - Streams generados con `tools/extract_rois_v2.py` siguiendo el contrato de datos.
-- CSV `meta.csv` con columnas `id;texto` y splits `train.csv`/`val.csv`/`test.csv`.
+- CSV `meta.csv` con columnas `video_id;texto` y splits `train.csv`/`val.csv`/`test.csv`.
 - Tokenizador HuggingFace compatible con modelos tipo T5/BART.
 
 ## Ejecución básica
@@ -45,7 +45,8 @@ Artefactos generados en `--work-dir`:
 
 | Bandera | Descripción |
 |---------|-------------|
-| `--face-dir`, `--hand-left-dir`, `--hand-right-dir`, `--pose-dir` | Directorios con los streams procesados. |
+| `--face-dir`, `--hand-left-dir`, `--hand-right-dir` | Directorios de recortes RGB. |
+| `--pose-dir` | Directorio con los `.npz` de pose. |
 | `--metadata-csv` | Ruta a `meta.csv`. |
 | `--train-index`, `--val-index` | Listas de `video_id` para cada split. |
 | `--batch-size`, `--val-batch-size` | Tamaños de lote de entrenamiento y validación. |
@@ -115,6 +116,17 @@ python tools/train_slt_multistream_v9.py \
 
 Los valores efectivos se persistirán en `config.json` dentro de `work_dir`.
 
+### Gestión avanzada de configuraciones
+
+- Usa notación de puntos para campos anidados (`data.batch_size=6`).
+- Valores booleanos aceptan `true`/`false` (insensible a mayúsculas).
+- Strings con espacios deben ir entre comillas (`"cosine warmup"`).
+- Repite `--set` tantas veces como sea necesario; la última definición prevalece.
+
+Guarda los archivos YAML/JSON utilizados junto al `work_dir` para asegurar
+reproducibilidad. Los diffs de configuración se listan en `config.json` bajo la
+clave `overrides`.
+
 ## Decodificadores personalizados
 
 Para usar un decoder propio, proporciona `--decoder-class` con el formato
@@ -129,6 +141,31 @@ python tools/train_slt_multistream_v9.py \
 
 Verifica que la dimensionalidad (`d_model`) del decoder coincida con el encoder
 multi-stream. El script valida este punto al inicializar el modelo.
+
+### Mezcla de streams y augmentations
+
+- `--mix-stream stream[:prob]`: intercambia aleatoriamente streams entre clips
+  durante el entrenamiento. Omite `:prob` para usar el valor por defecto `1.0`.
+  Los nombres válidos son `face`, `hand-left`, `hand-right` y `pose`.
+- En archivos `--config` puedes definir `mix_streams` como diccionario:
+  ```yaml
+  data:
+    mix_streams:
+      face: 0.5
+      hand_left: 0.25
+  ```
+  Las claves usan guion bajo para coincidencia con los campos del dataset.
+
+`normalise_mix_spec` garantiza que las probabilidades se ajusten al rango `[0,1]`
+y emite errores descriptivos cuando la configuración es inválida.
+
+### Optimización avanzada
+
+- `--grad-accum-steps`: acumula gradientes para simular lotes más grandes.
+- `--clip-grad-norm`: aplica *gradient clipping* antes de cada actualización.
+- `--compile` / `--no-compile`: activa `torch.compile` con el modo indicado en
+  `--compile-mode` cuando la versión de PyTorch lo soporta.
+- `--precision amp`: habilita *automatic mixed precision* en GPU.
 
 ## Reanudaciones y warm start
 
@@ -145,6 +182,12 @@ multi-stream. El script valida este punto al inicializar el modelo.
   referencia (se ejecuta en CI).
 - La bandera `--tensorboard` habilita logging directo compatible con
   `tensorboard --logdir work_dirs/...`.
+- `work_dir/logs/` almacena los archivos de texto con métricas resumidas por
+  época y mensajes de `logging`.
+
+Los reportes incluyen información de tiempo por iteración, tasa de samples y
+distribución de pérdidas. Conserva estos artefactos para facilitar auditorías y
+reproducibilidad.
 
 ## Siguientes pasos
 
