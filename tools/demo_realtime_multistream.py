@@ -93,6 +93,7 @@ class MultiStreamSLT(torch.nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
     ) -> torch.LongTensor:
         return self.generate(
             face=face,
@@ -102,6 +103,7 @@ class MultiStreamSLT(torch.nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
         )
 
     def generate(
@@ -114,6 +116,7 @@ class MultiStreamSLT(torch.nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
         **generation_kwargs,
     ) -> torch.LongTensor:
         encoded = self.encoder(
@@ -124,6 +127,7 @@ class MultiStreamSLT(torch.nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
         )
         encoder_attention_mask = pad_mask.to(torch.long) if pad_mask is not None else None
         max_length = generation_kwargs.pop("max_length", self.max_tokens)
@@ -462,6 +466,7 @@ def run_demo(args: argparse.Namespace) -> None:
                     hand_l_tensor,
                     hand_r_tensor,
                     pose_tensor,
+                    pose_conf_mask,
                     detections,
                     boxes,
                 ) = processor.process(
@@ -476,6 +481,7 @@ def run_demo(args: argparse.Namespace) -> None:
                     hand_l_tensor,
                     hand_r_tensor,
                     pose_tensor,
+                    pose_conf_mask=pose_conf_mask,
                     missing_left=not detections.hand_l,
                     missing_right=not detections.hand_r,
                 )

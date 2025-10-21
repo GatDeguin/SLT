@@ -266,6 +266,7 @@ def test_synthetic_pipeline_roundtrip(
         "pad_mask": inputs["pad_mask"],
         "miss_mask_hl": inputs["miss_mask_hl"],
         "miss_mask_hr": inputs["miss_mask_hr"],
+        "pose_conf_mask": inputs["pose_conf_mask"],
     }
 
     scripted = torch.jit.load(str(ts_path))
@@ -291,6 +292,7 @@ def test_synthetic_pipeline_roundtrip(
         "pad_mask": kwargs["pad_mask"].detach().cpu().numpy(),
         "miss_mask_hl": kwargs["miss_mask_hl"].detach().cpu().numpy(),
         "miss_mask_hr": kwargs["miss_mask_hr"].detach().cpu().numpy(),
+        "pose_conf_mask": kwargs["pose_conf_mask"].detach().cpu().numpy(),
     }
     onnx_outputs = session.run(None, onnx_inputs)
     assert len(onnx_outputs) == len(reference)

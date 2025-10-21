@@ -15,6 +15,7 @@ import cv2
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+POSE_VISIBILITY_THRESHOLD = 0.5
 
 
 @dataclass
@@ -52,6 +53,7 @@ class TemporalBuffer:
         self.hand_l: Deque[torch.Tensor] = deque(maxlen=sequence_length)
         self.hand_r: Deque[torch.Tensor] = deque(maxlen=sequence_length)
         self.pose: Deque[torch.Tensor] = deque(maxlen=sequence_length)
+        self.pose_conf: Deque[torch.Tensor] = deque(maxlen=sequence_length)
         self.miss_hl: Deque[bool] = deque(maxlen=sequence_length)
         self.miss_hr: Deque[bool] = deque(maxlen=sequence_length)
 
@@ -89,15 +91,59 @@ class TemporalBuffer:
         hand_r: torch.Tensor,
         pose: torch.Tensor,
         *,
-        missing_left: bool,
-        missing_right: bool,
+        pose_conf_mask: Optional[torch.Tensor] = None,
+        missing_left: Optional[bool] = None,
+        missing_right: Optional[bool] = None,
+        detected_left: Optional[bool] = None,
+        detected_right: Optional[bool] = None,
     ) -> None:
+        missing_left = self._resolve_missing(
+            provided=missing_left,
+            detected=detected_left,
+            name="left",
+        )
+        missing_right = self._resolve_missing(
+            provided=missing_right,
+            detected=detected_right,
+            name="right",
+        )
+
         self.face.append(face)
         self.hand_l.append(hand_l)
         self.hand_r.append(hand_r)
         self.pose.append(pose)
+        self.pose_conf.append(self._prepare_pose_mask(pose_conf_mask))
         self.miss_hl.append(bool(missing_left))
         self.miss_hr.append(bool(missing_right))
+
+    def _prepare_pose_mask(self, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return torch.ones(self.pose_landmarks, dtype=torch.bool)
+        tensor = torch.as_tensor(mask, dtype=torch.bool)
+        if tensor.shape != (self.pose_landmarks,):
+            raise ValueError(
+                "pose_conf_mask must have shape (pose_landmarks,)"
+            )
+        return tensor
+
+    @staticmethod
+    def _resolve_missing(
+        *,
+        provided: Optional[bool],
+        detected: Optional[bool],
+        name: str,
+    ) -> bool:
+        if provided is not None:
+            if detected is not None:
+                raise ValueError(
+                    f"Specify either missing_{name} or detected_{name}, not both"
+                )
+            return bool(provided)
+        if detected is not None:
+            return not bool(detected)
+        raise ValueError(
+            f"Either missing_{name} or detected_{name} must be provided"
+        )
 
     def _pad_stream(self, stream: Deque[torch.Tensor]) -> torch.Tensor:
         window = list(stream)[-self.window_size :]
@@ -140,6 +186,14 @@ class TemporalBuffer:
             mask[:valid_len] = torch.tensor(list(stream)[-valid_len:], dtype=torch.bool)
         return mask
 
+    def _pad_pose_mask(self, stream: Deque[torch.Tensor], valid_len: int) -> torch.Tensor:
+        mask = torch.zeros((self.sequence_length, self.pose_landmarks), dtype=torch.bool)
+        if valid_len:
+            recent = list(stream)[-valid_len:]
+            stacked = torch.stack([tensor.to(dtype=torch.bool) for tensor in recent], dim=0)
+            mask[:valid_len] = stacked
+        return mask
+
     def as_model_inputs(
         self,
         device: torch.device,
@@ -161,6 +215,7 @@ class TemporalBuffer:
 
         miss_mask_hl = self._pad_mask(self.miss_hl, valid_len)
         miss_mask_hr = self._pad_mask(self.miss_hr, valid_len)
+        pose_conf_mask = self._pad_pose_mask(self.pose_conf, valid_len)
 
         torch_backends = {"torch", "torchscript"}
         numpy_backends = {"onnx", "onnxruntime", "tensorrt"}
@@ -174,6 +229,7 @@ class TemporalBuffer:
                 "pad_mask": pad_mask.unsqueeze(0).to(device),
                 "miss_mask_hl": miss_mask_hl.unsqueeze(0).to(device),
                 "miss_mask_hr": miss_mask_hr.unsqueeze(0).to(device),
+                "pose_conf_mask": pose_conf_mask.unsqueeze(0).to(device),
             }
 
         if backend not in numpy_backends:
@@ -186,6 +242,7 @@ class TemporalBuffer:
         pad_mask_np = pad_mask.unsqueeze(0).cpu().numpy().astype(np.bool_)
         miss_hl_np = miss_mask_hl.unsqueeze(0).cpu().numpy().astype(np.bool_)
         miss_hr_np = miss_mask_hr.unsqueeze(0).cpu().numpy().astype(np.bool_)
+        pose_conf_np = pose_conf_mask.unsqueeze(0).cpu().numpy().astype(np.bool_)
 
         return {
             "face": face_np,
@@ -195,6 +252,7 @@ class TemporalBuffer:
             "pad_mask": pad_mask_np,
             "miss_mask_hl": miss_hl_np,
             "miss_mask_hr": miss_hr_np,
+            "pose_conf_mask": pose_conf_np,
         }
 
 
@@ -264,7 +322,7 @@ INPUT_ORDER = (
     "hand_r",
     "pose",
 )
-MASK_ORDER = ("pad_mask", "miss_mask_hl", "miss_mask_hr")
+MASK_ORDER = ("pad_mask", "miss_mask_hl", "miss_mask_hr", "pose_conf_mask")
 ALL_INPUTS = INPUT_ORDER + MASK_ORDER
 
 _NUMPY_DTYPES: Dict[str, np.dtype[Any]] = {
@@ -554,16 +612,20 @@ def preprocess_crop(crop: np.ndarray) -> torch.Tensor:
     return (tensor - IMAGENET_MEAN) / IMAGENET_STD
 
 
-def extract_pose_vector(result: object, count: int) -> torch.Tensor:
-    """Devuelve un vector plano con ``count`` landmarks de pose."""
+def extract_pose_vector(result: object, count: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Devuelve el vector plano de pose y una máscara de confianza."""
 
-    pose = np.zeros((count, 3), dtype=np.float32)
+    pose = torch.zeros((count, 3), dtype=torch.float32)
+    conf_mask = torch.zeros(count, dtype=torch.bool)
     if result and getattr(result, "pose_landmarks", None):
-        for idx, landmark in enumerate(result.pose_landmarks.landmark[:count]):
-            pose[idx, 0] = landmark.x
-            pose[idx, 1] = landmark.y
-            pose[idx, 2] = landmark.visibility
-    return torch.from_numpy(pose.reshape(-1))
+        landmarks = getattr(result.pose_landmarks, "landmark", [])
+        for idx, landmark in enumerate(landmarks[:count]):
+            pose[idx, 0] = float(getattr(landmark, "x", 0.0))
+            pose[idx, 1] = float(getattr(landmark, "y", 0.0))
+            visibility = float(getattr(landmark, "visibility", 0.0))
+            pose[idx, 2] = visibility
+            conf_mask[idx] = visibility >= POSE_VISIBILITY_THRESHOLD
+    return pose.reshape(-1), conf_mask
 
 
 class RoiTracker:
@@ -691,7 +753,15 @@ class HolisticFrameProcessor:
         face_result: object,
         hands_result: object,
         pose_result: object,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, FrameDetections, Dict[str, Optional[Tuple[int, int, int, int]]]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        FrameDetections,
+        Dict[str, Optional[Tuple[int, int, int, int]]],
+    ]:
         self._update_face(frame, face_result)
         self._update_hands(frame, hands_result)
 
@@ -702,7 +772,7 @@ class HolisticFrameProcessor:
         face_tensor = preprocess_crop(face_crop)
         hand_l_tensor = preprocess_crop(hand_l_crop)
         hand_r_tensor = preprocess_crop(hand_r_crop)
-        pose_tensor = extract_pose_vector(pose_result, self.pose_landmarks)
+        pose_tensor, pose_conf_mask = extract_pose_vector(pose_result, self.pose_landmarks)
 
         detections = FrameDetections(
             face=self.face_tracker.active,
@@ -714,4 +784,12 @@ class HolisticFrameProcessor:
             "hand_l": self.hand_left_tracker.bbox,
             "hand_r": self.hand_right_tracker.bbox,
         }
-        return face_tensor, hand_l_tensor, hand_r_tensor, pose_tensor, detections, boxes
+        return (
+            face_tensor,
+            hand_l_tensor,
+            hand_r_tensor,
+            pose_tensor,
+            pose_conf_mask,
+            detections,
+            boxes,
+        )

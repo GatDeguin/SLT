@@ -104,6 +104,7 @@ class EncoderExportModule(torch.nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         face_feats = self.encoder._encode_backbone(self.encoder.face_backbone, face)
         hand_l_feats = self.encoder._encode_backbone(self.encoder.hand_backbone_left, hand_l)
@@ -119,7 +120,11 @@ class EncoderExportModule(torch.nn.Module):
         face_proj = self.encoder.face_projector(face_feats)
         hand_l_proj = self.encoder.hand_left_projector(hand_l_feats)
         hand_r_proj = self.encoder.hand_right_projector(hand_r_feats)
-        pose_proj = self.encoder.pose_projector(self.encoder._ensure_pose_shape(pose))
+        pose_processed = self.encoder._ensure_pose_shape(pose)
+        pose_processed, _ = self.encoder._apply_pose_mask(
+            pose_processed, pose_conf_mask
+        )
+        pose_proj = self.encoder.pose_projector(pose_processed)
 
         combined_hand_mask = self.encoder._combine_missing_masks(hand_l_mask, hand_r_mask)
         fused = self.encoder._call_fusion(
@@ -409,8 +414,20 @@ def _dummy_inputs(args: argparse.Namespace, device: torch.device) -> tuple:
     pad_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
     miss_mask_hl = torch.zeros(batch, seq, dtype=torch.bool, device=device)
     miss_mask_hr = torch.zeros(batch, seq, dtype=torch.bool, device=device)
+    pose_conf_mask = torch.ones(
+        batch, seq, args.pose_landmarks, dtype=torch.bool, device=device
+    )
 
-    return face, hand_l, hand_r, pose, pad_mask, miss_mask_hl, miss_mask_hr
+    return (
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        pad_mask,
+        miss_mask_hl,
+        miss_mask_hr,
+        pose_conf_mask,
+    )
 
 
 def main_export(argv: Optional[Sequence[str]] = None) -> None:
@@ -450,6 +467,7 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
         "pad_mask": inputs[4],
         "miss_mask_hl": inputs[5],
         "miss_mask_hr": inputs[6],
+        "pose_conf_mask": inputs[7],
     }
 
     dynamic_axes = {
@@ -460,6 +478,7 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
         "pad_mask": {1: "T"},
         "miss_mask_hl": {1: "T"},
         "miss_mask_hr": {1: "T"},
+        "pose_conf_mask": {1: "T"},
         "encoded": {1: "T"},
         "face_head": {1: "T"},
         "hand_left_head": {1: "T"},
@@ -486,6 +505,7 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
                         "pad_mask",
                         "miss_mask_hl",
                         "miss_mask_hr",
+                        "pose_conf_mask",
                     ],
                     output_names=[
                         "encoded",
@@ -518,6 +538,7 @@ def main_export(argv: Optional[Sequence[str]] = None) -> None:
             keyword_args["pad_mask"],
             keyword_args["miss_mask_hl"],
             keyword_args["miss_mask_hr"],
+            keyword_args["pose_conf_mask"],
         )
         trace_inputs = tuple(positional_args) + mask_examples
         with torch.no_grad():
@@ -586,6 +607,10 @@ def _build_metadata(
         "miss_mask_hr": {
             "dtype": "bool",
             "shape": ["batch", "time"],
+        },
+        "pose_conf_mask": {
+            "dtype": "bool",
+            "shape": ["batch", "time", args.pose_landmarks],
         },
     }
 

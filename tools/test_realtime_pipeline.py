@@ -125,6 +125,7 @@ def run_offline(args: argparse.Namespace) -> None:
                     hand_l_tensor,
                     hand_r_tensor,
                     pose_tensor,
+                    pose_conf_mask,
                     detections,
                     boxes,
                 ) = processor.process(
@@ -139,6 +140,7 @@ def run_offline(args: argparse.Namespace) -> None:
                     hand_l_tensor,
                     hand_r_tensor,
                     pose_tensor,
+                    pose_conf_mask=pose_conf_mask,
                     detected_left=detections.hand_l,
                     detected_right=detections.hand_r,
                 )
