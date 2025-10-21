@@ -120,6 +120,7 @@ def test_main_export_generates_onnx_and_torchscript(tmp_path: Path, encoder_args
         "pad_mask": inputs[4],
         "miss_mask_hl": inputs[5],
         "miss_mask_hr": inputs[6],
+        "pose_conf_mask": inputs[7],
     }
 
     with torch.no_grad():

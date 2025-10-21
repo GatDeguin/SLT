@@ -23,7 +23,7 @@ if "cv2" not in sys.modules:
     def _mock_cvt_color(image: np.ndarray, code: int) -> np.ndarray:
         if code != mock_cv2.COLOR_BGR2RGB:  # pragma: no cover - defensive
             raise ValueError("Unsupported conversion code")
-        return image[..., ::-1]
+        return image[..., ::-1].copy()
 
     def _mock_resize(image: np.ndarray, size: Sequence[int], interpolation: int | None = None) -> np.ndarray:
         width, height = size
@@ -37,10 +37,12 @@ if "cv2" not in sys.modules:
     sys.modules["cv2"] = mock_cv2
 
 from slt.runtime.realtime import (
+    HolisticFrameProcessor,
     OnnxRuntimeEncoderRunner,
     TemporalBuffer,
     TensorRTEncoderRunner,
     TorchScriptEncoderRunner,
+    extract_pose_vector,
     load_export_metadata,
 )
 
@@ -94,17 +96,25 @@ def test_temporal_buffer_latency_masks() -> None:
     )
     device = torch.device("cpu")
 
+    recent_masks = []
     for idx in range(4):
         image = torch.full((3, 8, 8), float(idx), dtype=torch.float32)
         pose = torch.full((3 * 3,), float(idx), dtype=torch.float32)
+        pose_mask = torch.tensor(
+            [idx % 2 == 0, True, idx % 3 == 0], dtype=torch.bool
+        )
         buffer.append(
             face=image,
             hand_l=image,
             hand_r=image,
             pose=pose,
+            pose_conf_mask=pose_mask,
             missing_left=bool(idx % 2),
             missing_right=bool((idx + 1) % 2),
         )
+        recent_masks.append(pose_mask)
+        if len(recent_masks) > buffer.window_size:
+            recent_masks.pop(0)
 
     inputs = buffer.as_model_inputs(device, backend="torch")
     assert inputs is not None
@@ -116,6 +126,141 @@ def test_temporal_buffer_latency_masks() -> None:
     miss_right = inputs["miss_mask_hr"][0]
     assert miss_left.tolist() == [False, True, False, False]
     assert miss_right.tolist() == [True, False, False, False]
+
+    pose_conf = inputs["pose_conf_mask"][0]
+    assert pose_conf.shape == (buffer.sequence_length, buffer.pose_landmarks)
+    expected = torch.stack(recent_masks, dim=0)
+    assert torch.equal(pose_conf[: buffer.window_size], expected)
+    assert not pose_conf[buffer.window_size :].any()
+
+
+def test_temporal_buffer_accepts_detected_alias() -> None:
+    buffer = TemporalBuffer(sequence_length=2, image_size=4, pose_landmarks=2)
+    device = torch.device("cpu")
+
+    zeros = torch.zeros((3, 4, 4), dtype=torch.float32)
+    pose = torch.zeros(3 * buffer.pose_landmarks, dtype=torch.float32)
+    pose_mask = torch.tensor([True, False], dtype=torch.bool)
+
+    buffer.append(
+        face=zeros,
+        hand_l=zeros,
+        hand_r=zeros,
+        pose=pose,
+        pose_conf_mask=pose_mask,
+        detected_left=True,
+        detected_right=False,
+    )
+
+    inputs = buffer.as_model_inputs(device, backend="torch")
+    assert inputs is not None
+    assert inputs["miss_mask_hl"].shape[-1] == buffer.sequence_length
+    miss_left = inputs["miss_mask_hl"][0].tolist()
+    miss_right = inputs["miss_mask_hr"][0].tolist()
+    assert miss_left == [False, False]
+    assert miss_right == [True, False]
+    pose_conf = inputs["pose_conf_mask"][0, 0]
+    assert torch.equal(pose_conf, pose_mask)
+
+
+def test_extract_pose_vector_emits_mask() -> None:
+    landmarks = [
+        SimpleNamespace(x=0.1, y=0.2, visibility=0.9),
+        SimpleNamespace(x=0.3, y=0.4, visibility=0.4),
+        SimpleNamespace(x=0.5, y=0.6, visibility=0.7),
+        SimpleNamespace(x=0.7, y=0.8, visibility=0.2),
+    ]
+    pose_result = SimpleNamespace(
+        pose_landmarks=SimpleNamespace(landmark=landmarks)
+    )
+
+    pose, mask = extract_pose_vector(pose_result, 3)
+    assert pose.shape == (9,)
+    assert mask.dtype == torch.bool
+    assert mask.tolist() == [True, False, True]
+
+    empty_pose, empty_mask = extract_pose_vector(SimpleNamespace(), 2)
+    assert empty_pose.shape == (6,)
+    assert not empty_mask.any()
+
+
+def test_holistic_frame_processor_produces_pose_mask() -> None:
+    processor = HolisticFrameProcessor(
+        image_size=8,
+        pose_landmarks=3,
+        bbox_scale=1.0,
+        smoothing=0.0,
+        max_misses=1,
+    )
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    face_landmarks = [
+        SimpleNamespace(x=0.2, y=0.2, visibility=0.9),
+        SimpleNamespace(x=0.4, y=0.2, visibility=0.9),
+        SimpleNamespace(x=0.4, y=0.4, visibility=0.9),
+        SimpleNamespace(x=0.2, y=0.4, visibility=0.9),
+    ]
+    face_result = SimpleNamespace(
+        multi_face_landmarks=[SimpleNamespace(landmark=face_landmarks)]
+    )
+
+    hand_landmarks_left = [
+        SimpleNamespace(x=0.1, y=0.5, visibility=0.9),
+        SimpleNamespace(x=0.15, y=0.55, visibility=0.9),
+        SimpleNamespace(x=0.12, y=0.48, visibility=0.9),
+    ]
+    hand_landmarks_right = [
+        SimpleNamespace(x=0.75, y=0.45, visibility=0.9),
+        SimpleNamespace(x=0.82, y=0.5, visibility=0.9),
+        SimpleNamespace(x=0.78, y=0.55, visibility=0.9),
+    ]
+    hands_result = SimpleNamespace(
+        multi_hand_landmarks=[
+            SimpleNamespace(landmark=hand_landmarks_left),
+            SimpleNamespace(landmark=hand_landmarks_right),
+        ],
+        multi_handedness=[
+            SimpleNamespace(classification=[SimpleNamespace(label="Left")]),
+            SimpleNamespace(classification=[SimpleNamespace(label="Right")]),
+        ],
+    )
+
+    pose_landmarks = [
+        SimpleNamespace(x=0.1, y=0.1, visibility=0.9),
+        SimpleNamespace(x=0.2, y=0.2, visibility=0.3),
+        SimpleNamespace(x=0.3, y=0.3, visibility=0.8),
+    ]
+    pose_result = SimpleNamespace(
+        pose_landmarks=SimpleNamespace(landmark=pose_landmarks)
+    )
+
+    (
+        face_tensor,
+        hand_l_tensor,
+        hand_r_tensor,
+        pose_tensor,
+        pose_conf_mask,
+        detections,
+        boxes,
+    ) = processor.process(
+        frame,
+        face_result=face_result,
+        hands_result=hands_result,
+        pose_result=pose_result,
+    )
+
+    assert face_tensor.shape == (3, processor.image_size, processor.image_size)
+    assert hand_l_tensor.shape == face_tensor.shape
+    assert hand_r_tensor.shape == face_tensor.shape
+    assert pose_tensor.shape == (processor.pose_landmarks * 3,)
+    assert pose_conf_mask.dtype == torch.bool
+    assert pose_conf_mask.tolist() == [True, False, True]
+    assert detections.face
+    assert detections.hand_l
+    assert detections.hand_r
+    assert boxes["face"] is not None
+    assert boxes["hand_l"] is not None
+    assert boxes["hand_r"] is not None
 
 
 def test_runtime_backends_integration(tmp_path: Path) -> None:
@@ -205,11 +350,16 @@ def test_runtime_backends_integration(tmp_path: Path) -> None:
     for step in range(encoder_args.sequence_length + 1):
         img = torch.randn(3, encoder_args.image_size, encoder_args.image_size)
         pose = torch.randn(3 * encoder_args.pose_landmarks)
+        pose_mask = torch.tensor(
+            [(step + offset) % 2 == 0 for offset in range(encoder_args.pose_landmarks)],
+            dtype=torch.bool,
+        )
         buffer.append(
             face=img,
             hand_l=img,
             hand_r=img,
             pose=pose,
+            pose_conf_mask=pose_mask,
             missing_left=bool(step % 2),
             missing_right=bool((step + 1) % 2),
         )
@@ -227,6 +377,7 @@ def test_runtime_backends_integration(tmp_path: Path) -> None:
         "pad_mask": inputs_torch["pad_mask"],
         "miss_mask_hl": inputs_torch["miss_mask_hl"],
         "miss_mask_hr": inputs_torch["miss_mask_hr"],
+        "pose_conf_mask": inputs_torch["pose_conf_mask"],
     }
 
     with torch.no_grad():
@@ -296,8 +447,18 @@ def test_torchscript_runner_handles_non_divisible_image_size(tmp_path: Path) -> 
     pose = torch.randn(batch, seq, pose_dim, device=device)
     pad_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
     miss_mask = torch.zeros(batch, seq, dtype=torch.bool, device=device)
+    pose_conf_mask = torch.ones(batch, seq, args.pose_landmarks, dtype=torch.bool, device=device)
 
-    example_inputs = (face, hand_l, hand_r, pose, pad_mask, miss_mask, miss_mask)
+    example_inputs = (
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        pad_mask,
+        miss_mask,
+        miss_mask,
+        pose_conf_mask,
+    )
 
     with torch.no_grad():
         reference = export_module(*example_inputs)
@@ -321,6 +482,7 @@ def test_torchscript_runner_handles_non_divisible_image_size(tmp_path: Path) -> 
             "pad_mask": {"dtype": "bool"},
             "miss_mask_hl": {"dtype": "bool"},
             "miss_mask_hr": {"dtype": "bool"},
+            "pose_conf_mask": {"dtype": "bool"},
         }
     }
 
@@ -332,6 +494,7 @@ def test_torchscript_runner_handles_non_divisible_image_size(tmp_path: Path) -> 
         "pad_mask": pad_mask,
         "miss_mask_hl": miss_mask,
         "miss_mask_hr": miss_mask,
+        "pose_conf_mask": pose_conf_mask,
     }
 
     ts_runner = TorchScriptEncoderRunner(ts_path, metadata, device=device)
