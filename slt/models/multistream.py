@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import inspect
 import warnings
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .backbones import BackboneSpec, ViTConfig, load_backbone
@@ -362,6 +364,17 @@ class MultiStreamEncoder(torch.nn.Module):
             (self.pose_projector, None),
         )
         for module, backbone in projector_context:
+            if (
+                isinstance(module, StreamProjector)
+                and backbone is not None
+            ):
+                try:
+                    backbone_dim = self._infer_backbone_dim(backbone)
+                except AttributeError:
+                    backbone_dim = None
+                else:
+                    if module.out_dim != backbone_dim:
+                        continue
             self._maybe_install_dinov2(module, backbone)
         self._maybe_install_dinov2(self.fusion, None)
         self._maybe_install_dinov2(self.positional, self.face_backbone)
@@ -394,12 +407,74 @@ class MultiStreamEncoder(torch.nn.Module):
             )
 
     @staticmethod
+    def _extract_patch_size(
+        backbone: torch.nn.Module,
+    ) -> Optional[Tuple[int, int]]:
+        patch_embed = getattr(backbone, "patch_embed", None)
+
+        def _normalize(size: Any) -> Optional[Tuple[int, int]]:
+            if size is None:
+                return None
+            if isinstance(size, (int, float)):
+                value = int(size)
+                if value > 0:
+                    return value, value
+                return None
+            if isinstance(size, Sequence):
+                values = [int(v) for v in size]
+                if len(values) == 1:
+                    values = values * 2
+                if len(values) >= 2 and values[0] > 0 and values[1] > 0:
+                    return values[0], values[1]
+            return None
+
+        if patch_embed is None:
+            return None
+
+        candidates = [patch_embed]
+        for attr in ("proj", "projection"):
+            candidate = getattr(patch_embed, attr, None)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            kernel_size = getattr(candidate, "kernel_size", None)
+            patch = _normalize(kernel_size)
+            if patch is not None:
+                return patch
+
+        for owner in (patch_embed, backbone):
+            patch = _normalize(getattr(owner, "patch_size", None))
+            if patch is not None:
+                return patch
+
+        return None
+
+    @staticmethod
     def _encode_backbone(backbone: torch.nn.Module, stream: Tensor) -> Tensor:
         if stream.dim() != 5:
             raise ValueError(
                 "Backbone inputs must have shape (batch, time, channels, height, width)."
             )
         batch, time = stream.shape[:2]
+        patch = MultiStreamEncoder._extract_patch_size(backbone)
+        if patch is not None:
+            patch_h, patch_w = patch
+            if patch_h > 0 and patch_w > 0:
+                height, width = stream.shape[-2:]
+                target_h = math.ceil(height / patch_h) * patch_h
+                target_w = math.ceil(width / patch_w) * patch_w
+                if target_h != height or target_w != width:
+                    pad_bottom = target_h - height
+                    pad_right = target_w - width
+                    if pad_bottom < 0 or pad_right < 0:
+                        raise ValueError(
+                            "Target spatial dimensions must be greater or equal to the input"
+                        )
+                    pad_spec = (0, pad_right, 0, pad_bottom, 0, 0)
+                    stream = stream.permute(0, 2, 1, 3, 4)
+                    stream = F.pad(stream, pad_spec, mode="replicate")
+                    stream = stream.permute(0, 2, 1, 3, 4)
         flat = stream.view(batch * time, *stream.shape[2:])
         features = backbone(flat)
         return features.view(batch, time, -1)
