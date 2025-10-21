@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
-import torch.nn as nn
 from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
@@ -218,84 +217,61 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         "dim_feedforward": args.temporal_dim_feedforward,
         "dropout": args.temporal_dropout,
     }
-    disable_dino = args.image_size % 14 != 0
-    backbone_overrides: Dict[str, Any] = {}
-    if disable_dino:
-        embed_dim = max(int(args.projector_dim), 16)
-
-        class _TinyBackbone(nn.Module):  # pragma: no cover - simple feed-forward module
-            def __init__(self) -> None:
-                super().__init__()
-                self.embed_dim = embed_dim
-                hidden = max(embed_dim, 32)
-                self.net = nn.Sequential(
-                    nn.Conv2d(3, hidden, kernel_size=3, stride=1, padding=1),
-                    nn.GELU(),
-                    nn.Conv2d(hidden, embed_dim, kernel_size=1),
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Flatten(),
-                )
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                return self.net(x)
-
-        backbone_overrides = {
-            "face": _TinyBackbone,
-            "hand_left": _TinyBackbone,
-            "hand_right": _TinyBackbone,
-        }
-
-    original_auto = getattr(MultiStreamEncoder, "_auto_configure_components")
-    if disable_dino:
-        MultiStreamEncoder._auto_configure_components = lambda self: None  # type: ignore[assignment]
-    try:
-        encoder = MultiStreamEncoder(
-            backbone_config=vit_config,
-            projector_dim=args.projector_dim,
-            d_model=args.d_model,
-            pose_dim=3 * args.pose_landmarks,
-            positional_num_positions=args.sequence_length,
-            projector_dropout=args.projector_dropout,
-            fusion_dropout=args.fusion_dropout,
-            temporal_kwargs=temporal_kwargs,
-            backbones=backbone_overrides,
-        )
-    finally:
-        if disable_dino:
-            MultiStreamEncoder._auto_configure_components = original_auto  # type: ignore[assignment]
+    encoder = MultiStreamEncoder(
+        backbone_config=vit_config,
+        projector_dim=args.projector_dim,
+        d_model=args.d_model,
+        pose_dim=3 * args.pose_landmarks,
+        positional_num_positions=args.sequence_length,
+        projector_dropout=args.projector_dropout,
+        fusion_dropout=args.fusion_dropout,
+        temporal_kwargs=temporal_kwargs,
+    )
     setattr(args, "_packaged_meta", {})
     return encoder
 
 
-def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEncoder) -> OrderedDict[str, torch.Tensor]:
+def _select_state_dict(
+    state: Mapping[str, torch.Tensor], model: MultiStreamEncoder
+) -> OrderedDict[str, torch.Tensor]:
     expected_keys = set(model.state_dict().keys())
-    provided_keys = set(state.keys())
 
-    if provided_keys == expected_keys:
-        return OrderedDict(state)
+    attempts: list[tuple[str, Mapping[str, torch.Tensor], set[str]]] = []
 
-    prefixes = ["encoder.", "module.encoder."]
-    for prefix in prefixes:
-        filtered = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
-        if set(filtered.keys()) == expected_keys:
-            return OrderedDict(filtered)
+    def _register_attempt(
+        mapping: Mapping[str, torch.Tensor], description: str
+    ) -> Optional[OrderedDict[str, torch.Tensor]]:
+        keys = set(mapping.keys())
+        attempts.append((description, mapping, keys))
+        if keys == expected_keys:
+            return OrderedDict(mapping)
+        return None
 
-    # Fallback: iteratively strip known leading segments until a match is found.
+    match = _register_attempt(state, "original layout")
+    if match is not None:
+        return match
+
+    for prefix in ("encoder.", "module.encoder."):
+        filtered = {
+            key[len(prefix) :]: value
+            for key, value in state.items()
+            if key.startswith(prefix)
+        }
+        if filtered:
+            match = _register_attempt(filtered, f"removing prefix '{prefix}'")
+            if match is not None:
+                return match
+
     stripped: Dict[str, torch.Tensor] = {}
+    skip_tokens = {"encoder", "module", "model", "state_dict", "checkpoint"}
     for key, value in state.items():
         segments = key.split(".")
-        while segments and segments[0] in {"encoder", "module", "model", "state_dict", "checkpoint"}:
+        while segments and segments[0] in skip_tokens:
             segments = segments[1:]
-        candidate = ".".join(segments)
-        if candidate in expected_keys:
-            stripped[candidate] = value
-        else:
-            stripped[candidate] = value
-    if stripped:
-        if set(stripped.keys()) == expected_keys:
-            return OrderedDict(stripped)
+        candidate = ".".join(segments) or key
+        stripped[candidate] = value
 
-        # Handle projector architectures that differ only by dropout layers.
+    if stripped:
         remapped = dict(stripped)
         for key in list(remapped.keys()):
             if key in expected_keys:
@@ -312,12 +288,35 @@ def _select_state_dict(state: Mapping[str, torch.Tensor], model: MultiStreamEnco
             if shifted_key in expected_keys and shifted_key not in remapped:
                 remapped[shifted_key] = remapped.pop(key)
 
-        if set(remapped.keys()) == expected_keys:
-            return OrderedDict(remapped)
+        match = _register_attempt(remapped, "stripping common prefixes")
+        if match is not None:
+            return match
 
+    best_description = ""
+    best_keys: set[str] = set()
+    for description, _, keys in attempts:
+        overlap = len(expected_keys & keys)
+        if overlap > len(expected_keys & best_keys):
+            best_description = description
+            best_keys = keys
+
+    missing = sorted(expected_keys - best_keys)
+    unexpected = sorted(best_keys - expected_keys)
+    details: list[str] = []
+    if missing:
+        preview = ", ".join(missing[:3])
+        details.append(f"missing {len(missing)} parameter(s) (e.g. {preview})")
+    if unexpected:
+        preview = ", ".join(unexpected[:3])
+        details.append(f"unexpected {len(unexpected)} parameter(s) (e.g. {preview})")
+    if not details:
+        details.append("no compatible parameter prefixes detected")
+    hint = f" after {best_description}" if best_description else ""
     raise RuntimeError(
-        "Checkpoint does not contain weights compatible with MultiStreamEncoder. "
-        "Expected keys matching encoder parameters."
+        "Checkpoint parameters are incompatible with MultiStreamEncoder: "
+        + "; ".join(details)
+        + hint
+        + "."
     )
 
 
