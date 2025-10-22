@@ -7,7 +7,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -44,9 +44,70 @@ class SampleItem:
     length: torch.Tensor
     miss_mask_hl: torch.Tensor
     miss_mask_hr: torch.Tensor
+    keypoints: torch.Tensor
+    keypoints_mask: torch.Tensor
+    keypoints_frame_mask: torch.Tensor
+    keypoints_body: torch.Tensor
+    keypoints_body_mask: torch.Tensor
+    keypoints_body_frame_mask: torch.Tensor
+    keypoints_hand_l: torch.Tensor
+    keypoints_hand_l_mask: torch.Tensor
+    keypoints_hand_l_frame_mask: torch.Tensor
+    keypoints_hand_r: torch.Tensor
+    keypoints_hand_r_mask: torch.Tensor
+    keypoints_hand_r_frame_mask: torch.Tensor
+    keypoints_face: torch.Tensor
+    keypoints_face_mask: torch.Tensor
+    keypoints_face_frame_mask: torch.Tensor
+    keypoints_lengths: torch.Tensor
+    ctc_labels: Optional[torch.Tensor]
+    ctc_mask: Optional[torch.Tensor]
+    gloss_sequence: Optional[List[str]]
     quality: Dict[str, Any]
     text: str
+    gloss_text: Optional[str]
     video_id: str
+
+
+_MSKA_FACE_SUBSET = [1, 133, 362, 13]
+
+
+def _resolve_mediapipe_layout(num_landmarks: int) -> Dict[str, List[int]]:
+    """Devuelve el layout de índices esperado para los keypoints de MediaPipe."""
+
+    if num_landmarks >= 543:
+        face_offset = 33
+        hand_l_offset = face_offset + 468
+        hand_r_offset = hand_l_offset + 21
+        layout = {
+            "body": list(range(0, 33)),
+            "hand_l": list(range(hand_l_offset, hand_l_offset + 21)),
+            "hand_r": list(range(hand_r_offset, hand_r_offset + 21)),
+            "face": [face_offset + idx for idx in _MSKA_FACE_SUBSET],
+        }
+        return {key: list(value) for key, value in layout.items()}
+    if num_landmarks == 79:
+        layout = {
+            "body": list(range(0, 33)),
+            "hand_l": list(range(33, 54)),
+            "hand_r": list(range(54, 75)),
+            "face": list(range(75, 79)),
+        }
+        return {key: list(value) for key, value in layout.items()}
+    raise ValueError(
+        "No se puede inferir la estructura de keypoints: se esperaban 79 u "
+        ">=543 landmarks.")
+
+
+def _face_swap_pairs(face_count: int) -> List[Tuple[int, int]]:
+    """Pares de puntos faciales a intercambiar al reflejar."""
+
+    if face_count >= len(_MSKA_FACE_SUBSET):
+        # orden canónico: [nariz, ojo izq, ojo der, boca]
+        return [(1, 2)]
+    if face_count >= 2:
+        return [(1, face_count - 1)]
+    return []
 
 
 class LsaTMultiStream(Dataset):
@@ -72,6 +133,8 @@ class LsaTMultiStream(Dataset):
         pose_dir: str,
         csv_path: str,
         index_csv: str,
+        keypoints_dir: Optional[str] = None,
+        gloss_csv: Optional[str] = None,
         T: int = 128,
         img_size: int = 224,
         lkp_count: int = 13,
@@ -89,6 +152,7 @@ class LsaTMultiStream(Dataset):
         self.hand_l_dir = hand_l_dir
         self.hand_r_dir = hand_r_dir
         self.pose_dir = pose_dir
+        self.keypoints_dir = keypoints_dir
         self.img_size = img_size
         self.T = T
         self.lkp_count = lkp_count
@@ -99,6 +163,13 @@ class LsaTMultiStream(Dataset):
         self.quality_strict = quality_strict
         self.fps_tolerance = fps_tolerance
         self._np = np
+        self._keypoint_layout: Optional[Dict[str, List[int]]] = None
+        self._keypoint_total: int = 0
+        self._gloss_sequences: Dict[str, List[str]] = {}
+        self._gloss_texts: Dict[str, str] = {}
+        self._ctc_labels: Dict[str, torch.Tensor] = {}
+        self._ctc_masks: Dict[str, torch.Tensor] = {}
+        self._keypoint_source_total: int = 0
 
         df = pd.read_csv(csv_path, sep=";")
         df.columns = [c.strip().lower() for c in df.columns]
@@ -113,6 +184,39 @@ class LsaTMultiStream(Dataset):
         self.df = df.merge(idx[["video_id"]], on="video_id", how="inner")
         self.ids = self.df["video_id"].tolist()
         self.texts = dict(zip(df["video_id"], df["texto"]))
+
+        if gloss_csv:
+            gloss_df = pd.read_csv(gloss_csv, sep=";")
+            gloss_df.columns = [c.strip().lower() for c in gloss_df.columns]
+            if "video_id" not in gloss_df.columns:
+                raise ValueError(
+                    "El CSV de glosas debe contener la columna 'video_id'.")
+            if "gloss" in gloss_df.columns:
+                self._gloss_texts = {
+                    str(row["video_id"]): str(row["gloss"])
+                    for _, row in gloss_df.iterrows()
+                }
+                self._gloss_sequences = {
+                    vid: [token for token in text.split() if token]
+                    for vid, text in self._gloss_texts.items()
+                }
+            if "ctc_labels" in gloss_df.columns:
+                for _, row in gloss_df.iterrows():
+                    vid = str(row["video_id"])
+                    labels_raw = str(row["ctc_labels"]).strip()
+                    if not labels_raw:
+                        continue
+                    try:
+                        labels = torch.tensor(
+                            [int(tok) for tok in labels_raw.split()],
+                            dtype=torch.long,
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"ctc_labels inválidos para {vid}: {labels_raw}") from exc
+                    mask = torch.ones(labels.shape[0], dtype=torch.bool)
+                    self._ctc_labels[vid] = labels
+                    self._ctc_masks[vid] = mask
 
         def _coerce(value: Any) -> Optional[float]:
             if value is None:
@@ -188,6 +292,21 @@ class LsaTMultiStream(Dataset):
         idxs = np.rint(positions).astype("int64").tolist()
         return [max(0, min(last_index, int(i))) for i in idxs]
 
+    def _ensure_keypoint_layout(self, num_landmarks: int) -> None:
+        if num_landmarks <= 0:
+            return
+        if self._keypoint_layout is None:
+            layout = _resolve_mediapipe_layout(num_landmarks)
+            self._keypoint_layout = layout
+            self._keypoint_total = sum(len(v) for v in layout.values())
+            self._keypoint_source_total = num_landmarks
+            return
+        if num_landmarks in (self._keypoint_source_total, self._keypoint_total):
+            return
+        raise ValueError(
+            "Formato de keypoints inconsistente entre videos: se detectaron "
+            f"{self._keypoint_source_total} y {num_landmarks} landmarks.")
+
     # ------------------------------------------------------------------
     # Dataset API
     # ------------------------------------------------------------------
@@ -209,6 +328,20 @@ class LsaTMultiStream(Dataset):
         pose = self._load_pose(pose_path)
         pose_length = pose.shape[0] if hasattr(pose, "shape") else 0
         stream_lengths["pose"] = pose_length
+
+        kp_selected = self._np.zeros((0, 0, 3), dtype="float32")
+        if self.keypoints_dir:
+            base = os.path.join(self.keypoints_dir, vid)
+            kp_path = None
+            for ext in (".npz", ".npy"):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    kp_path = candidate
+                    break
+            kp_raw = self._read_keypoints_array(kp_path)
+            kp_selected = self._select_keypoints(kp_raw)
+        keypoints_length = kp_selected.shape[0] if kp_selected.size > 0 else 0
+        stream_lengths["keypoints"] = keypoints_length
 
         T0 = max(stream_lengths.values()) if stream_lengths else 0
         idxs = self._sample_indices(T0)
@@ -252,6 +385,7 @@ class LsaTMultiStream(Dataset):
         hand_r = torch.stack(hr_list, dim=0)
 
         pose_t, pose_mask = self._sample_pose(pose)
+        keypoints_data = self._sample_keypoints(kp_selected, idxs)
         effective_length = self._effective_length(stream_lengths)
 
         pad_mask = torch.zeros(self.T, dtype=torch.bool)
@@ -260,6 +394,23 @@ class LsaTMultiStream(Dataset):
         length = torch.tensor(effective_length, dtype=torch.long)
         miss_mask_hl = torch.tensor(miss_hl, dtype=torch.bool)
         miss_mask_hr = torch.tensor(miss_hr, dtype=torch.bool)
+
+        keypoints = torch.from_numpy(keypoints_data["keypoints"]).to(torch.float32)
+        keypoints_mask = torch.from_numpy(keypoints_data["mask"])
+        keypoints_frame_mask = torch.from_numpy(keypoints_data["frame_mask"])
+
+        views_tensors = {
+            key: torch.from_numpy(value).to(torch.float32)
+            for key, value in keypoints_data["views"].items()
+        }
+        view_masks = {
+            key: torch.from_numpy(value)
+            for key, value in keypoints_data["view_masks"].items()
+        }
+        view_frame_masks = {
+            key: torch.from_numpy(value)
+            for key, value in keypoints_data["view_frame_masks"].items()
+        }
 
         mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
@@ -276,6 +427,23 @@ class LsaTMultiStream(Dataset):
             miss_mask_hl, miss_mask_hr = miss_mask_hr, miss_mask_hl
             pose_t = self._flip_pose_tensor(pose_t)
             pose_mask = self._flip_pose_mask(pose_mask)
+            keypoints, keypoints_mask, keypoints_frame_mask = self._flip_keypoints(
+                keypoints, keypoints_mask, keypoints_frame_mask
+            )
+            views_tensors, view_masks, view_frame_masks = self._flip_keypoint_views(
+                views_tensors, view_masks, view_frame_masks
+            )
+
+        keypoints_lengths = torch.tensor(
+            [
+                int(keypoints_frame_mask.sum().item()),
+                int(view_frame_masks.get("body", torch.zeros(self.T, dtype=torch.bool)).sum().item()),
+                int(view_frame_masks.get("hand_l", torch.zeros(self.T, dtype=torch.bool)).sum().item()),
+                int(view_frame_masks.get("hand_r", torch.zeros(self.T, dtype=torch.bool)).sum().item()),
+                int(view_frame_masks.get("face", torch.zeros(self.T, dtype=torch.bool)).sum().item()),
+            ],
+            dtype=torch.long,
+        )
 
         quality = self._build_quality_report(
             vid,
@@ -283,8 +451,18 @@ class LsaTMultiStream(Dataset):
             hand_l_frames=hl_frames,
             hand_r_frames=hr_frames,
             pose_frames=pose,
+            keypoint_frames=kp_selected,
             effective_length=effective_length,
         )
+
+        gloss_text = self._gloss_texts.get(vid)
+        gloss_seq = self._gloss_sequences.get(vid)
+        ctc_labels = self._ctc_labels.get(vid)
+        ctc_mask = self._ctc_masks.get(vid)
+
+        zeros_body = torch.zeros(self.T, 0, 3)
+        zeros_mask = torch.zeros(self.T, 0, dtype=torch.bool)
+        zeros_frame = torch.zeros(self.T, dtype=torch.bool)
 
         return SampleItem(
             face=face,
@@ -296,8 +474,36 @@ class LsaTMultiStream(Dataset):
             length=length,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            keypoints=keypoints,
+            keypoints_mask=keypoints_mask,
+            keypoints_frame_mask=keypoints_frame_mask,
+            keypoints_body=views_tensors.get("body", torch.zeros_like(zeros_body)),
+            keypoints_body_mask=view_masks.get("body", torch.zeros_like(zeros_mask)),
+            keypoints_body_frame_mask=view_frame_masks.get(
+                "body", torch.zeros_like(zeros_frame)
+            ),
+            keypoints_hand_l=views_tensors.get("hand_l", torch.zeros_like(zeros_body)),
+            keypoints_hand_l_mask=view_masks.get("hand_l", torch.zeros_like(zeros_mask)),
+            keypoints_hand_l_frame_mask=view_frame_masks.get(
+                "hand_l", torch.zeros_like(zeros_frame)
+            ),
+            keypoints_hand_r=views_tensors.get("hand_r", torch.zeros_like(zeros_body)),
+            keypoints_hand_r_mask=view_masks.get("hand_r", torch.zeros_like(zeros_mask)),
+            keypoints_hand_r_frame_mask=view_frame_masks.get(
+                "hand_r", torch.zeros_like(zeros_frame)
+            ),
+            keypoints_face=views_tensors.get("face", torch.zeros_like(zeros_body)),
+            keypoints_face_mask=view_masks.get("face", torch.zeros_like(zeros_mask)),
+            keypoints_face_frame_mask=view_frame_masks.get(
+                "face", torch.zeros_like(zeros_frame)
+            ),
+            keypoints_lengths=keypoints_lengths,
+            ctc_labels=ctc_labels,
+            ctc_mask=ctc_mask,
+            gloss_sequence=gloss_seq,
             quality=quality,
             text=text,
+            gloss_text=gloss_text,
             video_id=vid,
         )
 
@@ -396,6 +602,324 @@ class LsaTMultiStream(Dataset):
         mask_tensor = torch.from_numpy(mask.astype("bool"))
         return pose_tensor, mask_tensor
 
+    # ------------------------------------------------------------------
+    # Keypoint helpers
+    # ------------------------------------------------------------------
+    def _read_keypoints_array(self, kp_path: Optional[str]) -> Any:
+        np = self._np
+        if not kp_path or not os.path.exists(kp_path):
+            total = self._keypoint_total if self._keypoint_total > 0 else 0
+            return np.zeros((0, total, 3), dtype="float32")
+
+        try:
+            if kp_path.endswith(".npz"):
+                with np.load(kp_path) as kp_npz:
+                    arr = None
+                    for key in ("keypoints", "kp", "points", "landmarks"):
+                        if key in kp_npz:
+                            arr = kp_npz[key]
+                            break
+                    if arr is None and kp_npz.files:
+                        arr = kp_npz[kp_npz.files[0]]
+                    conf = None
+                    for key in ("confidence", "conf", "scores"):
+                        if key in kp_npz:
+                            conf = kp_npz[key]
+                            break
+            else:
+                arr = np.load(kp_path)
+                conf = None
+        except (OSError, ValueError):
+            return np.zeros((0, 0, 3), dtype="float32")
+
+        arr = np.asarray(arr, dtype="float32")
+        if arr.ndim == 3:
+            frames, landmarks, dims = arr.shape
+            if dims < 2:
+                return np.zeros((0, 0, 3), dtype="float32")
+            if dims == 2:
+                ones = np.ones((frames, landmarks, 1), dtype="float32")
+                arr = np.concatenate([arr, ones], axis=2)
+            elif dims > 3:
+                arr = arr[:, :, :3]
+        elif arr.ndim == 2:
+            frames, feats = arr.shape
+            if feats % 3 == 0:
+                arr = arr.reshape(frames, feats // 3, 3)
+            elif feats % 2 == 0:
+                coords = arr.reshape(frames, feats // 2, 2)
+                ones = np.ones((frames, feats // 2, 1), dtype="float32")
+                arr = np.concatenate([coords, ones], axis=2)
+            else:
+                return np.zeros((0, 0, 3), dtype="float32")
+        else:
+            return np.zeros((0, 0, 3), dtype="float32")
+
+        frames = arr.shape[0]
+        landmarks = arr.shape[1]
+        if conf is not None:
+            conf_arr = np.asarray(conf, dtype="float32")
+            try:
+                conf_arr = conf_arr.reshape(frames, landmarks)
+            except ValueError:
+                conf_arr = np.ones((frames, landmarks), dtype="float32")
+            arr[:, :, 2] = conf_arr
+        self._ensure_keypoint_layout(landmarks)
+        return arr
+
+    def _select_keypoints(self, kp_arr: Any) -> Any:
+        np = self._np
+        arr = np.asarray(kp_arr, dtype="float32")
+        if arr.size == 0:
+            total = self._keypoint_total if self._keypoint_total > 0 else 0
+            return np.zeros((0, total, 3), dtype="float32")
+        if self._keypoint_layout is None:
+            self._ensure_keypoint_layout(arr.shape[1])
+        if not self._keypoint_layout:
+            return np.zeros((arr.shape[0], 0, 3), dtype="float32")
+
+        order: List[int] = []
+        for key in ("body", "hand_l", "hand_r", "face"):
+            order.extend(self._keypoint_layout.get(key, []))
+
+        selected = np.zeros((arr.shape[0], len(order), 3), dtype="float32")
+        for out_idx, src_idx in enumerate(order):
+            if src_idx < arr.shape[1]:
+                selected[:, out_idx, :] = arr[:, src_idx, :]
+        return selected
+
+    def _split_keypoint_views(
+        self,
+        kp_arr: Any,
+    ) -> Dict[str, Any]:
+        np = self._np
+        if kp_arr.size == 0 or not self._keypoint_layout:
+            result: Dict[str, Any] = {}
+            for key in ("body", "hand_l", "hand_r", "face"):
+                count = len(self._keypoint_layout[key]) if self._keypoint_layout else 0
+                result[key] = np.zeros((kp_arr.shape[0], count, 3), dtype="float32")
+            return result
+
+        result = {}
+        start = 0
+        for key in ("body", "hand_l", "hand_r", "face"):
+            count = len(self._keypoint_layout.get(key, []))
+            result[key] = kp_arr[:, start : start + count, :]
+            start += count
+        return result
+
+    def _sample_keypoints(
+        self,
+        kp_arr: Any,
+        idxs: Sequence[int],
+    ) -> Dict[str, Any]:
+        np = self._np
+        arr = np.asarray(kp_arr, dtype="float32")
+        if arr.ndim != 3:
+            arr = np.zeros((0, 0, 3), dtype="float32")
+        frames = arr.shape[0]
+        if frames <= 0:
+            total = self._keypoint_total if self._keypoint_total > 0 else 0
+            base = np.zeros((self.T, total, 3), dtype="float32")
+            mask = np.zeros((self.T, total), dtype="bool")
+            frame_mask = np.zeros(self.T, dtype="bool")
+            views = self._split_keypoint_views(base)
+            view_masks = {k: np.zeros(v.shape[:2], dtype="bool") for k, v in views.items()}
+            view_frame_masks = {k: np.zeros(self.T, dtype="bool") for k in views}
+            lengths = {k: 0 for k in views}
+            return {
+                "keypoints": base,
+                "mask": mask,
+                "frame_mask": frame_mask,
+                "views": views,
+                "view_masks": view_masks,
+                "view_frame_masks": view_frame_masks,
+                "view_lengths": lengths,
+            }
+
+        clamped = [min(max(0, i), frames - 1) for i in idxs]
+        sampled = arr[clamped]
+        conf = sampled[:, :, 2]
+        mask = conf >= self.min_conf
+        sampled[:, :, :2] *= mask[..., None].astype("float32")
+        frame_mask = mask.any(axis=1)
+
+        views_np = self._split_keypoint_views(sampled)
+        view_masks = {}
+        view_frame_masks = {}
+        view_lengths = {}
+        start = 0
+        for key, view_arr in views_np.items():
+            count = view_arr.shape[1]
+            if count == 0:
+                view_mask = np.zeros((self.T, 0), dtype="bool")
+                view_frame = np.zeros(self.T, dtype="bool")
+            else:
+                view_mask = mask[:, start : start + count]
+                view_frame = view_mask.any(axis=1)
+            view_masks[key] = view_mask
+            view_frame_masks[key] = view_frame
+            view_lengths[key] = int(view_frame.sum())
+            start += count
+
+        return {
+            "keypoints": sampled,
+            "mask": mask,
+            "frame_mask": frame_mask,
+            "views": views_np,
+            "view_masks": view_masks,
+            "view_frame_masks": view_frame_masks,
+            "view_lengths": view_lengths,
+        }
+
+    def _flip_keypoints(
+        self,
+        keypoints: torch.Tensor,
+        mask: torch.Tensor,
+        frame_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if keypoints.numel() == 0:
+            return keypoints, mask, frame_mask
+
+        flipped = keypoints.clone()
+        flipped[:, :, 0] = 1.0 - flipped[:, :, 0]
+        mask_flipped = mask.clone()
+
+        body_count = len(self._keypoint_layout.get("body", [])) if self._keypoint_layout else 0
+        hand_l_count = len(self._keypoint_layout.get("hand_l", [])) if self._keypoint_layout else 0
+        hand_r_count = len(self._keypoint_layout.get("hand_r", [])) if self._keypoint_layout else 0
+        face_count = len(self._keypoint_layout.get("face", [])) if self._keypoint_layout else 0
+
+        if body_count:
+            for left_idx, right_idx in self._pose_swap_pairs(body_count):
+                if left_idx < body_count and right_idx < body_count:
+                    li = left_idx
+                    ri = right_idx
+                    flipped[:, [li, ri], :] = flipped[:, [ri, li], :]
+                    mask_flipped[:, [li, ri]] = mask_flipped[:, [ri, li]]
+
+        # Manos: intercambiar segmentos completos
+        if hand_l_count and hand_r_count:
+            left_start = body_count
+            right_start = body_count + hand_l_count
+            left_slice = slice(left_start, left_start + hand_l_count)
+            right_slice = slice(right_start, right_start + hand_r_count)
+            flipped_left = flipped[:, left_slice].clone()
+            flipped_right = flipped[:, right_slice].clone()
+            mask_left = mask_flipped[:, left_slice].clone()
+            mask_right = mask_flipped[:, right_slice].clone()
+            flipped[:, left_slice] = flipped_right
+            flipped[:, right_slice] = flipped_left
+            mask_flipped[:, left_slice] = mask_right
+            mask_flipped[:, right_slice] = mask_left
+
+        if face_count:
+            face_start = body_count + hand_l_count + hand_r_count
+            for left_idx, right_idx in _face_swap_pairs(face_count):
+                if left_idx < face_count and right_idx < face_count:
+                    li = face_start + left_idx
+                    ri = face_start + right_idx
+                    flipped[:, [li, ri], :] = flipped[:, [ri, li], :]
+                    mask_flipped[:, [li, ri]] = mask_flipped[:, [ri, li]]
+
+        frame_mask_flipped = mask_flipped.any(dim=1)
+        return flipped, mask_flipped, frame_mask_flipped
+
+    def _flip_keypoint_views(
+        self,
+        views: Dict[str, torch.Tensor],
+        masks: Dict[str, torch.Tensor],
+        frame_masks: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        flipped_views: Dict[str, torch.Tensor] = {}
+        flipped_masks: Dict[str, torch.Tensor] = {}
+        flipped_frame_masks: Dict[str, torch.Tensor] = {}
+
+        body = views.get("body")
+        body_mask = masks.get("body")
+        body_frame = frame_masks.get("body")
+        if body is not None:
+            body_flipped = body.clone()
+            body_flipped[:, :, 0] = 1.0 - body_flipped[:, :, 0]
+            mask_body = body_mask.clone() if body_mask is not None else torch.zeros(
+                body_flipped.shape[:2], dtype=torch.bool
+            )
+            for left_idx, right_idx in self._pose_swap_pairs(body_flipped.shape[1]):
+                if right_idx < body_flipped.shape[1] and left_idx < body_flipped.shape[1]:
+                    body_flipped[:, [left_idx, right_idx]] = body_flipped[:, [right_idx, left_idx]]
+                    mask_body[:, [left_idx, right_idx]] = mask_body[:, [right_idx, left_idx]]
+            flipped_views["body"] = body_flipped
+            flipped_masks["body"] = mask_body
+            flipped_frame_masks["body"] = (
+                body_frame.clone() if body_frame is not None else mask_body.any(dim=1)
+            )
+
+        left = views.get("hand_l")
+        right = views.get("hand_r")
+        left_mask = masks.get("hand_l")
+        right_mask = masks.get("hand_r")
+        left_frame = frame_masks.get("hand_l")
+        right_frame = frame_masks.get("hand_r")
+        if left is not None and right is not None:
+            new_left = right.clone()
+            new_right = left.clone()
+            new_left[:, :, 0] = 1.0 - new_left[:, :, 0]
+            new_right[:, :, 0] = 1.0 - new_right[:, :, 0]
+            mask_left = right_mask.clone() if right_mask is not None else torch.zeros(
+                right.shape[:2], dtype=torch.bool
+            )
+            mask_right = left_mask.clone() if left_mask is not None else torch.zeros(
+                left.shape[:2], dtype=torch.bool
+            )
+            flipped_views["hand_l"] = new_left
+            flipped_views["hand_r"] = new_right
+            flipped_masks["hand_l"] = mask_left
+            flipped_masks["hand_r"] = mask_right
+            flipped_frame_masks["hand_l"] = (
+                right_frame.clone() if right_frame is not None else mask_left.any(dim=1)
+            )
+            flipped_frame_masks["hand_r"] = (
+                left_frame.clone() if left_frame is not None else mask_right.any(dim=1)
+            )
+        else:
+            if left is not None:
+                flipped_views["hand_l"] = left
+                flipped_masks["hand_l"] = left_mask if left_mask is not None else torch.zeros(
+                    left.shape[:2], dtype=torch.bool
+                )
+                flipped_frame_masks["hand_l"] = (
+                    left_frame.clone() if left_frame is not None else flipped_masks["hand_l"].any(dim=1)
+                )
+            if right is not None:
+                flipped_views["hand_r"] = right
+                flipped_masks["hand_r"] = right_mask if right_mask is not None else torch.zeros(
+                    right.shape[:2], dtype=torch.bool
+                )
+                flipped_frame_masks["hand_r"] = (
+                    right_frame.clone() if right_frame is not None else flipped_masks["hand_r"].any(dim=1)
+                )
+
+        face = views.get("face")
+        face_mask = masks.get("face")
+        face_frame = frame_masks.get("face")
+        if face is not None:
+            face_flipped = face.clone()
+            face_flipped[:, :, 0] = 1.0 - face_flipped[:, :, 0]
+            mask_face = face_mask.clone() if face_mask is not None else torch.zeros(
+                face.shape[:2], dtype=torch.bool
+            )
+            for left_idx, right_idx in _face_swap_pairs(face_flipped.shape[1]):
+                if right_idx < face_flipped.shape[1] and left_idx < face_flipped.shape[1]:
+                    face_flipped[:, [left_idx, right_idx]] = face_flipped[:, [right_idx, left_idx]]
+                    mask_face[:, [left_idx, right_idx]] = mask_face[:, [right_idx, left_idx]]
+            flipped_views["face"] = face_flipped
+            flipped_masks["face"] = mask_face
+            flipped_frame_masks["face"] = (
+                face_frame.clone() if face_frame is not None else mask_face.any(dim=1)
+            )
+
+        return flipped_views, flipped_masks, flipped_frame_masks
+
     def _flip_pose_tensor(self, pose: torch.Tensor) -> torch.Tensor:
         """Devuelve ``pose`` reflejada horizontalmente, intercambiando lados."""
 
@@ -485,6 +1009,7 @@ class LsaTMultiStream(Dataset):
         hand_l_frames: List[str],
         hand_r_frames: List[str],
         pose_frames: Any,
+        keypoint_frames: Any,
         effective_length: int,
     ) -> Dict[str, Any]:
         report: Dict[str, Any] = {
@@ -536,6 +1061,15 @@ class LsaTMultiStream(Dataset):
         pose_len = pose_frames.shape[0] if hasattr(pose_frames, "shape") else 0
         if pose_len <= 0:
             report["missing_frames"]["pose"] = {
+                "count": 1,
+                "indices": "all",
+                "available": 0,
+                "expected": effective_length,
+            }
+
+        kp_len = keypoint_frames.shape[0] if hasattr(keypoint_frames, "shape") else 0
+        if kp_len <= 0:
+            report["missing_frames"]["keypoints"] = {
                 "count": 1,
                 "indices": "all",
                 "available": 0,
@@ -599,7 +1133,9 @@ def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
     def stack_attr(attr: str) -> torch.Tensor:
         return torch.stack([getattr(sample, attr) for sample in batch_list], dim=0)
 
-    return {
+    batch_size = len(batch_list)
+
+    data: Dict[str, Any] = {
         "face": stack_attr("face"),
         "hand_l": stack_attr("hand_l"),
         "hand_r": stack_attr("hand_r"),
@@ -609,7 +1145,52 @@ def collate_fn(batch: Iterable[SampleItem]) -> Dict[str, Any]:
         "lengths": stack_attr("length"),
         "miss_mask_hl": stack_attr("miss_mask_hl"),
         "miss_mask_hr": stack_attr("miss_mask_hr"),
+        "keypoints": stack_attr("keypoints"),
+        "keypoints_mask": stack_attr("keypoints_mask"),
+        "keypoints_frame_mask": stack_attr("keypoints_frame_mask"),
+        "keypoints_body": stack_attr("keypoints_body"),
+        "keypoints_body_mask": stack_attr("keypoints_body_mask"),
+        "keypoints_body_frame_mask": stack_attr("keypoints_body_frame_mask"),
+        "keypoints_hand_l": stack_attr("keypoints_hand_l"),
+        "keypoints_hand_l_mask": stack_attr("keypoints_hand_l_mask"),
+        "keypoints_hand_l_frame_mask": stack_attr("keypoints_hand_l_frame_mask"),
+        "keypoints_hand_r": stack_attr("keypoints_hand_r"),
+        "keypoints_hand_r_mask": stack_attr("keypoints_hand_r_mask"),
+        "keypoints_hand_r_frame_mask": stack_attr("keypoints_hand_r_frame_mask"),
+        "keypoints_face": stack_attr("keypoints_face"),
+        "keypoints_face_mask": stack_attr("keypoints_face_mask"),
+        "keypoints_face_frame_mask": stack_attr("keypoints_face_frame_mask"),
+        "keypoints_lengths": stack_attr("keypoints_lengths"),
         "quality": [sample.quality for sample in batch_list],
         "texts": [sample.text for sample in batch_list],
+        "gloss_texts": [sample.gloss_text for sample in batch_list],
+        "gloss_sequences": [sample.gloss_sequence or [] for sample in batch_list],
         "video_ids": [sample.video_id for sample in batch_list],
     }
+
+    ctc_lengths = [
+        sample.ctc_labels.shape[0] if sample.ctc_labels is not None else 0
+        for sample in batch_list
+    ]
+    max_ctc_len = max(ctc_lengths) if ctc_lengths else 0
+    if max_ctc_len > 0:
+        labels_pad = torch.full((batch_size, max_ctc_len), -100, dtype=torch.long)
+        mask_pad = torch.zeros((batch_size, max_ctc_len), dtype=torch.bool)
+        for idx, sample in enumerate(batch_list):
+            if sample.ctc_labels is None:
+                continue
+            length = sample.ctc_labels.shape[0]
+            labels_pad[idx, :length] = sample.ctc_labels
+            if sample.ctc_mask is not None:
+                mask_pad[idx, :length] = sample.ctc_mask
+            else:
+                mask_pad[idx, :length] = True
+        data["ctc_labels"] = labels_pad
+        data["ctc_mask"] = mask_pad
+        data["ctc_lengths"] = torch.tensor(ctc_lengths, dtype=torch.long)
+    else:
+        data["ctc_labels"] = torch.zeros(batch_size, 0, dtype=torch.long)
+        data["ctc_mask"] = torch.zeros(batch_size, 0, dtype=torch.bool)
+        data["ctc_lengths"] = torch.zeros(batch_size, dtype=torch.long)
+
+    return data
