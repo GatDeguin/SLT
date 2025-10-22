@@ -30,10 +30,51 @@ class KeypointStreamOutput:
     frame_mask: Optional[Tensor]
 
 
-class _TanhMultiHeadAttention(nn.Module):
-    """Multi-head self-attention with ``tanh`` logits and global normalisation."""
+class _GlobalAttentionStore(nn.Module):
+    """Container for a learnable global attention matrix."""
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float) -> None:
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_parameter("matrix", None)
+        self._size: int = 0
+
+    def matrix_for(self, size: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Return an ``(size, size)`` matrix lazily initialised on ``device`` and ``dtype``."""
+
+        if size <= 0:
+            raise ValueError("Global attention size must be a positive integer")
+
+        if self.matrix is None:
+            self.matrix = nn.Parameter(torch.eye(size, device=device, dtype=dtype))
+            self._size = size
+        elif size > self._size:
+            new_matrix = torch.eye(size, device=device, dtype=dtype)
+            old_matrix = self.matrix.detach().to(device=device, dtype=dtype)
+            new_matrix[: self._size, : self._size] = old_matrix
+            self.matrix = nn.Parameter(new_matrix)
+            self._size = size
+
+        matrix = self.matrix
+        if matrix.device != device:
+            matrix = matrix.to(device=device)
+        if matrix.dtype != dtype:
+            matrix = matrix.to(dtype=dtype)
+        return matrix[:size, :size]
+
+
+class _TanhMultiHeadAttention(nn.Module):
+    """Multi-head self-attention with ``tanh`` logits and optional global matrix."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float,
+        *,
+        use_global: bool = False,
+        global_activation: str = "softmax",
+        global_mix: float = 0.5,
+    ) -> None:
         super().__init__()
         if embed_dim <= 0:
             raise ValueError("embed_dim must be positive")
@@ -41,17 +82,55 @@ class _TanhMultiHeadAttention(nn.Module):
             raise ValueError("num_heads must be positive")
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
+        if not 0.0 <= global_mix <= 1.0:
+            raise ValueError("global_mix must be between 0 and 1 inclusive")
 
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.use_global = bool(use_global)
+        self.global_mix = float(global_mix)
+        self._global_activation_name = str(global_activation).lower()
+        self._local_global_store: Optional[_GlobalAttentionStore] = (
+            _GlobalAttentionStore() if self.use_global else None
+        )
+        self._shared_global_store: Optional[_GlobalAttentionStore] = None
 
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+
+    def set_global_store(self, store: _GlobalAttentionStore) -> None:
+        """Attach a shared global attention store."""
+
+        if not isinstance(store, _GlobalAttentionStore):
+            raise TypeError("store must be an instance of _GlobalAttentionStore")
+        self.use_global = True
+        self._shared_global_store = store
+        if self._local_global_store is not None:
+            self._local_global_store = None
+
+    def _global_store(self) -> Optional[_GlobalAttentionStore]:
+        if self._shared_global_store is not None:
+            return self._shared_global_store
+        return self._local_global_store
+
+    def _activate_global(self, matrix: Tensor) -> Tensor:
+        activation = self._global_activation_name
+        if activation == "softmax":
+            return torch.softmax(matrix, dim=-1)
+        if activation == "sigmoid":
+            return torch.sigmoid(matrix)
+        if activation == "tanh":
+            return torch.tanh(matrix)
+        if activation == "relu":
+            return torch.relu(matrix)
+        if activation in {"identity", "linear", "none"}:
+            return matrix
+        raise ValueError(f"Unsupported global activation '{self._global_activation_name}'")
 
     def forward(
         self,
@@ -110,6 +189,27 @@ class _TanhMultiHeadAttention(nn.Module):
         renorm = weights.sum(dim=(-1, -2, -3), keepdim=True)
         renorm = renorm.clamp_min(torch.finfo(weights.dtype).tiny)
         weights = weights / renorm
+
+        if self.use_global:
+            store = self._global_store()
+            if store is None:
+                raise RuntimeError("Global attention requested but no store is available")
+            global_matrix = store.matrix_for(length, device=inputs.device, dtype=inputs.dtype)
+            activated = self._activate_global(global_matrix).clamp_min(0.0)
+            global_scores = activated.unsqueeze(0).expand(batch, length, length)
+            if mask is not None:
+                mask_float = mask.to(dtype=global_scores.dtype)
+                global_scores = (
+                    global_scores
+                    * mask_float[:, None, :]
+                    * mask_float[:, :, None]
+                )
+            sums = global_scores.sum(dim=(-1, -2), keepdim=True)
+            sums = sums.clamp_min(torch.finfo(global_scores.dtype).tiny)
+            normalised = global_scores / sums
+            normalised = normalised.unsqueeze(1).to(dtype=weights.dtype)
+            weights = (1.0 - self.global_mix) * weights + self.global_mix * normalised
+
         attended = torch.matmul(weights, value)
 
         if mask is not None:
@@ -177,6 +277,9 @@ class KeypointStreamEncoder(nn.Module):
         temporal_kernel: int = 3,
         temporal_dilation: int = 1,
         dropout: float = 0.0,
+        use_global_attention: bool = False,
+        global_attention_activation: str = "softmax",
+        global_attention_mix: float = 0.5,
     ) -> None:
         super().__init__()
         if in_dim <= 0:
@@ -199,7 +302,12 @@ class KeypointStreamEncoder(nn.Module):
         self.input_projection = nn.Linear(self.in_dim, self.embed_dim, bias=False)
         self.projection_dropout = nn.Dropout(dropout)
         self.self_attention = _TanhMultiHeadAttention(
-            self.embed_dim, self.num_heads, dropout
+            self.embed_dim,
+            self.num_heads,
+            dropout,
+            use_global=use_global_attention,
+            global_activation=global_attention_activation,
+            global_mix=global_attention_mix,
         )
         self.attention_norm = nn.LayerNorm(self.embed_dim)
         self.temporal_layers = nn.ModuleList(
@@ -217,6 +325,11 @@ class KeypointStreamEncoder(nn.Module):
             [nn.LayerNorm(self.embed_dim) for _ in range(self.temporal_blocks)]
         )
         self._last_attention_weights: Optional[Tensor] = None
+
+    def set_global_attention_store(self, store: _GlobalAttentionStore) -> None:
+        """Attach a shared global attention store to the underlying attention."""
+
+        self.self_attention.set_global_store(store)
 
     @staticmethod
     def _masked_mean(
@@ -635,14 +748,25 @@ class MSKAEncoder(nn.Module):
         stream_temporal_blocks: int = 2,
         stream_temporal_kernel: int = 3,
         stream_temporal_dilation: int = 1,
+        use_global_attention: bool = False,
+        global_attention_activation: str = "softmax",
+        global_attention_mix: float = 0.5,
+        global_attention_shared: bool = False,
     ) -> None:
         super().__init__()
         if not stream_names:
             raise ValueError("stream_names must contain at least one entry")
+        if not 0.0 <= global_attention_mix <= 1.0:
+            raise ValueError("global_attention_mix must be between 0 and 1 inclusive")
 
         self.embed_dim = embed_dim
         self.stream_names = tuple(stream_names)
         self.detach_teacher = detach_teacher
+        self._shared_global_store: Optional[_GlobalAttentionStore]
+        if use_global_attention and global_attention_shared:
+            self._shared_global_store = _GlobalAttentionStore()
+        else:
+            self._shared_global_store = None
         self.encoders = nn.ModuleDict(
             {
                 name: KeypointStreamEncoder(
@@ -653,10 +777,16 @@ class MSKAEncoder(nn.Module):
                     temporal_kernel=stream_temporal_kernel,
                     temporal_dilation=stream_temporal_dilation,
                     dropout=dropout,
+                    use_global_attention=use_global_attention,
+                    global_attention_activation=global_attention_activation,
+                    global_attention_mix=global_attention_mix,
                 )
                 for name in self.stream_names
             }
         )
+        if self._shared_global_store is not None:
+            for encoder in self.encoders.values():
+                encoder.set_global_attention_store(self._shared_global_store)
         self.attention = MultiStreamKeypointAttention(
             embed_dim,
             num_heads=num_heads,

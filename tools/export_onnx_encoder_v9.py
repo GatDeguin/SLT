@@ -86,6 +86,42 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Vocabulary size expected by the MSKA CTC heads",
     )
     parser.add_argument(
+        "--mska-use-sgr",
+        dest="mska_use_sgr",
+        action="store_true",
+        help="Enable the shared global refinement (SGR) matrix inside MSKA streams",
+    )
+    parser.add_argument(
+        "--mska-no-sgr",
+        dest="mska_use_sgr",
+        action="store_false",
+        help="Disable the SGR matrix and rely solely on local attention",
+    )
+    parser.set_defaults(mska_use_sgr=None)
+    parser.add_argument(
+        "--mska-sgr-shared",
+        dest="mska_sgr_shared",
+        action="store_true",
+        help="Share a single SGR matrix across all MSKA streams",
+    )
+    parser.add_argument(
+        "--mska-sgr-per-stream",
+        dest="mska_sgr_shared",
+        action="store_false",
+        help="Learn independent SGR matrices per MSKA stream",
+    )
+    parser.set_defaults(mska_sgr_shared=None)
+    parser.add_argument(
+        "--mska-sgr-activation",
+        type=str,
+        help="Activation applied to the SGR matrix (softmax/sigmoid/tanh/relu/identity)",
+    )
+    parser.add_argument(
+        "--mska-sgr-mix",
+        type=float,
+        help="Mixture factor between local attention and the SGR matrix (0-1)",
+    )
+    parser.add_argument(
         "--mska-detach-teacher",
         dest="mska_detach_teacher",
         action="store_true",
@@ -287,6 +323,10 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         dropout = args.mska_dropout if args.mska_dropout is not None else args.temporal_dropout
         input_dim = args.mska_input_dim if args.mska_input_dim is not None else 3
         detach_teacher = True if args.mska_detach_teacher is None else args.mska_detach_teacher
+        use_sgr = bool(args.mska_use_sgr) if args.mska_use_sgr is not None else False
+        shared_sgr = bool(args.mska_sgr_shared) if args.mska_sgr_shared is not None else False
+        sgr_activation = args.mska_sgr_activation or "softmax"
+        sgr_mix = args.mska_sgr_mix if args.mska_sgr_mix is not None else 0.5
         mska_encoder = MSKAEncoder(
             input_dim=input_dim,
             embed_dim=args.projector_dim,
@@ -296,6 +336,10 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
             dropout=dropout,
             ctc_vocab_size=int(args.mska_ctc_vocab),
             detach_teacher=detach_teacher,
+            use_global_attention=use_sgr,
+            global_attention_activation=sgr_activation,
+            global_attention_mix=sgr_mix,
+            global_attention_shared=shared_sgr,
         )
 
     encoder = MultiStreamEncoder(

@@ -263,6 +263,11 @@ Ajusta la atención por articulación y los bloques temporales con
 como se describe en la Sección 3.2.2 del paper y en
 `docs/train_slt_multistream_v9.md`.
 
+El refinamiento global descrito en la Sección 3.2.4 se activa con
+`--mska-use-sgr`. Controla su aportación con `--mska-sgr-mix`, selecciona la
+activación mediante `--mska-sgr-activation` y decide si la matriz se comparte
+entre streams (`--mska-sgr-shared`) o se aprende por flujo (`--mska-sgr-per-stream`).
+
 Revisa `tools/train_slt_multistream_v9.py --help` y
 `docs/train_slt_multistream_v9.md` para detalles de cada argumento.
 

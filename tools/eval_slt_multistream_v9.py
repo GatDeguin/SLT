@@ -199,6 +199,42 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Tamaño de vocabulario de las cabezas CTC de MSKA",
     )
     parser.add_argument(
+        "--mska-use-sgr",
+        dest="mska_use_sgr",
+        action="store_true",
+        help="Activa la matriz de refinamiento global compartida (SGR) en MSKA",
+    )
+    parser.add_argument(
+        "--mska-no-sgr",
+        dest="mska_use_sgr",
+        action="store_false",
+        help="Desactiva la matriz de refinamiento global (SGR)",
+    )
+    parser.set_defaults(mska_use_sgr=None)
+    parser.add_argument(
+        "--mska-sgr-shared",
+        dest="mska_sgr_shared",
+        action="store_true",
+        help="Comparte la matriz SGR entre todos los streams de MSKA",
+    )
+    parser.add_argument(
+        "--mska-sgr-per-stream",
+        dest="mska_sgr_shared",
+        action="store_false",
+        help="Aprende una matriz SGR independiente por stream",
+    )
+    parser.set_defaults(mska_sgr_shared=None)
+    parser.add_argument(
+        "--mska-sgr-activation",
+        type=str,
+        help="Activación aplicada a la matriz SGR (softmax/sigmoid/tanh/relu/identity)",
+    )
+    parser.add_argument(
+        "--mska-sgr-mix",
+        type=float,
+        help="Factor de mezcla entre la atención local y la matriz SGR (0-1)",
+    )
+    parser.add_argument(
         "--mska-detach-teacher",
         dest="mska_detach_teacher",
         action="store_true",
@@ -330,7 +366,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             except ValueError as exc:
                 parser.error(f"--keypoint-resample-range: {exc}")
     explicit_bool_flags = set()
-    for name in ("use_mska", "mska_detach_teacher", "keypoint_normalize_center"):
+    for name in (
+        "use_mska",
+        "mska_detach_teacher",
+        "keypoint_normalize_center",
+        "mska_use_sgr",
+        "mska_sgr_shared",
+    ):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
     args._explicit_bool_flags = explicit_bool_flags
@@ -397,6 +439,14 @@ def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -
         config.mska_input_dim = args.mska_input_dim
     if args.mska_ctc_vocab is not None:
         config.mska_ctc_vocab = args.mska_ctc_vocab
+    if args.mska_use_sgr is not None:
+        config.mska_use_sgr = bool(args.mska_use_sgr)
+    if args.mska_sgr_shared is not None:
+        config.mska_sgr_shared = bool(args.mska_sgr_shared)
+    if args.mska_sgr_activation is not None:
+        config.mska_sgr_activation = args.mska_sgr_activation
+    if args.mska_sgr_mix is not None:
+        config.mska_sgr_mix = args.mska_sgr_mix
     if args.mska_detach_teacher is not None:
         config.mska_detach_teacher = bool(args.mska_detach_teacher)
     if args.mska_gloss_hidden_dim is not None:

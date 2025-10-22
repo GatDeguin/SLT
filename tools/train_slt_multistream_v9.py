@@ -354,6 +354,42 @@ def parse_args() -> argparse.Namespace:
         help="Vocabulary size used by the MSKA CTC classification heads",
     )
     parser.add_argument(
+        "--mska-use-sgr",
+        dest="mska_use_sgr",
+        action="store_true",
+        help="Enable the shared global refinement (SGR) matrix inside MSKA streams",
+    )
+    parser.add_argument(
+        "--mska-no-sgr",
+        dest="mska_use_sgr",
+        action="store_false",
+        help="Disable the shared global refinement (SGR) matrix",
+    )
+    parser.set_defaults(mska_use_sgr=None)
+    parser.add_argument(
+        "--mska-sgr-shared",
+        dest="mska_sgr_shared",
+        action="store_true",
+        help="Share the SGR matrix across all MSKA streams",
+    )
+    parser.add_argument(
+        "--mska-sgr-per-stream",
+        dest="mska_sgr_shared",
+        action="store_false",
+        help="Learn an independent SGR matrix per MSKA stream",
+    )
+    parser.set_defaults(mska_sgr_shared=None)
+    parser.add_argument(
+        "--mska-sgr-activation",
+        type=str,
+        help="Activation applied to the SGR matrix (softmax/sigmoid/tanh/relu/identity)",
+    )
+    parser.add_argument(
+        "--mska-sgr-mix",
+        type=float,
+        help="Mixture factor between local attention and the SGR matrix (0-1)",
+    )
+    parser.add_argument(
         "--mska-detach-teacher",
         dest="mska_detach_teacher",
         action="store_true",
@@ -558,7 +594,13 @@ def parse_args() -> argparse.Namespace:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
     explicit_bool_flags = set()
-    for name in ("use_mska", "mska_detach_teacher", "keypoint_normalize_center"):
+    for name in (
+        "use_mska",
+        "mska_detach_teacher",
+        "keypoint_normalize_center",
+        "mska_use_sgr",
+        "mska_sgr_shared",
+    ):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
     args._explicit_bool_flags = explicit_bool_flags

@@ -128,6 +128,133 @@ def test_keypoint_stream_encoder_masks_and_gradients() -> None:
     assert grads[joint_mask].abs().sum() > 0
 
 
+def test_keypoint_stream_encoder_sgr_parameter_and_gradients() -> None:
+    torch.manual_seed(0)
+    encoder = KeypointStreamEncoder(
+        in_dim=3,
+        embed_dim=4,
+        num_heads=1,
+        temporal_blocks=0,
+        temporal_kernel=3,
+        dropout=0.0,
+        use_global_attention=True,
+        global_attention_activation="identity",
+        global_attention_mix=0.5,
+    )
+
+    points = torch.randn(2, 1, 3, 3)
+    output = encoder(points)
+
+    store = encoder.self_attention._global_store()
+    assert store is not None
+    matrix = store.matrix
+    assert matrix is not None
+    assert matrix.shape == (3, 3)
+
+    loss = output.joint_embeddings.sum()
+    loss.backward()
+
+    grad = matrix.grad
+    assert grad is not None
+    assert grad.abs().sum() > 0
+
+
+
+def test_keypoint_stream_encoder_sgr_modifies_output() -> None:
+    torch.manual_seed(0)
+    base = KeypointStreamEncoder(
+        in_dim=3,
+        embed_dim=4,
+        num_heads=1,
+        temporal_blocks=0,
+        temporal_kernel=3,
+        dropout=0.0,
+    )
+    sgr = KeypointStreamEncoder(
+        in_dim=3,
+        embed_dim=4,
+        num_heads=1,
+        temporal_blocks=0,
+        temporal_kernel=3,
+        dropout=0.0,
+        use_global_attention=True,
+        global_attention_activation="identity",
+        global_attention_mix=1.0,
+    )
+
+    with torch.no_grad():
+        base.input_projection.weight.copy_(torch.eye(4, 3))
+        sgr.input_projection.weight.copy_(torch.eye(4, 3))
+        for layer in (
+            base.self_attention.q_proj,
+            base.self_attention.k_proj,
+            base.self_attention.v_proj,
+            base.self_attention.out_proj,
+        ):
+            layer.weight.copy_(torch.eye(4))
+        for layer in (
+            sgr.self_attention.q_proj,
+            sgr.self_attention.k_proj,
+            sgr.self_attention.v_proj,
+            sgr.self_attention.out_proj,
+        ):
+            layer.weight.copy_(torch.eye(4))
+
+    points = torch.tensor([[[[0.2, -0.4, 0.6], [0.5, 0.1, -0.3], [-0.2, 0.7, 0.4]]]], dtype=torch.float32)
+    _ = sgr(points)
+    store = sgr.self_attention._global_store()
+    assert store is not None and store.matrix is not None
+    with torch.no_grad():
+        store.matrix.fill_(1.0)
+
+    base_output = base(points)
+    sgr_output = sgr(points)
+
+    assert not torch.allclose(base_output.joint_embeddings, sgr_output.joint_embeddings)
+    assert not torch.allclose(base_output.frame_embeddings, sgr_output.frame_embeddings)
+
+
+
+def test_mska_encoder_shared_sgr_parameter() -> None:
+    torch.manual_seed(0)
+    mska = MSKAEncoder(
+        input_dim=3,
+        embed_dim=4,
+        stream_names=("pose", "hand"),
+        num_heads=1,
+        ff_multiplier=1,
+        dropout=0.0,
+        ctc_vocab_size=5,
+        stream_attention_heads=1,
+        stream_temporal_blocks=0,
+        stream_temporal_kernel=3,
+        stream_temporal_dilation=1,
+        use_global_attention=True,
+        global_attention_activation="identity",
+        global_attention_mix=0.75,
+        global_attention_shared=True,
+    )
+
+    store = mska._shared_global_store
+    assert store is not None
+    for encoder in mska.encoders.values():
+        assert encoder.self_attention._global_store() is store
+
+    mska.zero_grad()
+    streams = {
+        "pose": {"points": torch.randn(2, 1, 3, 3)},
+        "hand": {"points": torch.randn(2, 1, 3, 3)},
+    }
+    output = mska(streams)
+    loss = output.fused_embedding.sum()
+    loss.backward()
+
+    matrix = store.matrix
+    assert matrix is not None
+    assert matrix.grad is not None
+    assert matrix.grad.abs().sum() > 0
+
+
 def test_multi_stream_keypoint_attention_shapes() -> None:
     embed_dim = 8
     encoder = KeypointStreamEncoder(
