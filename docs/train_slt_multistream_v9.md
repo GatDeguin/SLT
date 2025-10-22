@@ -99,6 +99,7 @@ Artefactos generados en `--work-dir`:
 | `--mska-stream-heads` | Número de cabezas en la atención por articulación. |
 | `--mska-temporal-blocks` | Cantidad de bloques convolucionales temporales por stream. |
 | `--mska-temporal-kernel` | Tamaño del kernel temporal usado en dichos bloques. |
+| `--mska-temporal-dilation` | Dilatación temporal aplicada de forma compartida en los bloques. |
 | `--mska-translation-weight` | Peso de la pérdida de traducción. |
 | `--mska-ctc-weight` | Peso del término CTC auxiliar. |
 | `--mska-distillation-weight` | Peso del término de distilación. |

@@ -10,7 +10,7 @@ from slt.models.mska import (
 )
 
 
-def test_keypoint_stream_encoder_tanh_attention_weights() -> None:
+def test_keypoint_stream_encoder_global_attention_weights() -> None:
     encoder = KeypointStreamEncoder(
         in_dim=4,
         embed_dim=4,
@@ -47,13 +47,18 @@ def test_keypoint_stream_encoder_tanh_attention_weights() -> None:
     flat = projected.view(1, 2, 4)
     raw_scores = torch.matmul(flat, flat.transpose(-2, -1)) * encoder.self_attention.scale
     tanh_scores = torch.tanh(raw_scores)
-    expected_weights = torch.softmax(tanh_scores, dim=-1)
+    max_score = tanh_scores.max()
+    exp_scores = torch.exp(tanh_scores - max_score)
+    expected_weights = exp_scores / exp_scores.sum()
 
     actual_weights = weights[0, 0, 0]
-    assert torch.allclose(actual_weights, expected_weights[0], atol=1e-5)
+    assert torch.allclose(actual_weights, expected_weights, atol=1e-5)
 
-    softmax_without_tanh = torch.softmax(raw_scores, dim=-1)
-    assert not torch.allclose(softmax_without_tanh, expected_weights, atol=1e-5)
+    global_sum = weights.sum(dim=(-1, -2, -3, -4))
+    assert torch.allclose(global_sum, torch.ones_like(global_sum), atol=1e-6)
+
+    row_softmax = torch.softmax(tanh_scores, dim=-1)
+    assert not torch.allclose(row_softmax[0], expected_weights, atol=1e-5)
 
 
 def test_keypoint_stream_encoder_masks_and_gradients() -> None:
@@ -99,6 +104,21 @@ def test_keypoint_stream_encoder_masks_and_gradients() -> None:
 
     hidden = output.joint_embeddings
     assert torch.allclose(hidden[~joint_mask], torch.zeros_like(hidden[~joint_mask]))
+
+    attn_weights = encoder._last_attention_weights
+    assert attn_weights is not None
+    attn_sum = attn_weights.sum(dim=(-1, -2, -3))
+    valid_frames = joint_mask.any(dim=2)
+    assert torch.allclose(attn_sum[valid_frames], torch.ones_like(attn_sum[valid_frames]), atol=1e-5)
+    assert torch.allclose(attn_sum[~valid_frames], torch.zeros_like(attn_sum[~valid_frames]))
+    key_mask = joint_mask.view(2 * 3, 4)
+    attn_weights_flat = attn_weights.view(2 * 3, encoder.self_attention.num_heads, 4, 4)
+    padded_cols = ~key_mask.unsqueeze(1).unsqueeze(-2)
+    masked_values = attn_weights_flat.masked_select(padded_cols)
+    assert torch.allclose(masked_values, torch.zeros_like(masked_values))
+    padded_rows = ~key_mask.unsqueeze(1).unsqueeze(-1)
+    masked_rows = attn_weights_flat.masked_select(padded_rows)
+    assert torch.allclose(masked_rows, torch.zeros_like(masked_rows))
 
     loss = hidden.sum() + output.frame_embeddings.sum()
     loss.backward()
