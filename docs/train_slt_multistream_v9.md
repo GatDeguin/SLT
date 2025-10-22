@@ -29,9 +29,10 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
    `--mska-distillation-weight` según el objetivo del experimento. El modelo
    combina automáticamente las pérdidas activas y registra cada término en
    `metrics.jsonl`. Cuando MSKA está activado, la representación fusionada de
-   keypoints se proyecta mediante un MLP configurable de dos capas y se expone
-   al decoder como secuencia de glosas para aplicar la combinación LSLT de
-   traducción y reconocimiento.
+   keypoints se proyecta mediante un MLP configurable de dos capas
+   (`Linear → activación → Dropout opcional → Linear`) y se expone al decoder
+   como secuencia de glosas para aplicar la combinación LSLT de traducción y
+   reconocimiento.
 4. **Evaluación y exportación**: reutiliza las mismas banderas MSKA en
    `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
    mantener consistencia entre entrenamiento, evaluación y despliegue.

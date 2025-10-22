@@ -141,10 +141,7 @@ class MultiStreamEncoder(torch.nn.Module):
         self._auto_configure_components()
         self.mska_encoder = mska
         self._last_mska_output: Optional["MSKAOutput"] = None
-        self._mska_gloss_linear1: Optional[torch.nn.Linear] = None
-        self._mska_gloss_activation: Optional[torch.nn.Module] = None
-        self._mska_gloss_dropout_layer: Optional[torch.nn.Module] = None
-        self._mska_gloss_linear2: Optional[torch.nn.Linear] = None
+        self._mska_gloss_mlp: Optional[torch.nn.Sequential] = None
         self._last_gloss_sequence: Optional[Tensor] = None
         self._last_gloss_mask: Optional[Tensor] = None
         if self.mska_encoder is not None:
@@ -155,14 +152,17 @@ class MultiStreamEncoder(torch.nn.Module):
             hidden_dim = int(mska_gloss_hidden_dim) if mska_gloss_hidden_dim else d_model
             if hidden_dim <= 0:
                 raise ValueError("mska_gloss_hidden_dim must be positive")
-            self._mska_gloss_linear1 = torch.nn.Linear(projector_dim, hidden_dim)
-            self._mska_gloss_activation = self._resolve_activation(mska_gloss_activation)
-            self._mska_gloss_dropout_layer = (
-                torch.nn.Dropout(mska_gloss_dropout)
-                if mska_gloss_dropout and mska_gloss_dropout > 0.0
-                else None
-            )
-            self._mska_gloss_linear2 = torch.nn.Linear(hidden_dim, d_model)
+            if mska_gloss_dropout < 0:
+                raise ValueError("mska_gloss_dropout must be non-negative")
+            activation = self._resolve_activation(mska_gloss_activation)
+            layers: list[torch.nn.Module] = [
+                torch.nn.Linear(projector_dim, hidden_dim),
+                activation,
+            ]
+            if mska_gloss_dropout > 0.0:
+                layers.append(torch.nn.Dropout(mska_gloss_dropout))
+            layers.append(torch.nn.Linear(hidden_dim, d_model))
+            self._mska_gloss_mlp = torch.nn.Sequential(*layers)
             self._mska_streams = {
                 name: name
                 for name in self.mska_encoder.stream_names
@@ -256,16 +256,8 @@ class MultiStreamEncoder(torch.nn.Module):
                         hand_r_proj = hand_r_proj + stream_embedding
                     elif projector_attr == "pose":
                         pose_proj = pose_proj + stream_embedding
-                if (
-                    self._mska_gloss_linear1 is not None
-                    and self._mska_gloss_activation is not None
-                    and self._mska_gloss_linear2 is not None
-                ):
-                    gloss_sequence = self._mska_gloss_linear1(mska_output.fused_embedding)
-                    gloss_sequence = self._mska_gloss_activation(gloss_sequence)
-                    if self._mska_gloss_dropout_layer is not None:
-                        gloss_sequence = self._mska_gloss_dropout_layer(gloss_sequence)
-                    gloss_sequence = self._mska_gloss_linear2(gloss_sequence)
+                if self._mska_gloss_mlp is not None:
+                    gloss_sequence = self._mska_gloss_mlp(mska_output.fused_embedding)
                     self._emit("mska.gloss", gloss_sequence)
                 gloss_mask = mska_output.fused_mask
                 if gloss_mask is not None:
