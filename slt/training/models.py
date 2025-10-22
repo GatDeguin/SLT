@@ -146,6 +146,7 @@ class MultiStreamClassifier(nn.Module):
         labels: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        **extra_inputs: Any,
     ) -> torch.Tensor:
         encoded = self.encoder(
             face,
@@ -156,6 +157,7 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
             pose_conf_mask=pose_conf_mask,
+            **extra_inputs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
@@ -178,8 +180,37 @@ class MultiStreamClassifier(nn.Module):
         miss_mask_hr: Optional[torch.Tensor] = None,
         pose_conf_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        **generation_kwargs: Any,
+        **kwargs: Any,
     ) -> torch.LongTensor:
+        encoder_extra_keys = {
+            "keypoints",
+            "keypoints_mask",
+            "keypoints_frame_mask",
+            "keypoints_body",
+            "keypoints_body_mask",
+            "keypoints_body_frame_mask",
+            "keypoints_hand_l",
+            "keypoints_hand_l_mask",
+            "keypoints_hand_l_frame_mask",
+            "keypoints_hand_r",
+            "keypoints_hand_r_mask",
+            "keypoints_hand_r_frame_mask",
+            "keypoints_face",
+            "keypoints_face_mask",
+            "keypoints_face_frame_mask",
+            "keypoints_lengths",
+            "ctc_labels",
+            "ctc_mask",
+            "ctc_lengths",
+            "gloss_sequences",
+            "gloss_texts",
+        }
+        extra_inputs = {
+            name: value for name, value in kwargs.items() if name in encoder_extra_keys
+        }
+        decoder_kwargs = {
+            name: value for name, value in kwargs.items() if name not in encoder_extra_keys
+        }
         encoded = self.encoder(
             face,
             hand_l,
@@ -189,12 +220,13 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
             pose_conf_mask=pose_conf_mask,
+            **extra_inputs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
         return self.decoder.generate(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
-            **generation_kwargs,
+            **decoder_kwargs,
         )
 

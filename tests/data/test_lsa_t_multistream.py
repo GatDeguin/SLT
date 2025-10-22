@@ -3,13 +3,10 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("torch")
-pytest.importorskip("numpy")
+torch = pytest.importorskip("torch")
+np = pytest.importorskip("numpy")
 pytest.importorskip("PIL")
-
-import torch
-import numpy as np
-from PIL import Image
+from PIL import Image  # type: ignore
 
 from slt.data import LsaTMultiStream, SampleItem, collate_fn
 
@@ -23,12 +20,14 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     hand_l_dir = tmp_path / "hand_l"
     hand_r_dir = tmp_path / "hand_r"
     pose_dir = tmp_path / "pose"
-    for d in [face_dir, hand_l_dir, hand_r_dir, pose_dir]:
+    keypoints_dir = tmp_path / "keypoints"
+    for d in [face_dir, hand_l_dir, hand_r_dir, pose_dir, keypoints_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     video_id = "vid001"
     textos_path = tmp_path / "subs.csv"
     split_path = tmp_path / "split.csv"
+    gloss_path = tmp_path / "gloss.csv"
 
     def save_frame(directory: Path, idx: int) -> None:
         arr = (np.random.rand(32, 32, 3) * 255).astype("uint8")
@@ -43,16 +42,23 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     pose = np.random.rand(7, 3 * 13).astype("float32")
     np.savez(pose_dir / f"{video_id}.npz", pose=pose)
 
+    keypoints = np.random.rand(6, 79, 3).astype("float32")
+    keypoints[:, :, 2] = np.random.uniform(0.6, 1.0, size=(6, 79)).astype("float32")
+    np.savez(keypoints_dir / f"{video_id}.npz", keypoints=keypoints)
+
     textos_path.write_text("video_id;texto\nvid001;hola mundo\n", encoding="utf-8")
     split_path.write_text("video_id\nvid001\n", encoding="utf-8")
+    gloss_path.write_text("video_id;gloss;ctc_labels\nvid001;ga gb;1 2\n", encoding="utf-8")
 
     return {
         "face_dir": str(face_dir),
         "hand_l_dir": str(hand_l_dir),
         "hand_r_dir": str(hand_r_dir),
         "pose_dir": str(pose_dir),
+        "keypoints_dir": str(keypoints_dir),
         "csv_path": str(textos_path),
         "index_csv": str(split_path),
+        "gloss_csv": str(gloss_path),
     }
 
 
@@ -75,6 +81,17 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
     assert sample.length.item() == 4
     assert sample.miss_mask_hr.sum() == 0
     assert sample.miss_mask_hl.sum() == 4
+    assert sample.keypoints.shape == (4, 79, 3)
+    assert sample.keypoints_mask.shape == (4, 79)
+    assert sample.keypoints_body.shape[1] == 33
+    assert sample.keypoints_hand_l.shape[1] == 21
+    assert sample.keypoints_hand_r.shape[1] == 21
+    assert sample.keypoints_face.shape[1] == 4
+    assert sample.keypoints_lengths.shape == (5,)
+    assert sample.ctc_labels.dtype == torch.long
+    assert sample.ctc_mask.dtype == torch.bool
+    assert sample.gloss_text == "ga gb"
+    assert sample.gloss_sequence == ["ga", "gb"]
     assert sample.text == "hola mundo"
     assert sample.video_id == "vid001"
 
@@ -92,6 +109,10 @@ def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
     assert data["pad_mask"].dtype == torch.bool
     assert torch.equal(data["lengths"], torch.tensor([4, 4], dtype=torch.long))
     assert data["texts"] == ["hola mundo", "hola mundo"]
+    assert data["keypoints"].shape == (2, 4, 79, 3)
+    assert data["keypoints_lengths"].shape == (2, 5)
+    assert data["ctc_labels"].shape[0] == 2
+    assert data["gloss_sequences"][0] == ["ga", "gb"]
     assert data["video_ids"] == ["vid001", "vid001"]
 
 
@@ -136,6 +157,8 @@ def test_cli_collate_propagates_masks_and_lengths(synthetic_dataset: dict) -> No
     assert torch.equal(inputs["encoder_attention_mask"], sample.pad_mask.unsqueeze(0).to(torch.long))
     assert torch.equal(inputs["lengths"], sample.length.unsqueeze(0))
     assert torch.equal(inputs["pose_conf_mask"], sample.pose_conf_mask.unsqueeze(0))
+    assert torch.equal(inputs["keypoints_mask"], sample.keypoints_mask.unsqueeze(0))
+    assert inputs["gloss_sequences"][0] == sample.gloss_sequence
 
 
 def test_training_collate_includes_pose_mask(synthetic_dataset: dict) -> None:
@@ -149,6 +172,8 @@ def test_training_collate_includes_pose_mask(synthetic_dataset: dict) -> None:
     batch = collate([sample])
     inputs = batch["inputs"]
     assert torch.equal(inputs["pose_conf_mask"], sample.pose_conf_mask.unsqueeze(0))
+    assert torch.equal(inputs["keypoints"], sample.keypoints.unsqueeze(0))
+    assert torch.equal(inputs["ctc_labels"], sample.ctc_labels.unsqueeze(0))
 
 
 def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
@@ -168,6 +193,14 @@ def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
 
     expected_pose = ds_flip._flip_pose_tensor(sample_no.pose)
     assert torch.allclose(sample_flip.pose, expected_pose)
+
+    expected_kp_hand_l = sample_no.keypoints_hand_r.clone()
+    expected_kp_hand_l[:, :, 0] = 1.0 - expected_kp_hand_l[:, :, 0]
+    expected_kp_hand_r = sample_no.keypoints_hand_l.clone()
+    expected_kp_hand_r[:, :, 0] = 1.0 - expected_kp_hand_r[:, :, 0]
+    assert torch.allclose(sample_flip.keypoints_hand_l, expected_kp_hand_l)
+    assert torch.allclose(sample_flip.keypoints_hand_r, expected_kp_hand_r)
+    assert sample_flip.keypoints_lengths[2].item() == sample_no.keypoints_lengths[3].item()
 
 
 def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:

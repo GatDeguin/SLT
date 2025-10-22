@@ -158,10 +158,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-left-dir", type=Path, help="Directory with left hand frames")
     parser.add_argument("--hand-right-dir", type=Path, help="Directory with right hand frames")
     parser.add_argument("--pose-dir", type=Path, help="Directory with pose .npz files")
+    parser.add_argument("--keypoints-dir", type=Path, help="Directory with MediaPipe keypoints")
     parser.add_argument("--metadata-csv", type=Path, help="CSV file with video_id/text pairs")
     parser.add_argument("--train-index", type=Path, help="CSV file listing training video IDs")
     parser.add_argument("--val-index", type=Path, help="CSV file listing validation video IDs")
     parser.add_argument("--work-dir", type=Path, help="Directory where checkpoints/logs will be saved")
+    parser.add_argument(
+        "--gloss-csv",
+        type=Path,
+        help="Optional CSV with columns video_id;gloss;ctc_labels",
+    )
 
     parser.add_argument("--num-workers", type=int, help="Number of DataLoader worker processes")
     parser.add_argument("--batch-size", type=int, help="Training batch size")
@@ -432,9 +438,13 @@ def _validate_paths(config: DataConfig) -> None:
     _ensure_exists(config.hand_left_dir, kind="Left hand directory")
     _ensure_exists(config.hand_right_dir, kind="Right hand directory")
     _ensure_exists(config.pose_dir, kind="Pose directory")
+    if config.keypoints_dir:
+        _ensure_exists(config.keypoints_dir, kind="Keypoints directory")
     _ensure_exists(config.metadata_csv, kind="Metadata CSV")
     _ensure_exists(config.train_index, kind="Train index CSV")
     _ensure_exists(config.val_index, kind="Validation index CSV")
+    if config.gloss_csv:
+        _ensure_exists(config.gloss_csv, kind="Gloss CSV")
     config.work_dir.mkdir(parents=True, exist_ok=True)
 def _maybe_compile_model(model: nn.Module, training: TrainingConfig) -> nn.Module:
     if not training.compile:
@@ -636,6 +646,10 @@ def main() -> None:
         pose_dir=str(data_config.pose_dir),
         csv_path=str(data_config.metadata_csv),
         index_csv=str(data_config.train_index),
+        keypoints_dir=str(data_config.keypoints_dir)
+        if data_config.keypoints_dir
+        else None,
+        gloss_csv=str(data_config.gloss_csv) if data_config.gloss_csv else None,
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
@@ -647,6 +661,10 @@ def main() -> None:
         pose_dir=str(data_config.pose_dir),
         csv_path=str(data_config.metadata_csv),
         index_csv=str(data_config.val_index),
+        keypoints_dir=str(data_config.keypoints_dir)
+        if data_config.keypoints_dir
+        else None,
+        gloss_csv=str(data_config.gloss_csv) if data_config.gloss_csv else None,
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,

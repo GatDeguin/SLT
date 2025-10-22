@@ -73,6 +73,7 @@ def test_multistream_classifier_forward_with_custom_decoder_config(tmp_path, bat
             miss_mask_hl=None,
             miss_mask_hr=None,
             pose_conf_mask=None,
+            **unused_inputs,
         ):
             batch, time = face.shape[:2]
             return torch.zeros(batch, time, model_config.d_model, device=face.device)

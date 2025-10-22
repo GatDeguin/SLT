@@ -43,6 +43,13 @@ def _validate_sample(sample, spec: SyntheticDatasetSpec) -> None:
     if sample.pad_mask.sum().item() != sample.length.item():
         raise RuntimeError("pad_mask y length no coinciden, revisar normalización del dataset.")
 
+    if sample.keypoints.shape[1] == 0:
+        raise RuntimeError("El sample no contiene keypoints normalizados.")
+    if sample.keypoints_mask.shape != sample.keypoints[..., 0].shape:
+        raise RuntimeError("La máscara de keypoints tiene dimensiones inesperadas.")
+    if sample.ctc_labels.numel() == 0 or sample.ctc_mask.numel() == 0:
+        raise RuntimeError("Las etiquetas CTC no fueron propagadas correctamente.")
+
 
 
 def main() -> int:
@@ -54,8 +61,10 @@ def main() -> int:
             hand_l_dir=str(paths.hand_left_dir),
             hand_r_dir=str(paths.hand_right_dir),
             pose_dir=str(paths.pose_dir),
+            keypoints_dir=str(paths.keypoints_dir),
             csv_path=str(paths.metadata_csv),
             index_csv=str(paths.train_index),
+            gloss_csv=str(paths.gloss_csv),
             T=EXPECTED_SPEC.sequence_length,
             img_size=EXPECTED_SPEC.image_size,
             lkp_count=EXPECTED_SPEC.pose_landmarks,

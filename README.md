@@ -114,6 +114,9 @@ para conocer las verificaciones recomendadas tras la instalación.
          hand_l/
          hand_r/
          pose/
+         keypoints/
+       annotations/
+         gloss.csv
        index/
          train.csv
          val.csv
@@ -131,7 +134,14 @@ para conocer las verificaciones recomendadas tras la instalación.
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
    fuese necesario.
-4. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
+4. Genera o copia los keypoints multistream en
+   `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
+   `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en
+   formato `(T, landmarks, 3)` con `(x, y, conf)` siguiendo el layout de
+   MediaPipe. Si cuentas con anotaciones de glosa, agrégalas al CSV opcional
+   `data/single_signer/annotations/gloss.csv` con columnas
+   `video_id;gloss;ctc_labels` (índices separados por espacios).
+5. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
    contener un `video_id` por línea sin encabezado. Un ejemplo mínimo:
    ```bash
    python - <<'PY'
@@ -147,10 +157,10 @@ para conocer las verificaciones recomendadas tras la instalación.
    pd.Series(ids[90:]).to_csv(out_dir / 'test.csv', index=False)
    PY
    ```
-5. Valida la estructura con `python tools/ci_validate_data_contract.py` o
+6. Valida la estructura con `python tools/ci_validate_data_contract.py` o
    ejecuta `pytest tests/data/test_dataset_quality.py` para comprobar los
-   avisos producidos ante inconsistencias de FPS, frames faltantes o splits
-   incompletos.
+   avisos producidos ante inconsistencias de FPS, frames faltantes, keypoints
+   ausentes o splits incompletos.
 
 El contrato de datos completo se detalla en `docs/data_contract.md`, donde se
 documentan los campos opcionales de `meta.csv`, las métricas registradas en
@@ -172,9 +182,11 @@ python -m slt \
   --hand-left-dir data/single_signer/processed/hand_l \
   --hand-right-dir data/single_signer/processed/hand_r \
   --pose-dir data/single_signer/processed/pose \
+  --keypoints-dir data/single_signer/processed/keypoints \
   --metadata-csv meta.csv \
   --train-index data/single_signer/index/train.csv \
   --val-index data/single_signer/index/val.csv \
+  --gloss-csv data/single_signer/annotations/gloss.csv \
   --work-dir work_dirs/single_signer_demo \
   --epochs 2 --batch-size 2 --sequence-length 32 \
   --tokenizer hf-internal-testing/tiny-random-T5
@@ -197,6 +209,10 @@ python tools/train_slt_multistream_v9.py \
   --set training.epochs=40 \
   --set optim.lr=5e-4
 ```
+
+Los templates aceptan ahora `data.keypoints_dir` y `data.gloss_csv` para
+propagar keypoints MediaPipe y secuencias de glosa/CTC al pipeline sin editar el
+código base.
 
 `config.json` dentro de `work_dir` refleja la configuración efectiva combinando
 defaults, archivo y banderas.

@@ -153,6 +153,7 @@ class MultiStreamEncoder(torch.nn.Module):
         miss_mask_hl: Optional[Tensor] = None,
         miss_mask_hr: Optional[Tensor] = None,
         pose_conf_mask: Optional[Tensor] = None,
+        **unused_inputs: Any,
     ) -> Tensor:
         """Encode multi-stream inputs returning a temporal sequence tensor."""
 

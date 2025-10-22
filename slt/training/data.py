@@ -136,10 +136,31 @@ def build_collate(
             "lengths": merged["lengths"],
             "miss_mask_hl": merged["miss_mask_hl"],
             "miss_mask_hr": merged["miss_mask_hr"],
+            "keypoints": merged["keypoints"],
+            "keypoints_mask": merged["keypoints_mask"],
+            "keypoints_frame_mask": merged["keypoints_frame_mask"],
+            "keypoints_body": merged["keypoints_body"],
+            "keypoints_body_mask": merged["keypoints_body_mask"],
+            "keypoints_body_frame_mask": merged["keypoints_body_frame_mask"],
+            "keypoints_hand_l": merged["keypoints_hand_l"],
+            "keypoints_hand_l_mask": merged["keypoints_hand_l_mask"],
+            "keypoints_hand_l_frame_mask": merged["keypoints_hand_l_frame_mask"],
+            "keypoints_hand_r": merged["keypoints_hand_r"],
+            "keypoints_hand_r_mask": merged["keypoints_hand_r_mask"],
+            "keypoints_hand_r_frame_mask": merged["keypoints_hand_r_frame_mask"],
+            "keypoints_face": merged["keypoints_face"],
+            "keypoints_face_mask": merged["keypoints_face_mask"],
+            "keypoints_face_frame_mask": merged["keypoints_face_frame_mask"],
+            "keypoints_lengths": merged["keypoints_lengths"],
+            "ctc_labels": merged["ctc_labels"],
+            "ctc_mask": merged["ctc_mask"],
+            "ctc_lengths": merged["ctc_lengths"],
             "labels": labels,
             "decoder_attention_mask": attention_mask,
             "encoder_attention_mask": merged["pad_mask"].to(torch.long),
         }
+        inputs["gloss_sequences"] = merged["gloss_sequences"]
+        inputs["gloss_texts"] = merged["gloss_texts"]
         return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
 
     return _collate

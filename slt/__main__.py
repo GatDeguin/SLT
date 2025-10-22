@@ -35,8 +35,8 @@ def _build_collate(tokenizer, *, max_length: int):
         collated = collate_fn(batch)
         inputs = {
             "face": collated["face"],
-            "hand_left": collated["hand_l"],
-            "hand_right": collated["hand_r"],
+            "hand_l": collated["hand_l"],
+            "hand_r": collated["hand_r"],
             "pose": collated["pose"],
             "pose_conf_mask": collated["pose_conf_mask"],
             "pad_mask": collated["pad_mask"],
@@ -44,6 +44,25 @@ def _build_collate(tokenizer, *, max_length: int):
             "lengths": collated["lengths"],
             "miss_mask_hl": collated.get("miss_mask_hl"),
             "miss_mask_hr": collated.get("miss_mask_hr"),
+            "keypoints": collated["keypoints"],
+            "keypoints_mask": collated["keypoints_mask"],
+            "keypoints_frame_mask": collated["keypoints_frame_mask"],
+            "keypoints_body": collated["keypoints_body"],
+            "keypoints_body_mask": collated["keypoints_body_mask"],
+            "keypoints_body_frame_mask": collated["keypoints_body_frame_mask"],
+            "keypoints_hand_l": collated["keypoints_hand_l"],
+            "keypoints_hand_l_mask": collated["keypoints_hand_l_mask"],
+            "keypoints_hand_l_frame_mask": collated["keypoints_hand_l_frame_mask"],
+            "keypoints_hand_r": collated["keypoints_hand_r"],
+            "keypoints_hand_r_mask": collated["keypoints_hand_r_mask"],
+            "keypoints_hand_r_frame_mask": collated["keypoints_hand_r_frame_mask"],
+            "keypoints_face": collated["keypoints_face"],
+            "keypoints_face_mask": collated["keypoints_face_mask"],
+            "keypoints_face_frame_mask": collated["keypoints_face_frame_mask"],
+            "keypoints_lengths": collated["keypoints_lengths"],
+            "ctc_labels": collated["ctc_labels"],
+            "ctc_mask": collated["ctc_mask"],
+            "ctc_lengths": collated["ctc_lengths"],
         }
         tokenized = tokenizer(
             collated["texts"],
@@ -56,6 +75,8 @@ def _build_collate(tokenizer, *, max_length: int):
             "input_ids": tokenized["input_ids"],
             "attention_mask": tokenized["attention_mask"],
         }
+        inputs["gloss_sequences"] = collated["gloss_sequences"]
+        inputs["gloss_texts"] = collated["gloss_texts"]
         return {
             "inputs": inputs,
             "targets": targets,
@@ -107,6 +128,10 @@ def _build_cli_overrides(
         data_section["tokenizer"] = args.tokenizer
     if args.max_target_length is not None:
         data_section["max_target_length"] = args.max_target_length
+    if getattr(args, "keypoints_dir", None) is not None:
+        data_section["keypoints_dir"] = args.keypoints_dir
+    if getattr(args, "gloss_csv", None) is not None:
+        data_section["gloss_csv"] = args.gloss_csv
     if args.device is not None:
         data_section["device"] = args.device
     if getattr(args, "precision", None) is not None:
@@ -187,6 +212,11 @@ def parse_args() -> argparse.Namespace:
         help="Carpeta con archivos .npz de pose",
     )
     parser.add_argument(
+        "--keypoints-dir",
+        type=Path,
+        help="Carpeta con keypoints MediaPipe (.npy/.npz)",
+    )
+    parser.add_argument(
         "--metadata-csv",
         type=Path,
         required=True,
@@ -203,6 +233,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="CSV con lista de video_id para validación",
+    )
+    parser.add_argument(
+        "--gloss-csv",
+        type=Path,
+        help="CSV opcional con columnas video_id;gloss;ctc_labels",
     )
     parser.add_argument(
         "--work-dir",
@@ -376,23 +411,31 @@ def main() -> None:
         device = torch.device("cpu")
 
     train_dataset = LsaTMultiStream(
-        str(data_config.face_dir),
-        str(data_config.hand_left_dir),
-        str(data_config.hand_right_dir),
-        str(data_config.pose_dir),
-        str(data_config.metadata_csv),
-        str(data_config.train_index),
+        face_dir=str(data_config.face_dir),
+        hand_l_dir=str(data_config.hand_left_dir),
+        hand_r_dir=str(data_config.hand_right_dir),
+        pose_dir=str(data_config.pose_dir),
+        csv_path=str(data_config.metadata_csv),
+        index_csv=str(data_config.train_index),
+        keypoints_dir=str(data_config.keypoints_dir)
+        if data_config.keypoints_dir
+        else None,
+        gloss_csv=str(data_config.gloss_csv) if data_config.gloss_csv else None,
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
     )
     val_dataset = LsaTMultiStream(
-        str(data_config.face_dir),
-        str(data_config.hand_left_dir),
-        str(data_config.hand_right_dir),
-        str(data_config.pose_dir),
-        str(data_config.metadata_csv),
-        str(data_config.val_index),
+        face_dir=str(data_config.face_dir),
+        hand_l_dir=str(data_config.hand_left_dir),
+        hand_r_dir=str(data_config.hand_right_dir),
+        pose_dir=str(data_config.pose_dir),
+        csv_path=str(data_config.metadata_csv),
+        index_csv=str(data_config.val_index),
+        keypoints_dir=str(data_config.keypoints_dir)
+        if data_config.keypoints_dir
+        else None,
+        gloss_csv=str(data_config.gloss_csv) if data_config.gloss_csv else None,
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,

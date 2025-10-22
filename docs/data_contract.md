@@ -17,10 +17,13 @@ data/
       hand_l/    # Recortes cuadrados de mano izquierda
       hand_r/    # Recortes cuadrados de mano derecha
       pose/      # Archivos .npz con tensores (T, 3 * landmarks)
+      keypoints/ # Archivos .npz/.npy con keypoints MediaPipe
     index/
       train.csv
       val.csv
       test.csv
+    annotations/
+      gloss.csv  # Opcional: glosas y etiquetas CTC por video
 meta.csv          # CSV semicolon con columnas video_id;texto
 ```
 
@@ -35,10 +38,14 @@ Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
   con patrón `<video_id>_fXXXXXX.jpg`, normalizados a RGB.
 - `processed/pose/`: archivos `.npz` que contienen un arreglo `pose` de forma
   `(T, 3 * landmarks)` con `float32` y opcionalmente un `pose_conf`.
+- `processed/keypoints/`: matrices `.npy` o `.npz` con keypoints MediaPipe en
+  formato `(T, landmarks, 3)` donde la última dimensión guarda `(x, y, conf)`.
 - `index/*.csv`: listas de `video_id` (una columna, sin encabezado) utilizadas
   para los splits de entrenamiento, validación y prueba.
 - `metadata.jsonl`: emitido por `tools/extract_rois_v2.py` con métricas por
   video (duración efectiva, FPS medidos, cantidad de frames escritos por stream).
+- `annotations/gloss.csv`: archivo opcional con columnas `video_id`, `gloss` y
+  `ctc_labels` (separadas por espacios) para alimentar pérdidas CTC.
 
 ## Metadata obligatoria en `meta.csv`
 
@@ -81,6 +88,15 @@ Cada ejemplo entregado por el dataset incluye:
 - `length`: longitud efectiva calculada como `pad_mask.sum()`.
 - `miss_mask_hl` / `miss_mask_hr`: marcan frames sin detección confiable de
   manos.
+- `keypoints`: tensor `(T, L, 3)` con los keypoints raw normalizados y
+  reordenados según MSKA.
+- `keypoints_*`: vistas separadas (`body`, `hand_l`, `hand_r`, `face`) con sus
+  máscaras por landmark (`*_mask`) y por frame (`*_frame_mask`).
+- `keypoints_lengths`: vector con las longitudes efectivas por vista.
+- `ctc_labels`, `ctc_mask`, `ctc_lengths`: tensores preparados para pérdidas
+  CTC cuando hay metadata de glosas.
+- `gloss_sequence` / `gloss_text`: tokens de glosa tokenizados y su texto
+  original cuando se provee `gloss.csv`.
 - `quality`: diccionario con métricas de FPS, frames perdidos y longitud
   efectiva.
 - `text` y `video_id`: valores originales del CSV.

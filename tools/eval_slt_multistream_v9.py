@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -148,9 +148,11 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        **extra_inputs: Any,
     ) -> torch.Tensor:
         encoded = self.encoder(
             face,
@@ -160,6 +162,8 @@ class MultiStreamClassifier(nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
+            **extra_inputs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
@@ -180,9 +184,39 @@ class MultiStreamClassifier(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         miss_mask_hl: Optional[torch.Tensor] = None,
         miss_mask_hr: Optional[torch.Tensor] = None,
+        pose_conf_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        **generation_kwargs,
+        **kwargs: Any,
     ) -> torch.LongTensor:
+        encoder_extra_keys = {
+            "keypoints",
+            "keypoints_mask",
+            "keypoints_frame_mask",
+            "keypoints_body",
+            "keypoints_body_mask",
+            "keypoints_body_frame_mask",
+            "keypoints_hand_l",
+            "keypoints_hand_l_mask",
+            "keypoints_hand_l_frame_mask",
+            "keypoints_hand_r",
+            "keypoints_hand_r_mask",
+            "keypoints_hand_r_frame_mask",
+            "keypoints_face",
+            "keypoints_face_mask",
+            "keypoints_face_frame_mask",
+            "keypoints_lengths",
+            "ctc_labels",
+            "ctc_mask",
+            "ctc_lengths",
+            "gloss_sequences",
+            "gloss_texts",
+        }
+        extra_inputs = {
+            name: value for name, value in kwargs.items() if name in encoder_extra_keys
+        }
+        generation_kwargs = {
+            name: value for name, value in kwargs.items() if name not in encoder_extra_keys
+        }
         encoded = self.encoder(
             face,
             hand_l,
@@ -191,6 +225,8 @@ class MultiStreamClassifier(nn.Module):
             pad_mask=pad_mask,
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
+            pose_conf_mask=pose_conf_mask,
+            **extra_inputs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
@@ -208,6 +244,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--hand-left-dir", type=Path, required=True, help="Directorio con frames de mano izquierda")
     parser.add_argument("--hand-right-dir", type=Path, required=True, help="Directorio con frames de mano derecha")
     parser.add_argument("--pose-dir", type=Path, required=True, help="Directorio con poses .npz")
+    parser.add_argument(
+        "--keypoints-dir",
+        type=Path,
+        help="Directorio con keypoints MediaPipe (.npy/.npz)",
+    )
     parser.add_argument("--metadata-csv", type=Path, required=True, help="CSV con columnas video_id/texto")
     parser.add_argument("--eval-index", type=Path, required=True, help="CSV con la lista de video_id a evaluar")
     parser.add_argument(
@@ -218,6 +259,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Ruta(s) a uno o varios checkpoints a cargar",
     )
     parser.add_argument("--output-csv", type=Path, required=True, help="Archivo de salida para escribir predicciones")
+
+    parser.add_argument(
+        "--gloss-csv",
+        type=Path,
+        help="CSV opcional con glosas y etiquetas CTC",
+    )
 
     parser.add_argument("--batch-size", type=int, default=4, help="Tamaño de batch para la evaluación")
     parser.add_argument("--num-workers", type=int, default=0, help="Número de workers del DataLoader")
@@ -376,8 +423,10 @@ def _create_dataloader(args: argparse.Namespace) -> DataLoader:
         hand_l_dir=str(args.hand_left_dir),
         hand_r_dir=str(args.hand_right_dir),
         pose_dir=str(args.pose_dir),
+        keypoints_dir=str(args.keypoints_dir) if args.keypoints_dir else None,
         csv_path=str(args.metadata_csv),
         index_csv=str(args.eval_index),
+        gloss_csv=str(args.gloss_csv) if args.gloss_csv else None,
         T=args.sequence_length,
         img_size=args.image_size,
         lkp_count=args.pose_landmarks,
@@ -393,9 +442,38 @@ def _create_dataloader(args: argparse.Namespace) -> DataLoader:
 
 
 def _prepare_inputs(batch: dict, device: torch.device) -> dict:
-    tensor_keys = ["face", "hand_l", "hand_r", "pose", "pad_mask", "miss_mask_hl", "miss_mask_hr"]
-    inputs = {key: batch[key].to(device) for key in tensor_keys}
+    tensor_keys = [
+        "face",
+        "hand_l",
+        "hand_r",
+        "pose",
+        "pad_mask",
+        "miss_mask_hl",
+        "miss_mask_hr",
+        "keypoints",
+        "keypoints_mask",
+        "keypoints_frame_mask",
+        "keypoints_body",
+        "keypoints_body_mask",
+        "keypoints_body_frame_mask",
+        "keypoints_hand_l",
+        "keypoints_hand_l_mask",
+        "keypoints_hand_l_frame_mask",
+        "keypoints_hand_r",
+        "keypoints_hand_r_mask",
+        "keypoints_hand_r_frame_mask",
+        "keypoints_face",
+        "keypoints_face_mask",
+        "keypoints_face_frame_mask",
+        "keypoints_lengths",
+        "ctc_labels",
+        "ctc_mask",
+        "ctc_lengths",
+    ]
+    inputs = {key: batch[key].to(device) for key in tensor_keys if key in batch}
     inputs["encoder_attention_mask"] = batch["pad_mask"].to(device=device, dtype=torch.long)
+    inputs["gloss_sequences"] = batch.get("gloss_sequences", [])
+    inputs["gloss_texts"] = batch.get("gloss_texts", [])
     return inputs
 
 

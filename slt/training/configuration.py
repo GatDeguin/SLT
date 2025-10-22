@@ -79,6 +79,8 @@ class DataConfig:
     train_index: Path
     val_index: Path
     work_dir: Path
+    keypoints_dir: Optional[Path] = None
+    gloss_csv: Optional[Path] = None
     num_workers: int = 0
     batch_size: int = 4
     val_batch_size: Optional[int] = None

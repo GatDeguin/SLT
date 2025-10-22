@@ -23,12 +23,14 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     hand_l_dir = tmp_path / "hand_l"
     hand_r_dir = tmp_path / "hand_r"
     pose_dir = tmp_path / "pose"
-    for directory in [face_dir, hand_l_dir, hand_r_dir, pose_dir]:
+    keypoints_dir = tmp_path / "keypoints"
+    for directory in [face_dir, hand_l_dir, hand_r_dir, pose_dir, keypoints_dir]:
         directory.mkdir(parents=True, exist_ok=True)
 
     video_id = "vid001"
     textos_path = tmp_path / "subs.csv"
     split_path = tmp_path / "split.csv"
+    gloss_path = tmp_path / "gloss.csv"
 
     def save_frame(directory: Path, idx: int) -> None:
         arr = (np.random.rand(32, 32, 3) * 255).astype("uint8")
@@ -42,16 +44,26 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     pose = np.random.rand(4, 3 * 13).astype("float32")
     np.savez(pose_dir / f"{video_id}.npz", pose=pose)
 
+    keypoints = np.random.rand(4, 79, 3).astype("float32")
+    keypoints[:, :, 2] = np.random.uniform(0.7, 1.0, size=(4, 79)).astype("float32")
+    np.savez(keypoints_dir / f"{video_id}.npz", keypoints=keypoints)
+
     textos_path.write_text("video_id;texto\nvid001;hola mundo\n", encoding="utf-8")
     split_path.write_text("video_id\nvid001\n", encoding="utf-8")
+    gloss_path.write_text(
+        "video_id;gloss;ctc_labels\nvid001;hola gloss;1 2\n",
+        encoding="utf-8",
+    )
 
     return {
         "face_dir": face_dir,
         "hand_l_dir": hand_l_dir,
         "hand_r_dir": hand_r_dir,
         "pose_dir": pose_dir,
+        "keypoints_dir": keypoints_dir,
         "metadata_csv": textos_path,
         "index_csv": split_path,
+        "gloss_csv": gloss_path,
     }
 
 
@@ -112,7 +124,19 @@ def test_eval_script_generates_stub_csv(
         def __init__(self) -> None:
             super().__init__()
 
-        def forward(self, face, hand_l, hand_r, pose, *, pad_mask=None, miss_mask_hl=None, miss_mask_hr=None):
+        def forward(
+            self,
+            face,
+            hand_l,
+            hand_r,
+            pose,
+            *,
+            pad_mask=None,
+            miss_mask_hl=None,
+            miss_mask_hr=None,
+            pose_conf_mask=None,
+            **unused_inputs,
+        ):
             batch, time = face.shape[:2]
             return torch.zeros(batch, time, config.d_model, device=face.device)
 
@@ -134,10 +158,14 @@ def test_eval_script_generates_stub_csv(
         str(synthetic_dataset["hand_r_dir"]),
         "--pose-dir",
         str(synthetic_dataset["pose_dir"]),
+        "--keypoints-dir",
+        str(synthetic_dataset["keypoints_dir"]),
         "--metadata-csv",
         str(synthetic_dataset["metadata_csv"]),
         "--eval-index",
         str(synthetic_dataset["index_csv"]),
+        "--gloss-csv",
+        str(synthetic_dataset["gloss_csv"]),
         "--checkpoint",
         str(checkpoint_path),
         "--output-csv",
