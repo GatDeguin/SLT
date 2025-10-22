@@ -24,6 +24,9 @@ experimentos o adaptar el flujo a nuevas variantes.
 - **Paquete `slt/`**: expone el dataset `LsaTMultiStream`, el encoder
   `MultiStreamEncoder`, un decoder seq2seq y utilidades para datos, métricas y
   entrenamiento.
+- **Pipeline ROI + keypoints**: integra la extracción de recortes, el alineado
+  de keypoints/glosas y el entrenamiento con pérdidas combinadas MSKA. Los
+  detalles paso a paso están en `docs/train_slt_multistream_v9.md`.
 - **Herramientas `tools/`**: scripts para extracción de ROIs, entrenamiento
   completo, evaluación, exportación, validación de contratos y demos en tiempo
   real (`docs/operational_checklist.md` lista los pasos sugeridos para releases).
@@ -35,6 +38,23 @@ experimentos o adaptar el flujo a nuevas variantes.
 Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
 `docs/pretraining.md` para ampliar cada etapa. `tools/README.md` describe cada
 script CLI disponible.
+
+### Pipeline unificado ROI + keypoints
+
+1. **Preprocesar ROIs y keypoints** con `tools/extract_rois_v2.py` y el pipeline
+   de MediaPipe documentado en `docs/data_contract.md`. Asegúrate de exportar
+   `metadata.jsonl` y los keypoints por video (`.npz`/`.npy`).
+2. **Validar alineación y glosas** ejecutando
+   `python tools/ci_validate_data_contract.py`, que comprueba máscaras,
+   keypoints y etiquetas CTC/gloss en un dataset sintético.
+3. **Entrenar con pérdidas combinadas** mediante
+   `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
+   traducción, CTC y distilación según el escenario (ver ejemplos en
+   `tools/README.md`). El wrapper `tools/train_slt_lsa_mska_v13.py` mantiene
+   compatibilidad con scripts heredados.
+4. **Evaluar y exportar** con `tools/eval_slt_multistream_v9.py` y
+   `tools/export_onnx_encoder_v9.py`, reutilizando las mismas configuraciones de
+   MSKA para reproducir métricas y artefactos.
 
 ### Pesos pre-entrenados
 
@@ -92,8 +112,10 @@ para conocer las verificaciones recomendadas tras la instalación.
 3. **Ejecutar un entrenamiento rápido** con `python -m slt` para validar que los
    datos y el tokenizador son correctos. Define el `work_dir` donde se guardarán
    los checkpoints temporales.
-4. **Lanzar experimentos completos** con `tools/train_slt_multistream_v9.py` o
-   `tools/train_slt_lsa_mska_v13.py` según el tipo de entrada (ROIs vs. keypoints).
+4. **Lanzar experimentos completos** con `tools/train_slt_multistream_v9.py`,
+   habilitando `--use-mska` cuando el dataset incluya keypoints y glosas. El
+   wrapper `tools/train_slt_lsa_mska_v13.py` reenvía los argumentos al flujo
+   unificado.
 5. **Evaluar resultados** usando `tools/eval_slt_multistream_v9.py` y analiza los
    reportes con `docs/metrics_dashboard_integration.py` o tus dashboards.
 6. **Exportar y validar** con `tools/export_onnx_encoder_v9.py` y las demos en

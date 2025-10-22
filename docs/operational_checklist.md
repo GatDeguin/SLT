@@ -6,17 +6,22 @@ técnicas; cada ítem enlaza con la documentación correspondiente.
 
 ## Reproducir errores y validar fixes
 
-1. **Contrato de datos**: ejecuta `python tools/ci_validate_data_contract.py`
-   para generar un dataset sintético y confirmar que los checks de calidad
-   coinciden con `docs/data_contract.md`.
-2. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
+1. **Contrato de datos y keypoints**: ejecuta
+   `python tools/ci_validate_data_contract.py` para generar un dataset sintético y
+   confirmar que las máscaras por stream, los keypoints y las etiquetas
+   CTC/gloss coinciden con `docs/data_contract.md`.
+2. **Alineación ROI-keypoints**: corre `pytest tests/data/test_lsa_t_multistream.py`
+   para verificar que los keypoints por flujo siguen las máscaras y longitudes
+   esperadas antes de lanzar experimentos reales.
+3. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
    para comprobar que los componentes de datos, entrenamiento y exportación
    funcionan integrados. Si trabajas con flujos basados en keypoints, valida
-   también `tools/train_slt_multistream_v9.py --use-mska` (o el wrapper) con un fragmento representativo.
-3. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
+   también `tools/train_slt_multistream_v9.py --use-mska` (o el wrapper) con un
+   fragmento representativo.
+4. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
    producido por la demo y revisa los reportes con
    `docs/metrics_dashboard_integration.py`.
-4. **Exportación**: ejecuta `pytest tests/test_export.py` o el script
+5. **Exportación**: ejecuta `pytest tests/test_export.py` o el script
    `tools/export_onnx_encoder_v9.py` con el checkpoint de referencia para
    asegurar que ONNX y TorchScript son válidos. Complementa con
    `tools/test_realtime_pipeline.py` cuando existan regresiones de latencia.
@@ -38,6 +43,8 @@ técnicas; cada ítem enlaza con la documentación correspondiente.
 
 - [ ] Generar reporte de datos (`tools/ci_validate_data_contract.py`) y adjuntar
       el resultado en la bitácora de la release.
+- [ ] Ejecutar `pytest tests/data/test_lsa_t_multistream.py` para confirmar la
+      alineación ROI-keypoints y la propagación de glosas/CTC.
 - [ ] Ejecutar `pytest` completo y conservar los registros.
 - [ ] Comparar métricas con `tools/ci_validate_metrics.py` y documentar desvíos.
 - [ ] Verificar que los ejemplos del README coinciden con la versión final del

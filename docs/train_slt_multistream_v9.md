@@ -16,6 +16,23 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
 - CSV `meta.csv` con columnas `video_id;texto` y splits `train.csv`/`val.csv`/`test.csv`.
 - Tokenizador HuggingFace compatible con modelos tipo T5/BART.
 
+## Pipeline unificado ROI + keypoints
+
+1. **Preprocesamiento**: extrae las ROIs con `tools/extract_rois_v2.py`, genera
+   los keypoints MediaPipe por video y prepara `gloss.csv` con las secuencias y
+   etiquetas CTC. `docs/data_contract.md` detalla formatos y convenciones.
+2. **Validación**: ejecuta `python tools/ci_validate_data_contract.py` o las
+   pruebas de `tests/data/test_lsa_t_multistream.py` para confirmar que las
+   máscaras por stream y la alineación ROI-keypoints son coherentes.
+3. **Entrenamiento multi-pérdida**: lanza este script con `--use-mska` y define
+   `--mska-translation-weight`, `--mska-ctc-weight` y
+   `--mska-distillation-weight` según el objetivo del experimento. El modelo
+   combina automáticamente las pérdidas activas y registra cada término en
+   `metrics.jsonl`.
+4. **Evaluación y exportación**: reutiliza las mismas banderas MSKA en
+   `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
+   mantener consistencia entre entrenamiento, evaluación y despliegue.
+
 ## Ejecución básica
 
 ```bash
