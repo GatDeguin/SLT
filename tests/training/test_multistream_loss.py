@@ -45,8 +45,8 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
     features = torch.randn(1, time_steps, embed_dim, dtype=torch.float32)
     stream_head = StreamCTCHead(embed_dim, ctc_vocab, dropout=0.0)
     fused_head = FusedCTCHead(embed_dim, ctc_vocab, dropout=0.0)
-    stream_logits = stream_head(features)
-    fused_logits = fused_head(features)
+    stream_logits, stream_temporal = stream_head.forward_with_intermediate(features)
+    fused_logits, fused_temporal = fused_head.forward_with_intermediate(features)
     fused_mask = torch.ones(1, time_steps, dtype=torch.bool)
     stream_mask = fused_mask.clone()
     teacher_logits = fused_logits.detach()
@@ -54,11 +54,19 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
     fused_probs = torch.softmax(fused_logits, dim=-1)
     stream_probs = torch.softmax(stream_logits, dim=-1)
     teacher_probs = torch.softmax(teacher_logits, dim=-1)
+    fused_temporal_probs = torch.softmax(fused_temporal, dim=1)
+    stream_temporal_probs = torch.softmax(stream_temporal, dim=1)
+    teacher_temporal_probs = torch.softmax(fused_temporal.detach(), dim=1)
 
     outputs = SimpleNamespace(
         logits=logits,
         auxiliary={
-            "fused": {"logits": fused_logits, "mask": fused_mask, "probs": fused_probs},
+            "fused": {
+                "logits": fused_logits,
+                "mask": fused_mask,
+                "probs": fused_probs,
+                "temporal_probs": fused_temporal_probs,
+            },
             "stream": {"pose": stream_logits},
             "frame_masks": {"pose": stream_mask},
             "distillation": {"pose": teacher_logits},
@@ -66,6 +74,15 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
                 "fused": fused_probs,
                 "stream": {"pose": stream_probs},
                 "distillation": {"pose": teacher_probs},
+                "temporal": {
+                    "fused": fused_temporal_probs,
+                    "stream": {"pose": stream_temporal_probs},
+                    "distillation": {"pose": teacher_temporal_probs},
+                },
+            },
+            "temporal_features": {
+                "fused": fused_temporal,
+                "stream": {"pose": stream_temporal},
             },
         },
     )

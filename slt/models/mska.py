@@ -529,38 +529,85 @@ class StreamCTCHead(nn.Module):
         self.hidden_dim = self.in_dim
 
         self.input_linear = nn.Linear(self.in_dim, self.hidden_dim)
-        self.input_norm = nn.BatchNorm1d(self.hidden_dim)
         self.input_activation = nn.ReLU(inplace=True)
-        self.temporal_block = nn.Sequential(
-            nn.Conv1d(
-                self.hidden_dim,
-                self.hidden_dim,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm1d(self.hidden_dim),
-            nn.ReLU(inplace=True),
+        self.input_norm_1d = nn.BatchNorm1d(self.hidden_dim)
+        self.input_norm_2d = nn.BatchNorm2d(self.hidden_dim)
+        self.temporal_conv_1d = nn.Conv1d(
+            self.hidden_dim,
+            self.hidden_dim,
+            kernel_size=3,
+            padding=1,
+            bias=False,
         )
+        self.temporal_norm_1d = nn.BatchNorm1d(self.hidden_dim)
+        self.temporal_conv_2d = nn.Conv2d(
+            self.hidden_dim,
+            self.hidden_dim,
+            kernel_size=(3, 3),
+            padding=(1, 1),
+            bias=False,
+        )
+        self.temporal_norm_2d = nn.BatchNorm2d(self.hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.output_projection = nn.Linear(self.hidden_dim, self.vocab_size)
 
-    def forward(self, features: Tensor) -> Tensor:
-        if features.dim() != 3:
-            raise ValueError("features must have shape (batch, time, dim)")
+    def forward(self, features: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        logits, _ = self.forward_with_intermediate(features, mask=mask)
+        return logits
+
+    def forward_with_intermediate(
+        self, features: Tensor, mask: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
+        """Return logits and temporal features preserving the time dimension."""
+
+        temporal = self._temporal_features(features, mask=mask)
+        logits = self.output_projection(temporal)
+        return logits, temporal
+
+    def _temporal_features(self, features: Tensor, mask: Optional[Tensor]) -> Tensor:
+        if features.dim() not in {3, 4}:
+            raise ValueError(
+                "features must have shape (batch, time, dim) or (batch, time, joints, dim)"
+            )
         if features.size(-1) != self.in_dim:
             raise ValueError(
                 f"Expected input dimension {self.in_dim}, received {features.size(-1)}"
             )
 
+        if features.dim() == 3:
+            hidden = self.input_linear(features)
+            hidden = hidden.transpose(1, 2).contiguous()
+            hidden = self.input_norm_1d(hidden)
+            hidden = self.input_activation(hidden)
+            hidden = self.temporal_conv_1d(hidden)
+            hidden = self.temporal_norm_1d(hidden)
+            hidden = self.input_activation(hidden)
+            hidden = self.dropout(hidden)
+            return hidden.transpose(1, 2).contiguous()
+
+        batch, time, joints, _ = features.shape
         hidden = self.input_linear(features)
-        hidden = hidden.transpose(1, 2).contiguous()
-        hidden = self.input_norm(hidden)
+        hidden = hidden.permute(0, 3, 1, 2).contiguous()
+        hidden = self.input_norm_2d(hidden)
         hidden = self.input_activation(hidden)
-        hidden = self.temporal_block(hidden)
+        hidden = self.temporal_conv_2d(hidden)
+        hidden = self.temporal_norm_2d(hidden)
+        hidden = self.input_activation(hidden)
         hidden = self.dropout(hidden)
-        hidden = hidden.transpose(1, 2).contiguous()
-        return self.output_projection(hidden)
+
+        if mask is not None:
+            if mask.shape != (batch, time, joints):
+                raise ValueError(
+                    "mask must match the (batch, time, joints) dimensions of the inputs"
+                )
+            mask_float = mask.to(dtype=hidden.dtype).unsqueeze(1)
+            hidden = hidden * mask_float
+            denom = mask_float.sum(dim=-1).clamp_min(1.0)
+            pooled = hidden.sum(dim=-1) / denom
+        else:
+            pooled = hidden.mean(dim=-1)
+
+        return pooled.transpose(1, 2).contiguous()
 
 
 class FusedCTCHead(StreamCTCHead):
@@ -681,25 +728,47 @@ class MSKAEncoder(nn.Module):
                 raise RuntimeError("No MSKA output available to compute auxiliary logits")
             output = self._last_output
 
-        fused_logits = self.fuse_head(output.fused_embedding)
+        fused_logits, fused_temporal = self.fuse_head.forward_with_intermediate(
+            output.fused_embedding
+        )
         use_teacher = self.detach_teacher if detach_teacher is None else detach_teacher
         teacher_logits = fused_logits.detach() if use_teacher else fused_logits
         fused_probs = torch.softmax(fused_logits, dim=-1)
         teacher_probs = torch.softmax(teacher_logits, dim=-1)
+        fused_temporal_probs = torch.softmax(fused_temporal, dim=1)
+        teacher_temporal_source = fused_temporal.detach() if use_teacher else fused_temporal
+        teacher_temporal_probs = torch.softmax(teacher_temporal_source, dim=1)
 
         stream_logits: Dict[str, Tensor] = {}
         distillation: Dict[str, Tensor] = {}
         stream_probs: Dict[str, Tensor] = {}
+        stream_temporal_features: Dict[str, Tensor] = {}
+        stream_temporal_probs: Dict[str, Tensor] = {}
+
         for name, embeddings in output.stream_embeddings.items():
-            logits = self.stream_heads[name](embeddings)
+            joint_embeddings = output.joint_embeddings.get(name)
+            joint_mask = output.stream_masks.get(name)
+            head_inputs = joint_embeddings if joint_embeddings is not None else embeddings
+            logits, temporal_features = self.stream_heads[name].forward_with_intermediate(
+                head_inputs, mask=joint_mask
+            )
             stream_logits[name] = logits
             distillation[name] = teacher_logits
             stream_probs[name] = torch.softmax(logits, dim=-1)
+            stream_temporal_features[name] = temporal_features
+            stream_temporal_probs[name] = torch.softmax(temporal_features, dim=1)
 
         probabilities = {
             "fused": fused_probs,
             "stream": stream_probs,
             "distillation": {name: teacher_probs for name in stream_logits},
+            "temporal": {
+                "fused": fused_temporal_probs,
+                "stream": stream_temporal_probs,
+                "distillation": {
+                    name: teacher_temporal_probs for name in stream_logits
+                },
+            },
         }
 
         return {
@@ -708,10 +777,15 @@ class MSKAEncoder(nn.Module):
                 "logits": fused_logits,
                 "mask": output.fused_mask,
                 "probs": fused_probs,
+                "temporal_probs": fused_temporal_probs,
             },
             "distillation": distillation,
             "frame_masks": output.frame_masks,
             "probabilities": probabilities,
+            "temporal_features": {
+                "fused": fused_temporal,
+                "stream": stream_temporal_features,
+            },
         }
 
     @property
