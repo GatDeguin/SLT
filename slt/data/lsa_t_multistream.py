@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import random
 import warnings
@@ -144,6 +145,11 @@ class LsaTMultiStream(Dataset):
         quality_checks: bool = True,
         quality_strict: bool = False,
         fps_tolerance: float = 1.0,
+        keypoint_normalize_center: bool = True,
+        keypoint_scale_range: Optional[Sequence[float]] = None,
+        keypoint_translate_range: Optional[Sequence[float]] = None,
+        keypoint_rotate_range: Optional[Sequence[float]] = None,
+        keypoint_resample_range: Optional[Sequence[float]] = None,
     ) -> None:
         pd = _get_pandas()
         np = _get_numpy()
@@ -162,6 +168,29 @@ class LsaTMultiStream(Dataset):
         self.quality_checks = quality_checks
         self.quality_strict = quality_strict
         self.fps_tolerance = fps_tolerance
+        self.keypoint_normalize_center = bool(keypoint_normalize_center)
+        self.keypoint_scale_range = self._normalise_pair_range(
+            keypoint_scale_range,
+            field_name="keypoint_scale_range",
+            positive=True,
+            symmetric_on_scalar=False,
+        )
+        self.keypoint_translate_range = self._normalise_translation_range(
+            keypoint_translate_range,
+            field_name="keypoint_translate_range",
+        )
+        self.keypoint_rotate_range = self._normalise_pair_range(
+            keypoint_rotate_range,
+            field_name="keypoint_rotate_range",
+            positive=False,
+            symmetric_on_scalar=True,
+        )
+        self.keypoint_resample_range = self._normalise_pair_range(
+            keypoint_resample_range,
+            field_name="keypoint_resample_range",
+            positive=True,
+            symmetric_on_scalar=False,
+        )
         self._np = np
         self._keypoint_layout: Optional[Dict[str, List[int]]] = None
         self._keypoint_total: int = 0
@@ -292,6 +321,79 @@ class LsaTMultiStream(Dataset):
         idxs = np.rint(positions).astype("int64").tolist()
         return [max(0, min(last_index, int(i))) for i in idxs]
 
+    def _normalise_pair_range(
+        self,
+        value: Optional[Sequence[float]],
+        *,
+        field_name: str,
+        positive: bool,
+        symmetric_on_scalar: bool,
+    ) -> Optional[Tuple[float, float]]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            scalar = float(value)
+            if symmetric_on_scalar:
+                low, high = -scalar, scalar
+            else:
+                low = high = scalar
+        else:
+            try:
+                items = [float(v) for v in value]
+            except TypeError as exc:
+                raise TypeError(
+                    f"{field_name} debe ser numérico o una secuencia de floats"
+                ) from exc
+            if len(items) != 2:
+                raise ValueError(
+                    f"{field_name} espera exactamente 2 valores; se recibieron {len(items)}"
+                )
+            low, high = items
+        if low > high:
+            raise ValueError(
+                f"{field_name}: el mínimo ({low}) no puede ser mayor que el máximo ({high})."
+            )
+        if positive and (low <= 0 or high <= 0):
+            raise ValueError(
+                f"{field_name}: los valores deben ser estrictamente positivos."
+            )
+        return float(low), float(high)
+
+    def _normalise_translation_range(
+        self,
+        value: Optional[Sequence[float]],
+        *,
+        field_name: str,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            delta = float(value)
+            return (-delta, delta, -delta, delta)
+        try:
+            items = [float(v) for v in value]
+        except TypeError as exc:
+            raise TypeError(
+                f"{field_name} debe ser numérico o una secuencia de floats"
+            ) from exc
+        if len(items) == 2:
+            low, high = items
+            if low > high:
+                raise ValueError(
+                    f"{field_name}: el mínimo ({low}) no puede ser mayor que el máximo ({high})."
+                )
+            return float(low), float(high), float(low), float(high)
+        if len(items) == 4:
+            min_x, max_x, min_y, max_y = items
+            if min_x > max_x or min_y > max_y:
+                raise ValueError(
+                    f"{field_name}: los límites deben cumplir min <= max por eje."
+                )
+            return float(min_x), float(max_x), float(min_y), float(max_y)
+        raise ValueError(
+            f"{field_name} espera 1, 2 o 4 valores; se recibieron {len(items)}"
+        )
+
     def _ensure_keypoint_layout(self, num_landmarks: int) -> None:
         if num_landmarks <= 0:
             return
@@ -340,7 +442,8 @@ class LsaTMultiStream(Dataset):
                     break
             kp_raw = self._read_keypoints_array(kp_path)
             kp_selected = self._select_keypoints(kp_raw)
-        keypoints_length = kp_selected.shape[0] if kp_selected.size > 0 else 0
+        kp_processed = self._prepare_keypoints(kp_selected)
+        keypoints_length = kp_processed.shape[0] if kp_processed.size > 0 else 0
         stream_lengths["keypoints"] = keypoints_length
 
         T0 = max(stream_lengths.values()) if stream_lengths else 0
@@ -385,7 +488,7 @@ class LsaTMultiStream(Dataset):
         hand_r = torch.stack(hr_list, dim=0)
 
         pose_t, pose_mask = self._sample_pose(pose)
-        keypoints_data = self._sample_keypoints(kp_selected, idxs)
+        keypoints_data = self._sample_keypoints(kp_processed, idxs)
         effective_length = self._effective_length(stream_lengths)
 
         pad_mask = torch.zeros(self.T, dtype=torch.bool)
@@ -451,7 +554,7 @@ class LsaTMultiStream(Dataset):
             hand_l_frames=hl_frames,
             hand_r_frames=hr_frames,
             pose_frames=pose,
-            keypoint_frames=kp_selected,
+            keypoint_frames=kp_processed,
             effective_length=effective_length,
         )
 
@@ -708,6 +811,73 @@ class LsaTMultiStream(Dataset):
             start += count
         return result
 
+    def _temporal_resample(
+        self,
+        kp_arr: Any,
+        ratio_range: Tuple[float, float],
+    ) -> Any:
+        np = self._np
+        arr = np.asarray(kp_arr, dtype="float32")
+        frames = arr.shape[0]
+        if frames <= 1:
+            return arr
+        low, high = ratio_range
+        if low <= 0 or high <= 0:
+            return arr
+        scale = random.uniform(low, high)
+        new_frames = max(1, int(round(frames * scale)))
+        if new_frames == frames:
+            return arr
+        positions = np.linspace(0.0, float(frames - 1), num=new_frames, dtype="float32")
+        lower = np.floor(positions).astype("int64")
+        upper = np.clip(lower + 1, 0, frames - 1)
+        weights = (positions - lower).astype("float32").reshape(new_frames, 1, 1)
+        base = arr[lower]
+        next_frames = arr[upper]
+        resampled = base * (1.0 - weights) + next_frames * weights
+        return resampled.astype("float32")
+
+    def _prepare_keypoints(self, kp_arr: Any) -> Any:
+        np = self._np
+        arr = np.asarray(kp_arr, dtype="float32")
+        if arr.ndim != 3:
+            total = self._keypoint_total if self._keypoint_total > 0 else 0
+            return np.zeros((0, total, 3), dtype="float32")
+        frames, landmarks, _ = arr.shape
+        if frames == 0 or landmarks == 0:
+            return arr.astype("float32")
+
+        processed = arr.astype("float32", copy=True)
+        coords = processed[:, :, :2].copy()
+
+        if self.keypoint_normalize_center:
+            coords -= 0.5
+        if self.keypoint_scale_range is not None:
+            scale = random.uniform(*self.keypoint_scale_range)
+            coords *= scale
+        if self.keypoint_rotate_range is not None:
+            angle = random.uniform(*self.keypoint_rotate_range)
+            if abs(angle) > 1e-6:
+                radians = math.radians(angle)
+                cos_val = math.cos(radians)
+                sin_val = math.sin(radians)
+                rot = np.array([[cos_val, -sin_val], [sin_val, cos_val]], dtype="float32")
+                coords = coords @ rot.T
+        if self.keypoint_translate_range is not None:
+            min_x, max_x, min_y, max_y = self.keypoint_translate_range
+            shift_x = random.uniform(min_x, max_x)
+            shift_y = random.uniform(min_y, max_y)
+            coords += np.array([shift_x, shift_y], dtype="float32")
+        if self.keypoint_normalize_center:
+            coords += 0.5
+
+        processed[:, :, :2] = coords
+
+        if self.keypoint_resample_range is not None:
+            processed = self._temporal_resample(processed, self.keypoint_resample_range)
+
+        return processed.astype("float32")
+
     def _sample_keypoints(
         self,
         kp_arr: Any,
@@ -741,7 +911,16 @@ class LsaTMultiStream(Dataset):
         sampled = arr[clamped]
         conf = sampled[:, :, 2]
         mask = conf >= self.min_conf
-        sampled[:, :, :2] *= mask[..., None].astype("float32")
+        coords = sampled[:, :, :2]
+        in_bounds = (
+            (coords[:, :, 0] >= 0.0)
+            & (coords[:, :, 0] <= 1.0)
+            & (coords[:, :, 1] >= 0.0)
+            & (coords[:, :, 1] <= 1.0)
+        )
+        mask = mask & in_bounds
+        clipped = self._np.clip(coords, 0.0, 1.0)
+        sampled[:, :, :2] = clipped * mask[..., None].astype("float32")
         frame_mask = mask.any(axis=1)
 
         views_np = self._split_keypoint_views(sampled)

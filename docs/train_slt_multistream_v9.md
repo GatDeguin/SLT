@@ -77,6 +77,34 @@ Artefactos generados en `--work-dir`:
 | `--mix-stream STREAM[:P]` | Permuta streams individuales con probabilidad `P`. |
 | `--max-target-length` | Longitud máxima de la secuencia tokenizada. |
 
+### Augmentaciones de keypoints
+
+- `--keypoint-normalize-center` / `--no-keypoint-normalize-center`: controla si los
+  keypoints se desplazan al centro de la imagen antes de aplicar las
+  transformaciones. La normalización está habilitada por defecto.
+- `--keypoint-scale-range min,max`: rango uniforme (``>0``) para escalar los
+  keypoints alrededor del centro.
+- `--keypoint-translate-range`: traslaciones en el plano. Admite un valor (±X),
+  dos valores (`min,max`) o cuatro valores (`min_x,max_x,min_y,max_y`).
+- `--keypoint-rotate-range`: ángulos mínimo y máximo, en grados, para rotar los
+  keypoints alrededor del centro.
+- `--keypoint-resample-range`: factores (``>0``) utilizados para re-muestrear la
+  secuencia temporal de keypoints antes del muestreo final a `T` frames.
+
+Ejemplo con augmentaciones activas durante el entrenamiento:
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --config configs/single_signer.yml \
+  --keypoint-scale-range 0.9,1.1 \
+  --keypoint-translate-range -0.05,0.05 \
+  --keypoint-rotate-range -15,15 \
+  --keypoint-resample-range 0.85,1.1
+```
+
+Los mismos flags están disponibles en `tools/eval_slt_multistream_v9.py` para
+replicar el preprocesamiento al evaluar checkpoints.
+
 ### Modelo
 
 | Bandera | Descripción |

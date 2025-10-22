@@ -49,6 +49,29 @@ cuando necesites procesar videos o ejecutar demos.
 - `--mska-ctc-vocab`, `--mska-input-dim`, `--mska-detach-teacher`: parámetros
   estructurales del encoder MSKA.
 
+### Augmentaciones de keypoints
+
+- `--keypoint-normalize-center` / `--no-keypoint-normalize-center`: activa o
+  desactiva la normalización al centro antes de aplicar augmentations.
+- `--keypoint-scale-range`: define un rango uniforme (``>0``) para escalar los
+  keypoints.
+- `--keypoint-translate-range`: acepta 1, 2 o 4 valores para trasladar los
+  keypoints en el plano.
+- `--keypoint-rotate-range`: rota los keypoints alrededor del centro usando un
+  rango de grados.
+- `--keypoint-resample-range`: vuelve a muestrear temporalmente los keypoints
+  antes de seleccionar `T` frames.
+
+Ejemplo:
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --keypoint-scale-range 0.9,1.1 \
+  --keypoint-translate-range -0.05,0.05 \
+  --keypoint-rotate-range -15,15 \
+  --keypoint-resample-range 0.85,1.1
+```
+
 ### Ejemplos de configuración con MSKA
 
 ```yaml

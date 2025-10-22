@@ -38,6 +38,7 @@ from slt.training.data import create_dataloader, normalise_mix_spec
 from slt.training.loops import eval_epoch, multistream_loss, train_epoch
 from slt.training.models import MultiStreamClassifier
 from slt.training.optim import create_optimizer, create_scheduler
+from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.general import set_seed
 from slt.utils.text import create_tokenizer
 
@@ -197,6 +198,39 @@ def parse_args() -> argparse.Namespace:
             "Optionally permute individual streams across the batch with probability P."
             " STREAM can be face, hand-left, hand-right or pose."
         ),
+    )
+    parser.add_argument(
+        "--keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_true",
+        help="Normalise keypoints around the image centre before augmentations.",
+    )
+    parser.add_argument(
+        "--no-keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_false",
+        help="Disable centre normalisation prior to keypoint augmentations.",
+    )
+    parser.set_defaults(keypoint_normalize_center=None)
+    parser.add_argument(
+        "--keypoint-scale-range",
+        type=str,
+        help="Uniform scale factor range applied to keypoints (e.g. 0.9,1.1).",
+    )
+    parser.add_argument(
+        "--keypoint-translate-range",
+        type=str,
+        help="Translation offsets (1, 2 or 4 floats) applied after scaling/rotation.",
+    )
+    parser.add_argument(
+        "--keypoint-rotate-range",
+        type=str,
+        help="Rotation range in degrees around the frame centre (e.g. -10,10).",
+    )
+    parser.add_argument(
+        "--keypoint-resample-range",
+        type=str,
+        help="Temporal resampling ratio range applied before frame selection.",
     )
 
     # Model arguments
@@ -472,11 +506,59 @@ def parse_args() -> argparse.Namespace:
         args.mix_streams = None
     if args.precision == "float32":
         args.precision = "fp32"
+    if getattr(args, "keypoint_scale_range", None) is not None:
+        raw = args.keypoint_scale_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_scale_range = None
+        else:
+            try:
+                args.keypoint_scale_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-scale-range: {exc}")
+    if getattr(args, "keypoint_translate_range", None) is not None:
+        raw = args.keypoint_translate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_translate_range = None
+        else:
+            try:
+                args.keypoint_translate_range = parse_translation_range(raw)
+            except ValueError as exc:
+                parser.error(f"--keypoint-translate-range: {exc}")
+    if getattr(args, "keypoint_rotate_range", None) is not None:
+        raw = args.keypoint_rotate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_rotate_range = None
+        else:
+            try:
+                args.keypoint_rotate_range = parse_range_pair(
+                    raw,
+                    positive=False,
+                    symmetric_single=True,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-rotate-range: {exc}")
+    if getattr(args, "keypoint_resample_range", None) is not None:
+        raw = args.keypoint_resample_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_resample_range = None
+        else:
+            try:
+                args.keypoint_resample_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-resample-range: {exc}")
     if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
     explicit_bool_flags = set()
-    for name in ("use_mska", "mska_detach_teacher"):
+    for name in ("use_mska", "mska_detach_teacher", "keypoint_normalize_center"):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
     args._explicit_bool_flags = explicit_bool_flags
@@ -786,6 +868,11 @@ def main() -> None:
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
+        keypoint_normalize_center=data_config.keypoint_normalize_center,
+        keypoint_scale_range=data_config.keypoint_scale_range,
+        keypoint_translate_range=data_config.keypoint_translate_range,
+        keypoint_rotate_range=data_config.keypoint_rotate_range,
+        keypoint_resample_range=data_config.keypoint_resample_range,
     )
     val_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),
@@ -801,6 +888,11 @@ def main() -> None:
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
+        keypoint_normalize_center=data_config.keypoint_normalize_center,
+        keypoint_scale_range=data_config.keypoint_scale_range,
+        keypoint_translate_range=data_config.keypoint_translate_range,
+        keypoint_rotate_range=data_config.keypoint_rotate_range,
+        keypoint_resample_range=data_config.keypoint_resample_range,
     )
 
     val_batch_size = data_config.val_batch_size or data_config.batch_size
