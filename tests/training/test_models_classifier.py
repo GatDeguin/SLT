@@ -201,7 +201,7 @@ def test_classifier_with_mska_auxiliary_outputs(monkeypatch) -> None:
         hand_left_backbone="stub",
         hand_right_backbone="stub",
         pretrained="none",
-        mska=True,
+        use_mska=True,
         mska_ctc_vocab=tokenizer.vocab_size,
         mska_dropout=0.0,
     )

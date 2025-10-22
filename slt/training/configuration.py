@@ -40,13 +40,17 @@ class ModelConfig:
     freeze_hand_right_backbone: bool = False
     pretrained: Optional[str] = "single_signer"
     pretrained_checkpoint: Optional[Path] = None
-    mska: bool = False
+    use_mska: bool = False
     mska_heads: int = 4
     mska_ff_multiplier: int = 4
     mska_dropout: float = 0.1
     mska_input_dim: int = 3
     mska_ctc_vocab: Optional[int] = None
     mska_detach_teacher: bool = True
+    mska_translation_weight: float = 1.0
+    mska_ctc_weight: float = 0.0
+    mska_distillation_weight: float = 0.0
+    mska_distillation_temperature: float = 1.0
 
 
 @dataclass
@@ -264,8 +268,10 @@ def resolve_configs(
 
     apply_string_overrides(defaults, set_overrides)
 
+    raw_model_section = defaults.get("model", {})
+
     data_config = instantiate_config(DataConfig, defaults.get("data", {}))
-    model_config = instantiate_config(ModelConfig, defaults.get("model", {}))
+    model_config = instantiate_config(ModelConfig, raw_model_section)
     optim_config = instantiate_config(OptimConfig, defaults.get("optim", {}))
     training_config = instantiate_config(TrainingConfig, defaults.get("training", {}))
 
@@ -279,6 +285,29 @@ def resolve_configs(
             optim_config.scheduler = None
         else:
             optim_config.scheduler = scheduler_choice
+
+    if "mska" in raw_model_section and "use_mska" not in raw_model_section:
+        model_config.use_mska = bool(raw_model_section["mska"])
+
+    if model_config.use_mska:
+        if data_config.keypoints_dir is None:
+            raise ValueError("MSKA requires data.keypoints_dir to be configured")
+        if model_config.mska_translation_weight < 0:
+            raise ValueError("mska_translation_weight must be non-negative")
+        if model_config.mska_ctc_weight < 0:
+            raise ValueError("mska_ctc_weight must be non-negative")
+        if model_config.mska_distillation_weight < 0:
+            raise ValueError("mska_distillation_weight must be non-negative")
+        if model_config.mska_distillation_temperature <= 0:
+            raise ValueError("mska_distillation_temperature must be > 0")
+        if model_config.mska_ctc_weight > 0 and data_config.gloss_csv is None:
+            raise ValueError(
+                "MSKA CTC supervision enabled but data.gloss_csv is missing"
+            )
+    else:
+        model_config.mska_translation_weight = max(0.0, model_config.mska_translation_weight)
+        model_config.mska_ctc_weight = 0.0
+        model_config.mska_distillation_weight = 0.0
 
     extra_optim = defaults.get("optim", {})
     if optim_config.scheduler == "cosine":

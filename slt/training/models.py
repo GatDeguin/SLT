@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
@@ -14,6 +15,30 @@ from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import load_single_signer_components
 
 from .configuration import ModelConfig
+
+
+@dataclass
+class ClassifierOutput:
+    """Wrapper combining decoder outputs with auxiliary logits."""
+
+    decoder: Any
+    auxiliary: Optional[Dict[str, Any]] = None
+
+    @property
+    def logits(self) -> Any:
+        if hasattr(self.decoder, "logits"):
+            return self.decoder.logits
+        return self.decoder
+
+    @property
+    def loss(self) -> Any:
+        return getattr(self.decoder, "loss", None)
+
+    def __getattr__(self, name: str) -> Any:  # pragma: no cover - passthrough
+        try:
+            return getattr(self.decoder, name)
+        except AttributeError as exc:  # pragma: no cover - defensive
+            raise AttributeError(name) from exc
 
 
 def _import_symbol(path: str) -> Any:
@@ -83,7 +108,7 @@ class MultiStreamClassifier(nn.Module):
             vocab_size = len(tokenizer)
 
         mska_encoder: Optional[MSKAEncoder] = None
-        if config.mska:
+        if config.use_mska:
             mska_vocab = config.mska_ctc_vocab or vocab_size
             mska_encoder = MSKAEncoder(
                 input_dim=config.mska_input_dim,
@@ -221,7 +246,7 @@ class MultiStreamClassifier(nn.Module):
         decoder_attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         **extra_inputs: Any,
-    ) -> torch.Tensor:
+    ) -> ClassifierOutput:
         keypoint_streams = None
         encoder_kwargs = extra_inputs
         if self._mska_enabled:
@@ -252,8 +277,7 @@ class MultiStreamClassifier(nn.Module):
             mska_output = self.encoder.last_mska_output
             if mska_output is not None:
                 auxiliary = self.encoder.mska_encoder.auxiliary_logits(mska_output)
-        setattr(decoder_output, "auxiliary", auxiliary)
-        return decoder_output
+        return ClassifierOutput(decoder=decoder_output, auxiliary=auxiliary)
 
     def generate(
         self,

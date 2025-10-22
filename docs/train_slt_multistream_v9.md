@@ -48,6 +48,8 @@ Artefactos generados en `--work-dir`:
 | `--face-dir`, `--hand-left-dir`, `--hand-right-dir` | Directorios de recortes RGB. |
 | `--pose-dir` | Directorio con los `.npz` de pose. |
 | `--metadata-csv` | Ruta a `meta.csv`. |
+| `--keypoints-dir` | Directorio opcional con keypoints MediaPipe (.npy/.npz). |
+| `--gloss-csv` | CSV con columnas `video_id;gloss;ctc_labels` para pérdidas MSKA. |
 | `--train-index`, `--val-index` | Listas de `video_id` para cada split. |
 | `--batch-size`, `--val-batch-size` | Tamaños de lote de entrenamiento y validación. |
 | `--num-workers`, `--pin-memory` | Parámetros del `DataLoader`. |
@@ -67,6 +69,10 @@ Artefactos generados en `--work-dir`:
 | `--decoder-class`, `--decoder-kwargs` | Decoder Python personalizado vía módulo/clase. |
 | `--pretrained` | Selecciona `single_signer` (default) o `none` para inicializar pesos. |
 | `--pretrained-checkpoint` | Ruta al checkpoint `single_signer` descargado. |
+| `--use-mska` | Activa la rama MSKA (requiere keypoints y glosas). |
+| `--mska-*` | Hiperparámetros MSKA (`heads`, `ff-multiplier`, `dropout`, `input-dim`, `ctc-vocab`, `detach-teacher`). |
+| `--mska-translation-weight`, `--mska-ctc-weight`, `--mska-distillation-weight` | Pesos de la combinación de pérdidas. |
+| `--mska-distillation-temperature` | Temperatura aplicada al término de distilación. |
 
 ### Optimización y ejecución
 

@@ -219,23 +219,24 @@ defaults, archivo y banderas.
 
 ### Entrenamiento basado en keypoints
 
-`tools/train_slt_lsa_mska_v13.py` entrena un modelo para variantes basadas en
-keypoints 2D/3D (por ejemplo flujos MSKA para lengua de señas argentina). Acepta
-archivos `.npy` estructurados como `(T, 79, {2,3})` o vectores planos por frame.
+Activa la rama MSKA con `tools/train_slt_multistream_v9.py --use-mska`,
+proporcionando `data.keypoints_dir` y `data.gloss_csv` en la configuración.
+Esto habilita la combinación de pérdidas (traducción, CTC y distilación) y la
+carga de checkpoints individuales para el encoder y las cabezas auxiliares.
+El script `tools/train_slt_lsa_mska_v13.py` queda como *wrapper* retrocompatible
+que reenvía los parámetros al flujo unificado.
 
 ```bash
-python tools/train_slt_lsa_mska_v13.py \
-  --kp_dir data/lsa_keypoints \
-  --csv meta.csv --csv_delim ';' \
-  --work_dir work_dirs/lsa_mska \
-  --tok_name facebook/mbart-large-50-many-to-many-mmt \
-  --tgt_lang es_XX \
-  --epochs 50 --batch_size 4 --xy_only true
+python tools/train_slt_multistream_v9.py \
+  --use-mska \
+  --keypoints-dir data/lsa_keypoints \
+  --gloss-csv data/lsa_gloss.csv \
+  --work-dir work_dirs/lsa_mska \
+  --mska-ctc-weight 0.5 --mska-distillation-weight 0.2
 ```
 
-El script puede congelar capas del decoder (`--unfreeze_last_n_dec_layers`),
-reporta BLEU con SacreBLEU cuando está instalado y ofrece *warm start* mediante
-`--resume` y `--init_checkpoint`.
+Revisa `tools/train_slt_multistream_v9.py --help` y
+`docs/train_slt_multistream_v9.md` para detalles de cada argumento.
 
 ### Evaluación y reportes
 

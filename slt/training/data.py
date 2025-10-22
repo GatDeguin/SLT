@@ -161,7 +161,18 @@ def build_collate(
         }
         inputs["gloss_sequences"] = merged["gloss_sequences"]
         inputs["gloss_texts"] = merged["gloss_texts"]
-        return {"inputs": inputs, "labels": labels, "video_ids": merged["video_ids"]}
+        targets = {
+            "translation": labels,
+            "ctc_labels": merged["ctc_labels"],
+            "ctc_mask": merged["ctc_mask"],
+            "ctc_lengths": merged["ctc_lengths"],
+        }
+        return {
+            "inputs": inputs,
+            "targets": targets,
+            "labels": labels,
+            "video_ids": merged["video_ids"],
+        }
 
     return _collate
 

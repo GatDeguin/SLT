@@ -19,7 +19,7 @@ import random
 from dataclasses import asdict, fields
 from pathlib import Path
 from collections.abc import Mapping
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +35,7 @@ from slt.training.configuration import (
     resolve_configs,
 )
 from slt.training.data import create_dataloader, normalise_mix_spec
-from slt.training.loops import eval_epoch, train_epoch
+from slt.training.loops import eval_epoch, multistream_loss, train_epoch
 from slt.training.models import MultiStreamClassifier
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.general import set_seed
@@ -265,6 +265,73 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="JSON object with keyword arguments forwarded to the decoder constructor",
     )
+    parser.add_argument(
+        "--use-mska",
+        dest="use_mska",
+        action="store_true",
+        help="Enable the MSKA keypoint encoder branch",
+    )
+    parser.add_argument(
+        "--no-mska",
+        dest="use_mska",
+        action="store_false",
+        help="Disable the MSKA keypoint encoder branch",
+    )
+    parser.set_defaults(use_mska=None)
+    parser.add_argument("--mska-heads", type=int, help="Number of attention heads used by MSKA")
+    parser.add_argument(
+        "--mska-ff-multiplier",
+        type=int,
+        help="Feed-forward multiplier applied inside the MSKA transformer",
+    )
+    parser.add_argument(
+        "--mska-dropout",
+        type=float,
+        help="Dropout probability applied by MSKA encoders and heads",
+    )
+    parser.add_argument(
+        "--mska-input-dim",
+        type=int,
+        help="Dimensionality of the keypoint vectors provided to MSKA",
+    )
+    parser.add_argument(
+        "--mska-ctc-vocab",
+        type=int,
+        help="Vocabulary size used by the MSKA CTC classification heads",
+    )
+    parser.add_argument(
+        "--mska-detach-teacher",
+        dest="mska_detach_teacher",
+        action="store_true",
+        help="Detach fused logits before distillation (teacher without gradients)",
+    )
+    parser.add_argument(
+        "--mska-attach-teacher",
+        dest="mska_detach_teacher",
+        action="store_false",
+        help="Propagate gradients through the fused logits during distillation",
+    )
+    parser.set_defaults(mska_detach_teacher=None)
+    parser.add_argument(
+        "--mska-translation-weight",
+        type=float,
+        help="Weight applied to the translation cross-entropy term",
+    )
+    parser.add_argument(
+        "--mska-ctc-weight",
+        type=float,
+        help="Weight applied to the summed MSKA CTC losses",
+    )
+    parser.add_argument(
+        "--mska-distillation-weight",
+        type=float,
+        help="Weight applied to the MSKA distillation loss",
+    )
+    parser.add_argument(
+        "--mska-distillation-temperature",
+        type=float,
+        help="Temperature used to soften logits during distillation",
+    )
 
     # Optimiser and loop arguments
     parser.add_argument("--epochs", type=int, help="Number of training epochs")
@@ -364,6 +431,11 @@ def parse_args() -> argparse.Namespace:
     if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
+    explicit_bool_flags = set()
+    for name in ("use_mska", "mska_detach_teacher"):
+        if getattr(args, name, None) is not None:
+            explicit_bool_flags.add(name)
+    args._explicit_bool_flags = explicit_bool_flags
     return args
 
 
@@ -383,7 +455,7 @@ def _collect_cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]
                 continue
             value = getattr(args, attr_name)
             if isinstance(value, bool):
-                if value:
+                if value or attr_name in getattr(args, "_explicit_bool_flags", set()):
                     overrides[section][attr_name] = value
             elif value is not None:
                 overrides[section][attr_name] = value
@@ -577,6 +649,14 @@ def _load_initial_checkpoint(model: nn.Module, path: Path, *, device: torch.devi
         logging.warning("Unexpected keys when loading init checkpoint: %s", unexpected)
 
 
+def _unwrap_model(module: nn.Module) -> nn.Module:
+    for attr in ("_orig_mod", "module", "_module"):
+        inner = getattr(module, attr, None)
+        if isinstance(inner, nn.Module):
+            return inner
+    return module
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -589,12 +669,21 @@ def _save_checkpoint(
     config: Mapping[str, Any] | None = None,
     scheduler: Any | None = None,
 ) -> None:
+    base_model = _unwrap_model(model)
+
     state = {
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "val_loss": float(val_loss),
     }
+    if hasattr(base_model, "encoder") and isinstance(base_model.encoder, nn.Module):
+        state["encoder_state"] = base_model.encoder.state_dict()
+        mska_encoder = getattr(base_model.encoder, "mska_encoder", None)
+        if isinstance(mska_encoder, nn.Module):
+            state["mska_state"] = mska_encoder.state_dict()
+    if hasattr(base_model, "decoder") and isinstance(base_model.decoder, nn.Module):
+        state["decoder_state"] = base_model.decoder.state_dict()
     if scaler is not None:
         state["scaler_state"] = scaler.state_dict()
     if best_val is not None:
@@ -733,26 +822,20 @@ def main() -> None:
                 },
             )
 
-    def _loss_fn(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        vocab = logits.size(-1)
-        try:
-            return F.cross_entropy(
-                logits.view(-1, vocab),
-                targets.view(-1),
-                ignore_index=-100,
-                label_smoothing=optim_config.label_smoothing,
-            )
-        except TypeError:  # pragma: no cover - fallback when label smoothing unsupported
-            logging.warning(
-                "Label smoothing unsupported in this PyTorch version. "
-                "Falling back to default loss."
-            )
-            return F.cross_entropy(
-                logits.view(-1, vocab),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+    def _loss_fn(
+        outputs: Any,
+        targets: Mapping[str, Any],
+        _: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return multistream_loss(
+            outputs,
+            targets,
+            label_smoothing=optim_config.label_smoothing,
+            translation_weight=model_config.mska_translation_weight,
+            ctc_weight=model_config.mska_ctc_weight,
+            distillation_weight=model_config.mska_distillation_weight,
+            distillation_temperature=model_config.mska_distillation_temperature,
+        )
 
     use_amp = (
         data_config.precision == "amp"
@@ -845,10 +928,15 @@ def main() -> None:
         )
         train_loss = train_result.loss
         val_loss = val_result.loss
+        train_ctc = train_result.metrics.get("loss_ctc_weighted")
+        val_ctc = val_result.metrics.get("loss_ctc_weighted")
+        train_dist = train_result.metrics.get("loss_distillation_weighted")
+        val_dist = val_result.metrics.get("loss_distillation_weighted")
 
         logging.info(
             "Epoch %d/%d - train_loss=%.4f - val_loss=%.4f - ppl_train=%.4f - "
-            "ppl_val=%.4f - cer_val=%.4f",
+            "ppl_val=%.4f - cer_val=%.4f - ctc_train=%.4f - ctc_val=%.4f - "
+            "dist_train=%.4f - dist_val=%.4f",
             epoch,
             training_config.epochs,
             train_loss,
@@ -856,6 +944,10 @@ def main() -> None:
             train_result.metrics.get("perplexity", float("nan")),
             val_result.metrics.get("perplexity", float("nan")),
             val_result.metrics.get("cer", float("nan")),
+            float("nan") if train_ctc is None else float(train_ctc),
+            float("nan") if val_ctc is None else float(val_ctc),
+            float("nan") if train_dist is None else float(train_dist),
+            float("nan") if val_dist is None else float(val_dist),
         )
 
         if writer is not None:

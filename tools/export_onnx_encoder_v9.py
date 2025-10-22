@@ -16,6 +16,7 @@ import torch
 from torch.onnx import OperatorExportTypes
 
 from slt.models import MultiStreamEncoder, ViTConfig
+from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import (
     load_single_signer_encoder,
     resolve_single_signer_checkpoint_path,
@@ -66,6 +67,37 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Feed-forward dimension inside the temporal encoder",
     )
     parser.add_argument("--temporal-dropout", type=float, default=0.1, help="Dropout probability in the temporal encoder")
+    parser.add_argument(
+        "--use-mska",
+        action="store_true",
+        help="Include the MSKA keypoint branch when exporting the encoder",
+    )
+    parser.add_argument("--mska-heads", type=int, help="Number of attention heads used by MSKA")
+    parser.add_argument(
+        "--mska-ff-multiplier",
+        type=int,
+        help="Feed-forward multiplier applied inside MSKA",
+    )
+    parser.add_argument("--mska-dropout", type=float, help="Dropout applied by MSKA components")
+    parser.add_argument("--mska-input-dim", type=int, help="Dimensionality of the MSKA keypoint vectors")
+    parser.add_argument(
+        "--mska-ctc-vocab",
+        type=int,
+        help="Vocabulary size expected by the MSKA CTC heads",
+    )
+    parser.add_argument(
+        "--mska-detach-teacher",
+        dest="mska_detach_teacher",
+        action="store_true",
+        help="Detach fused logits before distillation during export",
+    )
+    parser.add_argument(
+        "--mska-attach-teacher",
+        dest="mska_detach_teacher",
+        action="store_false",
+        help="Allow gradients through the fused logits during distillation",
+    )
+    parser.set_defaults(mska_detach_teacher=None)
     parser.add_argument("--device", type=str, default="cpu", help="Torch device identifier used during export")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument(
@@ -222,6 +254,26 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         "dim_feedforward": args.temporal_dim_feedforward,
         "dropout": args.temporal_dropout,
     }
+    mska_encoder = None
+    if args.use_mska:
+        if args.mska_ctc_vocab is None:
+            raise ValueError("--mska-ctc-vocab is required when --use-mska is set")
+        heads = args.mska_heads if args.mska_heads is not None else 4
+        ff_multiplier = args.mska_ff_multiplier if args.mska_ff_multiplier is not None else 4
+        dropout = args.mska_dropout if args.mska_dropout is not None else args.temporal_dropout
+        input_dim = args.mska_input_dim if args.mska_input_dim is not None else 3
+        detach_teacher = True if args.mska_detach_teacher is None else args.mska_detach_teacher
+        mska_encoder = MSKAEncoder(
+            input_dim=input_dim,
+            embed_dim=args.projector_dim,
+            stream_names=("face", "hand_left", "hand_right", "pose"),
+            num_heads=heads,
+            ff_multiplier=ff_multiplier,
+            dropout=dropout,
+            ctc_vocab_size=int(args.mska_ctc_vocab),
+            detach_teacher=detach_teacher,
+        )
+
     encoder = MultiStreamEncoder(
         backbone_config=vit_config,
         projector_dim=args.projector_dim,
@@ -231,6 +283,7 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         projector_dropout=args.projector_dropout,
         fusion_dropout=args.fusion_dropout,
         temporal_kwargs=temporal_kwargs,
+        mska=mska_encoder,
     )
     setattr(args, "_packaged_meta", {})
     return encoder
@@ -349,6 +402,10 @@ def _load_encoder_weights(identifier: str, model: MultiStreamEncoder) -> Dict[st
 
     state_dict = _select_state_dict(checkpoint, model)
     model.load_state_dict(state_dict)
+    if isinstance(raw_checkpoint, Mapping):
+        mska_state = raw_checkpoint.get("mska_state")
+        if mska_state is not None and model.mska_encoder is not None:
+            model.mska_encoder.load_state_dict(mska_state)
     return metadata
 
 
