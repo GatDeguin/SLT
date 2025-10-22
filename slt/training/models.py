@@ -119,6 +119,9 @@ class MultiStreamClassifier(nn.Module):
                 dropout=config.mska_dropout,
                 ctc_vocab_size=int(mska_vocab),
                 detach_teacher=config.mska_detach_teacher,
+                stream_attention_heads=config.mska_stream_heads,
+                stream_temporal_blocks=config.mska_temporal_blocks,
+                stream_temporal_kernel=config.mska_temporal_kernel,
             )
 
         self.encoder = MultiStreamEncoder(

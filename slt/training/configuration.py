@@ -47,6 +47,9 @@ class ModelConfig:
     mska_input_dim: int = 3
     mska_ctc_vocab: Optional[int] = None
     mska_detach_teacher: bool = True
+    mska_stream_heads: int = 4
+    mska_temporal_blocks: int = 2
+    mska_temporal_kernel: int = 3
     mska_translation_weight: float = 1.0
     mska_ctc_weight: float = 0.0
     mska_distillation_weight: float = 0.0

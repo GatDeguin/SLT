@@ -257,6 +257,11 @@ python tools/train_slt_multistream_v9.py \
   --mska-ctc-weight 0.5 --mska-distillation-weight 0.2
 ```
 
+Ajusta la atención por articulación y los bloques temporales con
+`--mska-stream-heads`, `--mska-temporal-blocks` y `--mska-temporal-kernel`, tal
+como se describe en la Sección 3.2.2 del paper y en
+`docs/train_slt_multistream_v9.md`.
+
 Revisa `tools/train_slt_multistream_v9.py --help` y
 `docs/train_slt_multistream_v9.md` para detalles de cada argumento.
 
