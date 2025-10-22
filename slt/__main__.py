@@ -188,156 +188,132 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescribe valores utilizando claves con puntos (ej. data.batch_size=4)",
     )
 
-    config_group = parser.add_argument_group(
-        "Menú de configuración",
-        "Define rutas base e importación de CSV para el demo.",
-    )
-    config_group.add_argument(
+    parser.add_argument(
         "--face-dir",
         type=Path,
         required=True,
         help="Carpeta con frames de rostro",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--hand-left-dir",
         type=Path,
         required=True,
         help="Carpeta con frames de mano izquierda",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--hand-right-dir",
         type=Path,
         required=True,
         help="Carpeta con frames de mano derecha",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--pose-dir",
         type=Path,
         required=True,
         help="Carpeta con archivos .npz de pose",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--keypoints-dir",
         type=Path,
         help="Carpeta con keypoints MediaPipe (.npy/.npz)",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--metadata-csv",
         type=Path,
         required=True,
         help="CSV con columnas video_id;texto",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--train-index",
         type=Path,
         required=True,
         help="CSV con lista de video_id para entrenamiento",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--val-index",
         type=Path,
         required=True,
         help="CSV con lista de video_id para validación",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--gloss-csv",
         type=Path,
         help="CSV opcional con columnas video_id;gloss;ctc_labels",
     )
-    config_group.add_argument(
+    parser.add_argument(
         "--work-dir",
         type=Path,
         default=Path("work_dirs/demo"),
         help="Directorio donde guardar checkpoints",
     )
 
-    training_group = parser.add_argument_group(
-        "Entrenamiento",
-        "Opciones principales del loop de entrenamiento.",
-    )
-    training_group.add_argument("--batch-size", type=int, help="Tamaño de batch")
-    training_group.add_argument(
-        "--val-batch-size",
-        type=int,
-        help="Batch de validación",
-    )
-    training_group.add_argument(
-        "--epochs",
-        type=int,
-        help="Cantidad de épocas de entrenamiento",
-    )
-    training_group.add_argument(
-        "--lr",
-        type=float,
-        help="Learning rate del optimizador",
-    )
-    training_group.add_argument(
-        "--num-workers",
-        type=int,
-        help="Workers de DataLoader",
-    )
-    training_group.add_argument(
-        "--no-pin-memory",
-        action="store_true",
-        help="Deshabilita pinned memory en los loaders",
-    )
-    training_group.add_argument("--seed", type=int, help="Semilla aleatoria")
-    training_group.add_argument(
-        "--no-amp",
-        action="store_true",
-        help="Desactiva AMP incluso si hay GPU disponible",
-    )
-
-    model_group = parser.add_argument_group(
-        "Modelo",
-        "Hiper-parámetros del encoder y decoder utilizados en la demo.",
-    )
-    model_group.add_argument(
+    parser.add_argument("--batch-size", type=int, help="Tamaño de batch")
+    parser.add_argument("--val-batch-size", type=int, help="Batch de validación")
+    parser.add_argument("--epochs", type=int, help="Cantidad de épocas de entrenamiento")
+    parser.add_argument(
         "--sequence-length",
         type=int,
         help="Número de frames muestreados por clip",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--image-size",
         type=int,
         help="Resolución de entrada para los backbones",
     )
-    model_group.add_argument(
+    parser.add_argument("--lr", type=float, help="Learning rate del optimizador")
+    parser.add_argument("--num-workers", type=int, help="Workers de DataLoader")
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="Deshabilita pinned memory en los loaders",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)",
+    )
+    parser.add_argument("--seed", type=int, help="Semilla aleatoria")
+    parser.add_argument(
+        "--precision",
+        choices=["amp", "fp32", "float32"],
+        help="Precisión numérica. 'amp' usa mixed precision en GPU",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         help="Identificador o ruta a un tokenizer de HuggingFace",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--max-target-length",
         type=int,
         default=None,
         help="Longitud máxima de las secuencias de texto tokenizadas",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--decoder-layers",
         type=int,
         default=None,
         help="Capas del decoder seq2seq utilizado durante la demo",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--decoder-heads",
         type=int,
         default=None,
         help="Número de cabezas de atención en el decoder seq2seq",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--decoder-dropout",
         type=float,
         default=None,
         help="Dropout aplicado dentro del decoder seq2seq",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--pretrained",
         type=str,
         default=None,
         help="Identificador de pesos pre-entrenados (single_signer o none)",
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--pretrained-checkpoint",
         type=Path,
         default=None,
@@ -346,7 +322,7 @@ def parse_args() -> argparse.Namespace:
             "--pretrained está activo."
         ),
     )
-    model_group.add_argument(
+    parser.add_argument(
         "--mix-stream",
         dest="mix_streams",
         action="append",
@@ -357,20 +333,10 @@ def parse_args() -> argparse.Namespace:
             "(face, hand-left, hand-right, pose)"
         ),
     )
-
-    runtime_group = parser.add_argument_group(
-        "Ejecución",
-        "Control del dispositivo, precisión numérica y flags relacionados.",
-    )
-    runtime_group.add_argument(
-        "--device",
-        type=str,
-        help="Dispositivo torch (auto, cpu, cuda, cuda:0, ...)",
-    )
-    runtime_group.add_argument(
-        "--precision",
-        choices=["amp", "fp32", "float32"],
-        help="Precisión numérica. 'amp' usa mixed precision en GPU",
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Desactiva AMP incluso si hay GPU disponible",
     )
     return parser.parse_args()
 
