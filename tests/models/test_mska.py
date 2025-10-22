@@ -436,3 +436,40 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
     grads = [tensor.grad for tensor in parameters]
     assert all(grad is not None for grad in grads)
     assert all(grad.abs().sum() > 0 for grad in grads)
+
+
+def test_stream_heads_use_leaky_relu_activation() -> None:
+    slope = 0.2
+    stream_head = StreamCTCHead(8, 4, dropout=0.0, negative_slope=slope)
+    fused_head = FusedCTCHead(8, 4, dropout=0.0, negative_slope=slope)
+
+    for head in (stream_head, fused_head):
+        assert isinstance(head.input_activation, nn.LeakyReLU)
+        assert abs(head.input_activation.negative_slope - slope) < 1e-6
+
+
+def test_mska_encoder_propagates_leaky_relu_negative_slope() -> None:
+    slope = 0.05
+    mska = MSKAEncoder(
+        input_dim=3,
+        embed_dim=6,
+        stream_names=("face", "hand_left"),
+        num_heads=1,
+        ff_multiplier=2,
+        dropout=0.0,
+        ctc_vocab_size=10,
+        stream_attention_heads=1,
+        stream_temporal_blocks=1,
+        stream_temporal_kernel=3,
+        leaky_relu_negative_slope=slope,
+    )
+
+    encoder = mska.encoders["face"]
+    assert isinstance(encoder.temporal_layers[0].activation, nn.LeakyReLU)
+    assert abs(encoder.temporal_layers[0].activation.negative_slope - slope) < 1e-6
+
+    assert isinstance(mska.stream_heads["face"].input_activation, nn.LeakyReLU)
+    assert abs(mska.stream_heads["face"].input_activation.negative_slope - slope) < 1e-6
+
+    assert isinstance(mska.fuse_head.input_activation, nn.LeakyReLU)
+    assert abs(mska.fuse_head.input_activation.negative_slope - slope) < 1e-6

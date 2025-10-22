@@ -241,6 +241,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int, help="Temporal sequence length used during sampling")
     parser.add_argument("--projector-dropout", type=float, help="Dropout applied inside the projectors")
     parser.add_argument("--fusion-dropout", type=float, help="Dropout applied before stream fusion")
+    parser.add_argument(
+        "--leaky-relu-negative-slope",
+        dest="leaky_relu_negative_slope",
+        type=float,
+        help="Negative slope used by all LeakyReLU activations in MSKA components",
+    )
     parser.add_argument("--temporal-nhead", type=int, help="Number of attention heads in the temporal encoder")
     parser.add_argument("--temporal-layers", type=int, help="Number of transformer layers in the temporal encoder")
     parser.add_argument("--temporal-dim-feedforward", type=int, help="Feed-forward dimension inside the temporal encoder")
@@ -411,7 +417,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
-        choices=("relu", "gelu", "silu", "tanh"),
+        choices=("leaky_relu",),
         help="Activation function inserted between the gloss MLP layers",
     )
     parser.add_argument(

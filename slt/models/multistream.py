@@ -68,6 +68,7 @@ class MultiStreamEncoder(torch.nn.Module):
         projector_dropout: float = 0.0,
         fusion_dropout: float = 0.0,
         fusion_bias: bool = True,
+        leaky_relu_negative_slope: float = 0.01,
         temporal_kwargs: Optional[Dict[str, Any]] = None,
         backbones: Optional[Mapping[str, torch.nn.Module]] = None,
         mask_combiner: Optional[
@@ -75,12 +76,14 @@ class MultiStreamEncoder(torch.nn.Module):
         ] = None,
         mska: Optional["MSKAEncoder"] = None,
         mska_gloss_hidden_dim: Optional[int] = None,
-        mska_gloss_activation: str = "gelu",
+        mska_gloss_activation: str = "leaky_relu",
         mska_gloss_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         temporal_kwargs = temporal_kwargs or {}
 
+        if leaky_relu_negative_slope < 0:
+            raise ValueError("leaky_relu_negative_slope must be non-negative")
         backbones = backbones or {}
         self._stream_to_attr = {
             "face": "face_backbone",
@@ -129,6 +132,7 @@ class MultiStreamEncoder(torch.nn.Module):
         self._last_combined_hand_mask: Optional[Tensor] = None
         self._last_padding_mask: Optional[Tensor] = None
         self._last_pose_mask: Optional[Tensor] = None
+        self._leaky_relu_negative_slope = float(leaky_relu_negative_slope)
         self._mask_combiner = mask_combiner or self._default_mask_combiner
         self._stream_assemblies: Dict[str, _StreamAssembly] = {
             stream: _StreamAssembly(
@@ -154,7 +158,9 @@ class MultiStreamEncoder(torch.nn.Module):
                 raise ValueError("mska_gloss_hidden_dim must be positive")
             if mska_gloss_dropout < 0:
                 raise ValueError("mska_gloss_dropout must be non-negative")
-            activation = self._resolve_activation(mska_gloss_activation)
+            activation = self._build_gloss_activation(
+                mska_gloss_activation, self._leaky_relu_negative_slope
+            )
             layers: list[torch.nn.Module] = [
                 torch.nn.Linear(projector_dim, hidden_dim),
                 activation,
@@ -772,20 +778,20 @@ class MultiStreamEncoder(torch.nn.Module):
         return ~mask_bool
 
     @staticmethod
-    def _resolve_activation(name: str) -> torch.nn.Module:
-        lookup = {
-            "relu": torch.nn.ReLU(),
-            "gelu": torch.nn.GELU(),
-            "silu": torch.nn.SiLU(),
-            "tanh": torch.nn.Tanh(),
-        }
+    def _build_gloss_activation(
+        name: str, negative_slope: float
+    ) -> torch.nn.Module:
+        aliases = {"leaky_relu", "leaky-relu", "leakyrelu"}
         key = name.strip().lower()
-        if key not in lookup:
-            supported = ", ".join(sorted(lookup))
+        if key not in aliases:
+            supported = ", ".join(sorted(aliases))
             raise ValueError(
-                f"Unsupported activation '{name}'. Available options: {supported}"
+                "mska_gloss_activation must be one of "
+                f"{supported}; received '{name}'"
             )
-        return lookup[key]
+        if negative_slope < 0:
+            raise ValueError("leaky_relu_negative_slope must be non-negative")
+        return torch.nn.LeakyReLU(negative_slope=negative_slope, inplace=True)
 
     def _register_initial_backbones(
         self,

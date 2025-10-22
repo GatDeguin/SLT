@@ -127,6 +127,7 @@ class MultiStreamClassifier(nn.Module):
                 global_attention_activation=config.mska_sgr_activation,
                 global_attention_mix=config.mska_sgr_mix,
                 global_attention_shared=config.mska_sgr_shared,
+                leaky_relu_negative_slope=config.leaky_relu_negative_slope,
             )
 
         self.encoder = MultiStreamEncoder(
@@ -137,6 +138,7 @@ class MultiStreamClassifier(nn.Module):
             positional_num_positions=config.sequence_length,
             projector_dropout=config.projector_dropout,
             fusion_dropout=config.fusion_dropout,
+            leaky_relu_negative_slope=config.leaky_relu_negative_slope,
             temporal_kwargs=temporal_kwargs,
             backbones=external_backbones if external_backbones else None,
             mska=mska_encoder,
