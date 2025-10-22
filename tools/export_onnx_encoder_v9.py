@@ -98,6 +98,30 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Allow gradients through the fused logits during distillation",
     )
     parser.set_defaults(mska_detach_teacher=None)
+    parser.add_argument(
+        "--mska-gloss-hidden-dim",
+        dest="mska_gloss_hidden_dim",
+        type=int,
+        help="Hidden dimension of the MSKA gloss MLP",
+    )
+    parser.add_argument(
+        "--mska-gloss-activation",
+        dest="mska_gloss_activation",
+        choices=("relu", "gelu", "silu", "tanh"),
+        help="Activation function applied inside the gloss MLP",
+    )
+    parser.add_argument(
+        "--mska-gloss-dropout",
+        dest="mska_gloss_dropout",
+        type=float,
+        help="Dropout probability used within the gloss MLP",
+    )
+    parser.add_argument(
+        "--mska-gloss-fusion",
+        dest="mska_gloss_fusion",
+        choices=("add", "concat", "none"),
+        help="How the gloss sequence should be exposed to the decoder",
+    )
     parser.add_argument("--device", type=str, default="cpu", help="Torch device identifier used during export")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument(
@@ -284,6 +308,9 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         fusion_dropout=args.fusion_dropout,
         temporal_kwargs=temporal_kwargs,
         mska=mska_encoder,
+        mska_gloss_hidden_dim=args.mska_gloss_hidden_dim,
+        mska_gloss_activation=args.mska_gloss_activation or "gelu",
+        mska_gloss_dropout=args.mska_gloss_dropout if args.mska_gloss_dropout is not None else 0.0,
     )
     setattr(args, "_packaged_meta", {})
     return encoder

@@ -249,3 +249,9 @@ def test_classifier_with_mska_auxiliary_outputs(monkeypatch) -> None:
     assert fused.shape[:2] == (batch, seq_len)
     stream_logits = outputs.auxiliary["stream"]
     assert set(stream_logits.keys()) == {"face", "hand_left", "hand_right", "pose"}
+    gloss_sequence = model.encoder.last_gloss_sequence
+    assert gloss_sequence is not None
+    assert gloss_sequence.shape[:2] == (batch, seq_len)
+    gloss_mask = model.encoder.last_gloss_mask
+    assert gloss_mask is not None
+    assert gloss_mask.shape == (batch, seq_len)

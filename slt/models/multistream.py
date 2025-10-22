@@ -74,6 +74,9 @@ class MultiStreamEncoder(torch.nn.Module):
             Callable[[Optional[Tensor], Optional[Tensor]], Optional[Tensor]]
         ] = None,
         mska: Optional["MSKAEncoder"] = None,
+        mska_gloss_hidden_dim: Optional[int] = None,
+        mska_gloss_activation: str = "gelu",
+        mska_gloss_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         temporal_kwargs = temporal_kwargs or {}
@@ -138,19 +141,34 @@ class MultiStreamEncoder(torch.nn.Module):
         self._auto_configure_components()
         self.mska_encoder = mska
         self._last_mska_output: Optional["MSKAOutput"] = None
+        self._mska_gloss_linear1: Optional[torch.nn.Linear] = None
+        self._mska_gloss_activation: Optional[torch.nn.Module] = None
+        self._mska_gloss_dropout_layer: Optional[torch.nn.Module] = None
+        self._mska_gloss_linear2: Optional[torch.nn.Linear] = None
+        self._last_gloss_sequence: Optional[Tensor] = None
+        self._last_gloss_mask: Optional[Tensor] = None
         if self.mska_encoder is not None:
             if getattr(self.mska_encoder, "embed_dim", projector_dim) != projector_dim:
                 raise ValueError(
                     "MSKA encoder output dimensionality must match projector_dim"
                 )
-            self._mska_fusion_adapter = torch.nn.Linear(projector_dim, d_model)
+            hidden_dim = int(mska_gloss_hidden_dim) if mska_gloss_hidden_dim else d_model
+            if hidden_dim <= 0:
+                raise ValueError("mska_gloss_hidden_dim must be positive")
+            self._mska_gloss_linear1 = torch.nn.Linear(projector_dim, hidden_dim)
+            self._mska_gloss_activation = self._resolve_activation(mska_gloss_activation)
+            self._mska_gloss_dropout_layer = (
+                torch.nn.Dropout(mska_gloss_dropout)
+                if mska_gloss_dropout and mska_gloss_dropout > 0.0
+                else None
+            )
+            self._mska_gloss_linear2 = torch.nn.Linear(hidden_dim, d_model)
             self._mska_streams = {
                 name: name
                 for name in self.mska_encoder.stream_names
                 if name in self._stream_to_projector
             }
         else:
-            self._mska_fusion_adapter = None
             self._mska_streams = {}
 
     @classmethod
@@ -217,6 +235,8 @@ class MultiStreamEncoder(torch.nn.Module):
             self._emit("pose.mask", pose_mask.to(torch.float32))
 
         mska_output: Optional["MSKAOutput"] = None
+        gloss_sequence: Optional[Tensor] = None
+        gloss_mask: Optional[Tensor] = None
         if self.mska_encoder is not None and keypoint_streams:
             try:
                 mska_output = self.mska_encoder(keypoint_streams)
@@ -236,15 +256,25 @@ class MultiStreamEncoder(torch.nn.Module):
                         hand_r_proj = hand_r_proj + stream_embedding
                     elif projector_attr == "pose":
                         pose_proj = pose_proj + stream_embedding
-                if self._mska_fusion_adapter is not None:
-                    fusion_residual = self._mska_fusion_adapter(mska_output.fused_embedding)
-                else:
-                    fusion_residual = None
+                if (
+                    self._mska_gloss_linear1 is not None
+                    and self._mska_gloss_activation is not None
+                    and self._mska_gloss_linear2 is not None
+                ):
+                    gloss_sequence = self._mska_gloss_linear1(mska_output.fused_embedding)
+                    gloss_sequence = self._mska_gloss_activation(gloss_sequence)
+                    if self._mska_gloss_dropout_layer is not None:
+                        gloss_sequence = self._mska_gloss_dropout_layer(gloss_sequence)
+                    gloss_sequence = self._mska_gloss_linear2(gloss_sequence)
+                    self._emit("mska.gloss", gloss_sequence)
+                gloss_mask = mska_output.fused_mask
+                if gloss_mask is not None:
+                    gloss_mask = gloss_mask.to(dtype=torch.bool)
+                    self._emit("mska.gloss_mask", gloss_mask.to(torch.float32))
             else:
-                fusion_residual = None
-        else:
-            fusion_residual = None
-
+                gloss_sequence = None
+                gloss_mask = None
+        
         combined_hand_mask = self._combine_missing_masks(hand_l_mask, hand_r_mask)
         self._last_combined_hand_mask = combined_hand_mask
         if combined_hand_mask is not None:
@@ -253,8 +283,6 @@ class MultiStreamEncoder(torch.nn.Module):
         fused = self._call_fusion(
             (face_proj, hand_l_proj, hand_r_proj, pose_proj), combined_hand_mask
         )
-        if fusion_residual is not None:
-            fused = fused + fusion_residual
         self._emit("fusion.output", fused)
         fused = self.positional(fused)
 
@@ -264,6 +292,8 @@ class MultiStreamEncoder(torch.nn.Module):
             self._emit("pad.mask", src_key_padding_mask.to(torch.float32))
         encoded = self.temporal(fused, src_key_padding_mask=src_key_padding_mask)
         self._last_mska_output = mska_output
+        self._last_gloss_sequence = gloss_sequence
+        self._last_gloss_mask = gloss_mask
         self._emit("temporal.output", encoded)
         return encoded
 
@@ -325,6 +355,18 @@ class MultiStreamEncoder(torch.nn.Module):
         """Return the last MSKA output if available."""
 
         return self._last_mska_output
+
+    @property
+    def last_gloss_sequence(self) -> Optional[Tensor]:
+        """Return the gloss representation produced by the MSKA MLP."""
+
+        return self._last_gloss_sequence
+
+    @property
+    def last_gloss_mask(self) -> Optional[Tensor]:
+        """Return the temporal mask aligned with the gloss sequence."""
+
+        return self._last_gloss_mask
 
     def active_backbone_name(self, stream: str) -> Optional[str]:
         """Return the currently active backbone identifier for ``stream``."""
@@ -736,6 +778,22 @@ class MultiStreamEncoder(torch.nn.Module):
         if mask_bool.dim() > 2:
             mask_bool = mask_bool.view(mask_bool.shape[0], -1)
         return ~mask_bool
+
+    @staticmethod
+    def _resolve_activation(name: str) -> torch.nn.Module:
+        lookup = {
+            "relu": torch.nn.ReLU(),
+            "gelu": torch.nn.GELU(),
+            "silu": torch.nn.SiLU(),
+            "tanh": torch.nn.Tanh(),
+        }
+        key = name.strip().lower()
+        if key not in lookup:
+            supported = ", ".join(sorted(lookup))
+            raise ValueError(
+                f"Unsupported activation '{name}'. Available options: {supported}"
+            )
+        return lookup[key]
 
     def _register_initial_backbones(
         self,
