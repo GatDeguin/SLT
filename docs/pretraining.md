@@ -91,6 +91,11 @@ python tools/train_slt_multistream_v9.py \
 El prefijo `file::` indica que se cargará un checkpoint local. Es posible
 combinarlo con backbones distintos para cada mano.
 
+El pipeline unificado combina estos backbones con la rama de keypoints MSKA.
+Cuando `--use-mska` está activo, asegúrate de mantener sincronizadas las rutas
+de keypoints y glosas para que las pérdidas de traducción, CTC y distilación
+puedan evaluarse de forma conjunta durante entrenamiento y validación.
+
 ## Buenas prácticas
 
 - Versiona los archivos de configuración junto a los pesos exportados.

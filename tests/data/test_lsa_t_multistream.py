@@ -42,8 +42,12 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     pose = np.random.rand(7, 3 * 13).astype("float32")
     np.savez(pose_dir / f"{video_id}.npz", pose=pose)
 
-    keypoints = np.random.rand(6, 79, 3).astype("float32")
-    keypoints[:, :, 2] = np.random.uniform(0.6, 1.0, size=(6, 79)).astype("float32")
+    keypoints = np.zeros((6, 79, 3), dtype="float32")
+    for frame in range(6):
+        value = frame / 10.0
+        keypoints[frame, :, 0] = value
+        keypoints[frame, :, 1] = value + 0.5
+        keypoints[frame, :, 2] = 0.9
     np.savez(keypoints_dir / f"{video_id}.npz", keypoints=keypoints)
 
     textos_path.write_text("video_id;texto\nvid001;hola mundo\n", encoding="utf-8")
@@ -198,9 +202,39 @@ def test_forced_flip_swaps_streams_and_pose(synthetic_dataset: dict) -> None:
     expected_kp_hand_l[:, :, 0] = 1.0 - expected_kp_hand_l[:, :, 0]
     expected_kp_hand_r = sample_no.keypoints_hand_l.clone()
     expected_kp_hand_r[:, :, 0] = 1.0 - expected_kp_hand_r[:, :, 0]
-    assert torch.allclose(sample_flip.keypoints_hand_l, expected_kp_hand_l)
-    assert torch.allclose(sample_flip.keypoints_hand_r, expected_kp_hand_r)
-    assert sample_flip.keypoints_lengths[2].item() == sample_no.keypoints_lengths[3].item()
+
+
+def test_keypoints_sampling_tracks_frame_indices(synthetic_dataset: dict) -> None:
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+
+    expected = torch.tensor([0.0, 0.2, 0.4, 0.5], dtype=torch.float32)
+    assert torch.allclose(sample.keypoints[:, 0, 0], expected, atol=1e-6)
+
+    frame_mask = sample.keypoints_mask.any(dim=1)
+    assert torch.equal(sample.keypoints_frame_mask, frame_mask)
+    assert sample.keypoints_lengths[0].item() == int(frame_mask.sum().item())
+
+
+def test_keypoint_view_masks_track_lengths(synthetic_dataset: dict) -> None:
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+
+    views = [
+        (sample.keypoints_body_mask, sample.keypoints_body_frame_mask, sample.keypoints_lengths[1]),
+        (sample.keypoints_hand_l_mask, sample.keypoints_hand_l_frame_mask, sample.keypoints_lengths[2]),
+        (sample.keypoints_hand_r_mask, sample.keypoints_hand_r_frame_mask, sample.keypoints_lengths[3]),
+        (sample.keypoints_face_mask, sample.keypoints_face_frame_mask, sample.keypoints_lengths[4]),
+    ]
+
+    for mask, frame_mask, length in views:
+        if mask.numel() == 0:
+            assert length.item() == 0
+            assert not frame_mask.any()
+            continue
+        expected = mask.any(dim=1)
+        assert torch.equal(frame_mask, expected)
+        assert length.item() == int(expected.sum().item())
 
 
 def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:
