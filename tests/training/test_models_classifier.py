@@ -76,7 +76,9 @@ class DummyDecoder(torch.nn.Module):
 
 
 @pytest.mark.parametrize("batch_size,target_length", [(2, 2)])
-def test_classifier_forward_backward_with_stream_backbones(monkeypatch, batch_size, target_length) -> None:
+def test_classifier_forward_backward_with_stream_backbones(
+    monkeypatch, batch_size, target_length
+) -> None:
     image_size = 8
     embed_dim = 12
 
@@ -149,9 +151,101 @@ def test_classifier_forward_backward_with_stream_backbones(monkeypatch, batch_si
 
     assert outputs.logits.shape == (batch_size, target_length, tokenizer.vocab_size)
     assert outputs.loss is not None
+    assert outputs.auxiliary is None
     outputs.loss.backward()
 
     encoder_grads = [p.grad for p in model.encoder.parameters() if p.requires_grad]
     assert any(grad is not None for grad in encoder_grads)
     expected_mask = pose_conf_mask.unsqueeze(-1)
     assert torch.equal(model.encoder.last_pose_mask, expected_mask)
+
+
+def test_classifier_with_mska_auxiliary_outputs(monkeypatch) -> None:
+    image_size = 8
+    embed_dim = 12
+
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_dim = embed_dim
+            self.linear = torch.nn.Linear(3 * image_size * image_size, embed_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            flat = x.view(x.size(0), -1)
+            return self.linear(flat)
+
+    monkeypatch.setattr(
+        "slt.training.models.load_dinov2_backbone",
+        lambda spec, freeze=False: DummyBackbone(),
+    )
+
+    tokenizer = TinyTokenizer()
+    config = ModelConfig(
+        image_size=image_size,
+        projector_dim=8,
+        d_model=16,
+        pose_landmarks=1,
+        projector_dropout=0.0,
+        fusion_dropout=0.0,
+        temporal_nhead=2,
+        temporal_layers=1,
+        temporal_dim_feedforward=32,
+        temporal_dropout=0.0,
+        sequence_length=2,
+        decoder_layers=1,
+        decoder_heads=2,
+        decoder_dropout=0.0,
+        decoder_class="tests.training.test_models_classifier.DummyDecoder",
+        decoder_kwargs={},
+        face_backbone="stub",
+        hand_left_backbone="stub",
+        hand_right_backbone="stub",
+        pretrained="none",
+        mska=True,
+        mska_ctc_vocab=tokenizer.vocab_size,
+        mska_dropout=0.0,
+    )
+
+    model = MultiStreamClassifier(config, tokenizer)
+    batch = 2
+    seq_len = config.sequence_length
+    face = torch.randn(batch, seq_len, 3, image_size, image_size)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, seq_len, 3 * config.pose_landmarks)
+    pad_mask = torch.ones(batch, seq_len, dtype=torch.bool)
+    miss_mask = torch.zeros(batch, seq_len, dtype=torch.bool)
+    pose_conf_mask = torch.ones(batch, seq_len, dtype=torch.bool)
+
+    keypoints = {
+        "keypoints_body": torch.randn(batch, seq_len, 2, 3),
+        "keypoints_body_mask": torch.ones(batch, seq_len, 2, dtype=torch.bool),
+        "keypoints_body_frame_mask": torch.ones(batch, seq_len, dtype=torch.bool),
+        "keypoints_hand_l": torch.randn(batch, seq_len, 2, 3),
+        "keypoints_hand_l_mask": torch.ones(batch, seq_len, 2, dtype=torch.bool),
+        "keypoints_hand_l_frame_mask": torch.ones(batch, seq_len, dtype=torch.bool),
+        "keypoints_hand_r": torch.randn(batch, seq_len, 2, 3),
+        "keypoints_hand_r_mask": torch.ones(batch, seq_len, 2, dtype=torch.bool),
+        "keypoints_hand_r_frame_mask": torch.ones(batch, seq_len, dtype=torch.bool),
+        "keypoints_face": torch.randn(batch, seq_len, 2, 3),
+        "keypoints_face_mask": torch.ones(batch, seq_len, 2, dtype=torch.bool),
+        "keypoints_face_frame_mask": torch.ones(batch, seq_len, dtype=torch.bool),
+    }
+
+    outputs = model(
+        face=face,
+        hand_l=hand_l,
+        hand_r=hand_r,
+        pose=pose,
+        pad_mask=pad_mask,
+        miss_mask_hl=miss_mask,
+        miss_mask_hr=miss_mask,
+        pose_conf_mask=pose_conf_mask,
+        **keypoints,
+    )
+
+    assert outputs.auxiliary is not None
+    fused = outputs.auxiliary["fused"]["logits"]
+    assert fused.shape[:2] == (batch, seq_len)
+    stream_logits = outputs.auxiliary["stream"]
+    assert set(stream_logits.keys()) == {"face", "hand_left", "hand_right", "pose"}

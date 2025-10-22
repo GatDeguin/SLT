@@ -40,6 +40,13 @@ class ModelConfig:
     freeze_hand_right_backbone: bool = False
     pretrained: Optional[str] = "single_signer"
     pretrained_checkpoint: Optional[Path] = None
+    mska: bool = False
+    mska_heads: int = 4
+    mska_ff_multiplier: int = 4
+    mska_dropout: float = 0.1
+    mska_input_dim: int = 3
+    mska_ctc_vocab: Optional[int] = None
+    mska_detach_teacher: bool = True
 
 
 @dataclass
