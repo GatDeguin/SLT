@@ -2,9 +2,11 @@ import torch
 from torch import nn
 
 from slt.models.mska import (
+    FusedCTCHead,
     KeypointStreamEncoder,
     MSKAEncoder,
     MultiStreamKeypointAttention,
+    StreamCTCHead,
 )
 
 
@@ -155,6 +157,33 @@ def test_multi_stream_keypoint_attention_shapes() -> None:
     assert torch.equal(result.fused_mask, expected_fused_mask)
 
 
+def test_ctc_heads_preserve_temporal_dimension() -> None:
+    torch.manual_seed(0)
+    batch, time, dim, vocab = 2, 5, 6, 9
+    features = torch.randn(batch, time, dim)
+
+    stream_head = StreamCTCHead(dim, vocab, dropout=0.0)
+    fused_head = FusedCTCHead(dim, vocab, dropout=0.0)
+
+    stream_logits = stream_head(features)
+    fused_logits = fused_head(features)
+
+    assert stream_logits.shape == (batch, time, vocab)
+    assert fused_logits.shape == (batch, time, vocab)
+
+    stream_convs = [module for module in stream_head.modules() if isinstance(module, nn.Conv1d)]
+    fused_convs = [module for module in fused_head.modules() if isinstance(module, nn.Conv1d)]
+    assert stream_convs and stream_convs[0].kernel_size == (3,)
+    assert fused_convs and fused_convs[0].kernel_size == (3,)
+
+    stream_probs = torch.softmax(stream_logits, dim=-1)
+    fused_probs = torch.softmax(fused_logits, dim=-1)
+    stream_sums = stream_probs.sum(dim=-1)
+    fused_sums = fused_probs.sum(dim=-1)
+    assert torch.allclose(stream_sums, torch.ones_like(stream_sums), atol=1e-5)
+    assert torch.allclose(fused_sums, torch.ones_like(fused_sums), atol=1e-5)
+
+
 def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
     torch.manual_seed(0)
     mska = MSKAEncoder(
@@ -192,6 +221,26 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
     fused = auxiliary["fused"]
     assert fused["logits"].shape == (batch, time, 7)
     assert fused["mask"].shape == (batch, time)
+    assert "probs" in fused
+    assert fused["probs"].shape == (batch, time, 7)
+
+    probabilities = auxiliary["probabilities"]
+    assert torch.allclose(fused["probs"], probabilities["fused"], atol=1e-6)
+
+    stream_probs = probabilities["stream"]
+    assert set(stream_probs.keys()) == {"face", "hand_left", "pose"}
+    for probs in stream_probs.values():
+        assert probs.shape == (batch, time, 7)
+        sums = probs.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+    teacher_probs = probabilities["distillation"]
+    assert set(teacher_probs.keys()) == {"face", "hand_left", "pose"}
+    for probs in teacher_probs.values():
+        assert probs.shape == (batch, time, 7)
+        sums = probs.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+    assert not teacher_probs["face"].requires_grad
 
     loss = fused["logits"].sum()
     for logits in auxiliary["stream"].values():

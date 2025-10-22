@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 torch = pytest.importorskip("torch")
 
+from slt.models.mska import FusedCTCHead, StreamCTCHead
 from slt.training.loops import multistream_loss
 
 
@@ -30,6 +31,7 @@ def test_multistream_loss_translation_only() -> None:
 
 
 def test_multistream_loss_with_ctc_and_distillation() -> None:
+    torch.manual_seed(0)
     translation = torch.tensor([[2, 3, -100]], dtype=torch.long)
     logits = torch.zeros(1, 3, 4, dtype=torch.float32)
 
@@ -39,19 +41,32 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
 
     time_steps = 4
     ctc_vocab = 5
-    fused_logits = torch.zeros(1, time_steps, ctc_vocab, dtype=torch.float32)
+    embed_dim = 6
+    features = torch.randn(1, time_steps, embed_dim, dtype=torch.float32)
+    stream_head = StreamCTCHead(embed_dim, ctc_vocab, dropout=0.0)
+    fused_head = FusedCTCHead(embed_dim, ctc_vocab, dropout=0.0)
+    stream_logits = stream_head(features)
+    fused_logits = fused_head(features)
     fused_mask = torch.ones(1, time_steps, dtype=torch.bool)
-    stream_logits = torch.zeros(1, time_steps, ctc_vocab, dtype=torch.float32)
-    stream_mask = torch.ones(1, time_steps, dtype=torch.bool)
-    teacher_logits = torch.zeros(1, time_steps, ctc_vocab, dtype=torch.float32)
+    stream_mask = fused_mask.clone()
+    teacher_logits = fused_logits.detach()
+
+    fused_probs = torch.softmax(fused_logits, dim=-1)
+    stream_probs = torch.softmax(stream_logits, dim=-1)
+    teacher_probs = torch.softmax(teacher_logits, dim=-1)
 
     outputs = SimpleNamespace(
         logits=logits,
         auxiliary={
-            "fused": {"logits": fused_logits, "mask": fused_mask},
+            "fused": {"logits": fused_logits, "mask": fused_mask, "probs": fused_probs},
             "stream": {"pose": stream_logits},
             "frame_masks": {"pose": stream_mask},
             "distillation": {"pose": teacher_logits},
+            "probabilities": {
+                "fused": fused_probs,
+                "stream": {"pose": stream_probs},
+                "distillation": {"pose": teacher_probs},
+            },
         },
     )
 
@@ -73,6 +88,40 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
     assert "loss_distillation" in components
     assert components["loss_ctc"].item() >= 0.0
     assert components["loss_distillation"].item() >= 0.0
+
+    targets = ctc_labels[ctc_mask]
+    input_lengths = torch.tensor([time_steps], dtype=torch.long)
+    target_lengths = ctc_lengths
+    fused_expected = F.ctc_loss(
+        fused_logits.log_softmax(dim=-1).transpose(0, 1),
+        targets,
+        input_lengths,
+        target_lengths,
+        blank=0,
+        zero_infinity=True,
+    )
+    stream_expected = F.ctc_loss(
+        stream_logits.log_softmax(dim=-1).transpose(0, 1),
+        targets,
+        input_lengths,
+        target_lengths,
+        blank=0,
+        zero_infinity=True,
+    )
+    expected_ctc = fused_expected + stream_expected
+    assert torch.allclose(components["loss_ctc"], expected_ctc.detach(), atol=1e-6)
+
+    temperature = 2.0
+    student = stream_logits / temperature
+    teacher = teacher_logits / temperature
+    log_probs = F.log_softmax(student, dim=-1)
+    teacher_probs_temp = F.softmax(teacher, dim=-1)
+    per_token = F.kl_div(log_probs, teacher_probs_temp, reduction="none").sum(dim=-1)
+    denom = stream_mask.to(dtype=per_token.dtype).sum().clamp_min(1.0)
+    expected_dist = per_token.sum() * (temperature ** 2) / denom
+    assert torch.allclose(
+        components["loss_distillation"], expected_dist.detach(), atol=1e-6
+    )
 
     expected_total = (
         components["loss_translation_weighted"]

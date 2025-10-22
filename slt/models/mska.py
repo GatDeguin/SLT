@@ -497,7 +497,7 @@ class MSKAOutput:
 
 
 class StreamCTCHead(nn.Module):
-    """CTC classification head for individual streams."""
+    """CTC classification head with temporal convolutions for individual streams."""
 
     def __init__(self, in_dim: int, vocab_size: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -505,25 +505,50 @@ class StreamCTCHead(nn.Module):
             raise ValueError("in_dim must be positive")
         if vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
-        self.in_dim = in_dim
-        self.vocab_size = vocab_size
-        self.norm = nn.LayerNorm(in_dim)
+        self.in_dim = int(in_dim)
+        self.vocab_size = int(vocab_size)
+        self.hidden_dim = self.in_dim
+
+        self.input_linear = nn.Linear(self.in_dim, self.hidden_dim)
+        self.input_norm = nn.BatchNorm1d(self.hidden_dim)
+        self.input_activation = nn.ReLU(inplace=True)
+        self.temporal_block = nn.Sequential(
+            nn.Conv1d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm1d(self.hidden_dim),
+            nn.ReLU(inplace=True),
+        )
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(in_dim, vocab_size)
+        self.output_projection = nn.Linear(self.hidden_dim, self.vocab_size)
 
     def forward(self, features: Tensor) -> Tensor:
+        if features.dim() != 3:
+            raise ValueError("features must have shape (batch, time, dim)")
         if features.size(-1) != self.in_dim:
             raise ValueError(
                 f"Expected input dimension {self.in_dim}, received {features.size(-1)}"
             )
-        hidden = self.dropout(self.norm(features))
-        return self.proj(hidden)
+
+        hidden = self.input_linear(features)
+        hidden = hidden.transpose(1, 2).contiguous()
+        hidden = self.input_norm(hidden)
+        hidden = self.input_activation(hidden)
+        hidden = self.temporal_block(hidden)
+        hidden = self.dropout(hidden)
+        hidden = hidden.transpose(1, 2).contiguous()
+        return self.output_projection(hidden)
 
 
 class FusedCTCHead(StreamCTCHead):
-    """CTC head operating on the fused stream representation."""
+    """CTC head operating on the fused stream representation with temporal context."""
 
-    pass
+    def __init__(self, in_dim: int, vocab_size: int, dropout: float = 0.0) -> None:
+        super().__init__(in_dim, vocab_size, dropout=dropout)
 
 
 class MSKAEncoder(nn.Module):
@@ -638,19 +663,34 @@ class MSKAEncoder(nn.Module):
         fused_logits = self.fuse_head(output.fused_embedding)
         use_teacher = self.detach_teacher if detach_teacher is None else detach_teacher
         teacher_logits = fused_logits.detach() if use_teacher else fused_logits
+        fused_probs = torch.softmax(fused_logits, dim=-1)
+        teacher_probs = torch.softmax(teacher_logits, dim=-1)
 
         stream_logits: Dict[str, Tensor] = {}
         distillation: Dict[str, Tensor] = {}
+        stream_probs: Dict[str, Tensor] = {}
         for name, embeddings in output.stream_embeddings.items():
             logits = self.stream_heads[name](embeddings)
             stream_logits[name] = logits
             distillation[name] = teacher_logits
+            stream_probs[name] = torch.softmax(logits, dim=-1)
+
+        probabilities = {
+            "fused": fused_probs,
+            "stream": stream_probs,
+            "distillation": {name: teacher_probs for name in stream_logits},
+        }
 
         return {
             "stream": stream_logits,
-            "fused": {"logits": fused_logits, "mask": output.fused_mask},
+            "fused": {
+                "logits": fused_logits,
+                "mask": output.fused_mask,
+                "probs": fused_probs,
+            },
             "distillation": distillation,
             "frame_masks": output.frame_masks,
+            "probabilities": probabilities,
         }
 
     @property
