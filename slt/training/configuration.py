@@ -54,6 +54,10 @@ class ModelConfig:
     mska_ctc_weight: float = 0.0
     mska_distillation_weight: float = 0.0
     mska_distillation_temperature: float = 1.0
+    mska_gloss_hidden_dim: Optional[int] = None
+    mska_gloss_activation: str = "gelu"
+    mska_gloss_dropout: float = 0.0
+    mska_gloss_fusion: str = "add"
 
 
 @dataclass

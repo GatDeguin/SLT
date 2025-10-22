@@ -135,8 +135,16 @@ class MultiStreamClassifier(nn.Module):
             temporal_kwargs=temporal_kwargs,
             backbones=external_backbones if external_backbones else None,
             mska=mska_encoder,
+            mska_gloss_hidden_dim=config.mska_gloss_hidden_dim,
+            mska_gloss_activation=config.mska_gloss_activation,
+            mska_gloss_dropout=config.mska_gloss_dropout,
         )
         self._mska_enabled = mska_encoder is not None
+        self._mska_gloss_fusion = (config.mska_gloss_fusion or "add").strip().lower()
+        if self._mska_gloss_fusion not in {"add", "concat", "none"}:
+            raise ValueError(
+                "mska_gloss_fusion must be one of {'add', 'concat', 'none'}"
+            )
 
         decoder_config = None
         if config.decoder_config:
@@ -269,6 +277,11 @@ class MultiStreamClassifier(nn.Module):
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
+        gloss_sequence = getattr(self.encoder, "last_gloss_sequence", None)
+        gloss_mask = getattr(self.encoder, "last_gloss_mask", None)
+        encoded, encoder_attention_mask = self._merge_gloss_sequence(
+            encoded, encoder_attention_mask, gloss_sequence, gloss_mask
+        )
         decoder_output = self.decoder(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
@@ -343,9 +356,76 @@ class MultiStreamClassifier(nn.Module):
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
+        gloss_sequence = getattr(self.encoder, "last_gloss_sequence", None)
+        gloss_mask = getattr(self.encoder, "last_gloss_mask", None)
+        encoded, encoder_attention_mask = self._merge_gloss_sequence(
+            encoded, encoder_attention_mask, gloss_sequence, gloss_mask
+        )
         return self.decoder.generate(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
             **decoder_kwargs,
         )
+
+    def _merge_gloss_sequence(
+        self,
+        encoder_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        gloss_states: Optional[torch.Tensor],
+        gloss_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if gloss_states is None or self._mska_gloss_fusion == "none":
+            return encoder_states, attention_mask
+
+        if self._mska_gloss_fusion == "add":
+            if gloss_states.shape != encoder_states.shape:
+                raise ValueError(
+                    "Gloss sequence must match encoder hidden states when fusion is 'add'"
+                )
+            merged = encoder_states + gloss_states
+            if gloss_mask is None:
+                return merged, attention_mask
+            gloss_bool = gloss_mask.to(dtype=torch.bool)
+            if attention_mask is None:
+                return merged, gloss_bool
+            base_bool = attention_mask.to(dtype=torch.bool)
+            combined_bool = base_bool & gloss_bool
+            if attention_mask.dtype == torch.bool:
+                return merged, combined_bool
+            return merged, combined_bool.to(dtype=attention_mask.dtype)
+
+        if self._mska_gloss_fusion == "concat":
+            merged = torch.cat([encoder_states, gloss_states], dim=1)
+            batch, gloss_length, _ = gloss_states.shape
+            device = merged.device
+            if gloss_mask is None:
+                if attention_mask is not None:
+                    gloss_mask_tensor = torch.ones(
+                        batch,
+                        gloss_length,
+                        dtype=attention_mask.dtype,
+                        device=device,
+                    )
+                else:
+                    gloss_mask_tensor = torch.ones(
+                        batch,
+                        gloss_length,
+                        dtype=torch.bool,
+                        device=device,
+                    )
+            else:
+                gloss_mask_tensor = gloss_mask.to(device=device)
+                if (
+                    attention_mask is not None
+                    and gloss_mask_tensor.dtype != attention_mask.dtype
+                ):
+                    gloss_mask_tensor = gloss_mask_tensor.to(dtype=attention_mask.dtype)
+            if attention_mask is None:
+                return merged, gloss_mask_tensor
+            return (
+                merged,
+                torch.cat([attention_mask, gloss_mask_tensor], dim=1),
+            )
+
+        raise RuntimeError(f"Unsupported mska_gloss_fusion mode '{self._mska_gloss_fusion}'")
 

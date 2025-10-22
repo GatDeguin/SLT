@@ -28,7 +28,10 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
    `--mska-translation-weight`, `--mska-ctc-weight` y
    `--mska-distillation-weight` según el objetivo del experimento. El modelo
    combina automáticamente las pérdidas activas y registra cada término en
-   `metrics.jsonl`.
+   `metrics.jsonl`. Cuando MSKA está activado, la representación fusionada de
+   keypoints se proyecta mediante un MLP configurable de dos capas y se expone
+   al decoder como secuencia de glosas para aplicar la combinación LSLT de
+   traducción y reconocimiento.
 4. **Evaluación y exportación**: reutiliza las mismas banderas MSKA en
    `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
    mantener consistencia entre entrenamiento, evaluación y despliegue.
@@ -100,6 +103,10 @@ Artefactos generados en `--work-dir`:
 | `--mska-ctc-weight` | Peso del término CTC auxiliar. |
 | `--mska-distillation-weight` | Peso del término de distilación. |
 | `--mska-distillation-temperature` | Temperatura aplicada al término de distilación. |
+| `--mska-gloss-hidden-dim` | Dimensión oculta del MLP que proyecta la secuencia MSKA. |
+| `--mska-gloss-activation` | Activación empleada entre las dos capas del MLP de glosas. |
+| `--mska-gloss-dropout` | Dropout aplicado entre las capas del MLP de glosas. |
+| `--mska-gloss-fusion` | Fusión de glosas con el decoder (`add`/`concat`/`none`). |
 
 ### Optimización y ejecución
 

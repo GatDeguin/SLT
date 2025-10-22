@@ -328,6 +328,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(mska_detach_teacher=None)
     parser.add_argument(
+        "--mska-gloss-hidden-dim",
+        dest="mska_gloss_hidden_dim",
+        type=int,
+        help="Hidden dimension of the gloss MLP applied to MSKA fused embeddings",
+    )
+    parser.add_argument(
+        "--mska-gloss-activation",
+        dest="mska_gloss_activation",
+        choices=("relu", "gelu", "silu", "tanh"),
+        help="Activation function inserted between the gloss MLP layers",
+    )
+    parser.add_argument(
+        "--mska-gloss-dropout",
+        dest="mska_gloss_dropout",
+        type=float,
+        help="Dropout probability applied inside the gloss MLP",
+    )
+    parser.add_argument(
+        "--mska-gloss-fusion",
+        dest="mska_gloss_fusion",
+        choices=("add", "concat", "none"),
+        help="Strategy to expose the gloss sequence to the decoder",
+    )
+    parser.add_argument(
         "--mska-translation-weight",
         type=float,
         help="Weight applied to the translation cross-entropy term",
