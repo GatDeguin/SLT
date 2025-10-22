@@ -123,6 +123,10 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--mska-ff-multiplier` | Factor del bloque feed-forward dentro de la atención. |
 | `--mska-dropout` | Dropout aplicado a proyectores y cabezas MSKA. |
 | `--mska-input-dim` | Dimensionalidad de los keypoints de entrada. |
+| `--mska-use-sgr` / `--mska-no-sgr` | Activa o desactiva la matriz global compartida (SGR). |
+| `--mska-sgr-activation` | Activación aplicada a la matriz SGR (`softmax`/`sigmoid`/`tanh`/`relu`/`identity`). |
+| `--mska-sgr-mix` | Mezcla entre la atención local y la matriz SGR (0.0 a 1.0). |
+| `--mska-sgr-shared` / `--mska-sgr-per-stream` | Controla si la matriz SGR se comparte entre streams o se aprende por separado. |
 | `--mska-ctc-vocab` | Tamaño del vocabulario para las cabezas CTC auxiliares. |
 | `--mska-detach-teacher` | Controla si los logits fusionados participan en la distilación. |
 | `--mska-stream-heads` | Número de cabezas en la atención por articulación. |

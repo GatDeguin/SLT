@@ -123,6 +123,10 @@ class MultiStreamClassifier(nn.Module):
                 stream_temporal_blocks=config.mska_temporal_blocks,
                 stream_temporal_kernel=config.mska_temporal_kernel,
                 stream_temporal_dilation=config.mska_temporal_dilation,
+                use_global_attention=config.mska_use_sgr,
+                global_attention_activation=config.mska_sgr_activation,
+                global_attention_mix=config.mska_sgr_mix,
+                global_attention_shared=config.mska_sgr_shared,
             )
 
         self.encoder = MultiStreamEncoder(

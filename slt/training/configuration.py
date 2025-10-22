@@ -51,6 +51,10 @@ class ModelConfig:
     mska_temporal_blocks: int = 2
     mska_temporal_kernel: int = 3
     mska_temporal_dilation: int = 1
+    mska_use_sgr: bool = False
+    mska_sgr_shared: bool = False
+    mska_sgr_activation: str = "softmax"
+    mska_sgr_mix: float = 0.5
     mska_translation_weight: float = 1.0
     mska_ctc_weight: float = 0.0
     mska_distillation_weight: float = 0.0
@@ -316,6 +320,13 @@ def resolve_configs(
         if model_config.mska_ctc_weight > 0 and data_config.gloss_csv is None:
             raise ValueError(
                 "MSKA CTC supervision enabled but data.gloss_csv is missing"
+            )
+        if not 0.0 <= model_config.mska_sgr_mix <= 1.0:
+            raise ValueError("mska_sgr_mix must be between 0 and 1 inclusive")
+        valid_sgr_activations = {"softmax", "sigmoid", "tanh", "relu", "identity", "linear", "none"}
+        if model_config.mska_sgr_activation.lower() not in valid_sgr_activations:
+            raise ValueError(
+                "mska_sgr_activation must be one of {'softmax', 'sigmoid', 'tanh', 'relu', 'identity', 'linear', 'none'}"
             )
     else:
         model_config.mska_translation_weight = max(0.0, model_config.mska_translation_weight)
