@@ -301,3 +301,103 @@ def test_missing_metadata_columns_raise(tmp_path: Path) -> None:
             str(csv_path),
             str(index_path),
         )
+
+
+def test_keypoint_translation_updates_masks(synthetic_dataset: dict) -> None:
+    keypoint_path = Path(synthetic_dataset["keypoints_dir"]) / "vid001.npz"
+    shifted = np.zeros((4, 79, 3), dtype="float32")
+    shifted[:, :, 0] = 0.8
+    shifted[:, :, 1] = 0.2
+    shifted[:, :, 2] = 0.9
+    np.savez(keypoint_path, keypoints=shifted)
+
+    ds = LsaTMultiStream(
+        T=4,
+        img_size=32,
+        flip_prob=0.0,
+        keypoint_translate_range=(0.5, 0.5, 0.0, 0.0),
+        **synthetic_dataset,
+    )
+
+    random.seed(0)
+    sample = ds[0]
+
+    assert sample.keypoints_mask.sum().item() == 0
+    assert not bool(sample.keypoints_frame_mask.any())
+    assert sample.keypoints_lengths[0].item() == 0
+    assert not bool(sample.keypoints_body_mask.any())
+    assert not bool(sample.keypoints_hand_l_mask.any())
+    assert not bool(sample.keypoints_hand_r_mask.any())
+    assert not bool(sample.keypoints_face_mask.any())
+
+
+def test_keypoint_resample_affects_sampling_sequence(synthetic_dataset: dict) -> None:
+    keypoint_path = Path(synthetic_dataset["keypoints_dir"]) / "vid001.npz"
+    frames = 6
+    pattern = np.zeros((frames, 79, 3), dtype="float32")
+    for idx in range(frames):
+        value = idx / (frames - 1)
+        pattern[idx, :, 0] = value
+        pattern[idx, :, 1] = 0.5
+        pattern[idx, :, 2] = 1.0
+    np.savez(keypoint_path, keypoints=pattern)
+
+    ds_baseline = LsaTMultiStream(
+        T=4,
+        img_size=32,
+        flip_prob=0.0,
+        **synthetic_dataset,
+    )
+    ds_resampled = LsaTMultiStream(
+        T=4,
+        img_size=32,
+        flip_prob=0.0,
+        keypoint_resample_range=(0.5, 0.5),
+        **synthetic_dataset,
+    )
+
+    random.seed(1)
+    sample_default = ds_baseline[0]
+    random.seed(1)
+    sample_resampled = ds_resampled[0]
+
+    seq_default = sample_default.keypoints[:, 0, 0]
+    seq_resampled = sample_resampled.keypoints[:, 0, 0]
+
+    assert seq_resampled.shape == seq_default.shape == (4,)
+    assert not torch.allclose(seq_default, seq_resampled)
+    assert pytest.approx(seq_resampled[0].item()) == seq_default[0].item()
+    assert pytest.approx(seq_resampled[-1].item()) == 1.0
+    assert torch.all(seq_resampled[1:] >= seq_resampled[:-1])
+    assert sample_resampled.keypoints_lengths[0].item() == int(
+        sample_resampled.keypoints_frame_mask.sum().item()
+    )
+
+
+def test_spatial_transforms_keep_valid_points_in_bounds(synthetic_dataset: dict) -> None:
+    keypoint_path = Path(synthetic_dataset["keypoints_dir"]) / "vid001.npz"
+    base = np.zeros((5, 79, 3), dtype="float32")
+    base[:, :, 0] = 0.4
+    base[:, :, 1] = 0.6
+    base[:, :, 2] = 0.9
+    np.savez(keypoint_path, keypoints=base)
+
+    ds = LsaTMultiStream(
+        T=4,
+        img_size=32,
+        flip_prob=0.0,
+        keypoint_scale_range=(1.1, 1.1),
+        keypoint_translate_range=(-0.1, -0.1, 0.05, 0.05),
+        keypoint_rotate_range=(30.0, 30.0),
+        **synthetic_dataset,
+    )
+
+    random.seed(2)
+    sample = ds[0]
+
+    assert sample.keypoints.shape == (4, 79, 3)
+    mask = sample.keypoints_mask
+    assert bool(mask.any())
+    coords = sample.keypoints[:, :, :2][mask]
+    assert torch.all((coords >= 0.0) & (coords <= 1.0))
+    assert sample.keypoints_lengths[0].item() == int(sample.keypoints_frame_mask.sum().item())

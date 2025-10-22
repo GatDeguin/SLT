@@ -23,6 +23,7 @@ from .training.data import create_dataloader, normalise_mix_spec
 from .training.loops import eval_epoch, train_epoch
 from .training.models import MultiStreamClassifier
 from .training.optim import create_optimizer
+from .utils.cli import parse_range_pair, parse_translation_range
 from .utils.general import set_seed
 from .utils.text import create_tokenizer
 
@@ -133,6 +134,16 @@ def _build_cli_overrides(
         data_section["keypoints_dir"] = args.keypoints_dir
     if getattr(args, "gloss_csv", None) is not None:
         data_section["gloss_csv"] = args.gloss_csv
+    if getattr(args, "keypoint_normalize_center", None) is not None:
+        data_section["keypoint_normalize_center"] = args.keypoint_normalize_center
+    if getattr(args, "keypoint_scale_range", None) is not None:
+        data_section["keypoint_scale_range"] = args.keypoint_scale_range
+    if getattr(args, "keypoint_translate_range", None) is not None:
+        data_section["keypoint_translate_range"] = args.keypoint_translate_range
+    if getattr(args, "keypoint_rotate_range", None) is not None:
+        data_section["keypoint_rotate_range"] = args.keypoint_rotate_range
+    if getattr(args, "keypoint_resample_range", None) is not None:
+        data_section["keypoint_resample_range"] = args.keypoint_resample_range
     if args.device is not None:
         data_section["device"] = args.device
     if getattr(args, "precision", None) is not None:
@@ -334,11 +345,93 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_true",
+        help="Normaliza los keypoints respecto al centro antes de los augments.",
+    )
+    parser.add_argument(
+        "--no-keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_false",
+        help="Evita desplazar los keypoints al centro previo a las transformaciones.",
+    )
+    parser.set_defaults(keypoint_normalize_center=None)
+    parser.add_argument(
+        "--keypoint-scale-range",
+        type=str,
+        help="Rango de escala uniforme aplicado a los keypoints (ej. 0.9,1.1).",
+    )
+    parser.add_argument(
+        "--keypoint-translate-range",
+        type=str,
+        help="Traslación (1, 2 o 4 valores) aplicada tras escalar/rotar los keypoints.",
+    )
+    parser.add_argument(
+        "--keypoint-rotate-range",
+        type=str,
+        help="Ángulo mínimo y máximo en grados para rotar los keypoints.",
+    )
+    parser.add_argument(
+        "--keypoint-resample-range",
+        type=str,
+        help="Factor mínimo y máximo para el re-muestreo temporal previo al muestreo final.",
+    )
+    parser.add_argument(
         "--no-amp",
         action="store_true",
         help="Desactiva AMP incluso si hay GPU disponible",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if getattr(args, "keypoint_scale_range", None) is not None:
+        raw = args.keypoint_scale_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_scale_range = None
+        else:
+            try:
+                args.keypoint_scale_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-scale-range: {exc}")
+    if getattr(args, "keypoint_translate_range", None) is not None:
+        raw = args.keypoint_translate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_translate_range = None
+        else:
+            try:
+                args.keypoint_translate_range = parse_translation_range(raw)
+            except ValueError as exc:
+                parser.error(f"--keypoint-translate-range: {exc}")
+    if getattr(args, "keypoint_rotate_range", None) is not None:
+        raw = args.keypoint_rotate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_rotate_range = None
+        else:
+            try:
+                args.keypoint_rotate_range = parse_range_pair(
+                    raw,
+                    positive=False,
+                    symmetric_single=True,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-rotate-range: {exc}")
+    if getattr(args, "keypoint_resample_range", None) is not None:
+        raw = args.keypoint_resample_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_resample_range = None
+        else:
+            try:
+                args.keypoint_resample_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-resample-range: {exc}")
+    return args
 
 
 def _parse_mix_streams(raw: list[str]) -> dict[str, float]:
@@ -425,6 +518,11 @@ def main() -> None:
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
+        keypoint_normalize_center=data_config.keypoint_normalize_center,
+        keypoint_scale_range=data_config.keypoint_scale_range,
+        keypoint_translate_range=data_config.keypoint_translate_range,
+        keypoint_rotate_range=data_config.keypoint_rotate_range,
+        keypoint_resample_range=data_config.keypoint_resample_range,
     )
     val_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),
@@ -440,6 +538,11 @@ def main() -> None:
         T=model_config.sequence_length,
         img_size=model_config.image_size,
         lkp_count=model_config.pose_landmarks,
+        keypoint_normalize_center=data_config.keypoint_normalize_center,
+        keypoint_scale_range=data_config.keypoint_scale_range,
+        keypoint_translate_range=data_config.keypoint_translate_range,
+        keypoint_rotate_range=data_config.keypoint_rotate_range,
+        keypoint_resample_range=data_config.keypoint_resample_range,
     )
 
     tokenizer_source = (

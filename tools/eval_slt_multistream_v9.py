@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from slt.data import LsaTMultiStream, collate_fn
 from slt.training.configuration import ModelConfig
 from slt.training.models import MultiStreamClassifier
+from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.text import (
     TokenizerValidationError,
     character_error_rate,
@@ -67,6 +68,39 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--keypoints-dir",
         type=Path,
         help="Directorio con keypoints MediaPipe (.npy/.npz)",
+    )
+    parser.add_argument(
+        "--keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_true",
+        help="Normaliza keypoints alrededor del centro antes de evaluar.",
+    )
+    parser.add_argument(
+        "--no-keypoint-normalize-center",
+        dest="keypoint_normalize_center",
+        action="store_false",
+        help="Desactiva la normalización al centro de los keypoints.",
+    )
+    parser.set_defaults(keypoint_normalize_center=None)
+    parser.add_argument(
+        "--keypoint-scale-range",
+        type=str,
+        help="Rango de escala aplicado a los keypoints durante la evaluación.",
+    )
+    parser.add_argument(
+        "--keypoint-translate-range",
+        type=str,
+        help="Traslación (1, 2 o 4 valores) aplicada antes del muestreo final.",
+    )
+    parser.add_argument(
+        "--keypoint-rotate-range",
+        type=str,
+        help="Ángulo mínimo y máximo en grados para rotar los keypoints.",
+    )
+    parser.add_argument(
+        "--keypoint-resample-range",
+        type=str,
+        help="Rango de factores usado para re-muestrear temporalmente los keypoints.",
     )
     parser.add_argument("--metadata-csv", type=Path, required=True, help="CSV con columnas video_id/texto")
     parser.add_argument("--eval-index", type=Path, required=True, help="CSV con la lista de video_id a evaluar")
@@ -247,8 +281,56 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.set_defaults(compute_metrics=True)
 
     args = parser.parse_args(argv)
+    if getattr(args, "keypoint_scale_range", None) is not None:
+        raw = args.keypoint_scale_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_scale_range = None
+        else:
+            try:
+                args.keypoint_scale_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-scale-range: {exc}")
+    if getattr(args, "keypoint_translate_range", None) is not None:
+        raw = args.keypoint_translate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_translate_range = None
+        else:
+            try:
+                args.keypoint_translate_range = parse_translation_range(raw)
+            except ValueError as exc:
+                parser.error(f"--keypoint-translate-range: {exc}")
+    if getattr(args, "keypoint_rotate_range", None) is not None:
+        raw = args.keypoint_rotate_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_rotate_range = None
+        else:
+            try:
+                args.keypoint_rotate_range = parse_range_pair(
+                    raw,
+                    positive=False,
+                    symmetric_single=True,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-rotate-range: {exc}")
+    if getattr(args, "keypoint_resample_range", None) is not None:
+        raw = args.keypoint_resample_range.strip()
+        if raw.lower() in {"none", "off"}:
+            args.keypoint_resample_range = None
+        else:
+            try:
+                args.keypoint_resample_range = parse_range_pair(
+                    raw,
+                    positive=True,
+                    symmetric_single=False,
+                )
+            except ValueError as exc:
+                parser.error(f"--keypoint-resample-range: {exc}")
     explicit_bool_flags = set()
-    for name in ("use_mska", "mska_detach_teacher"):
+    for name in ("use_mska", "mska_detach_teacher", "keypoint_normalize_center"):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
     args._explicit_bool_flags = explicit_bool_flags
@@ -352,6 +434,11 @@ def _create_dataloader(args: argparse.Namespace) -> DataLoader:
         T=args.sequence_length,
         img_size=args.image_size,
         lkp_count=args.pose_landmarks,
+        keypoint_normalize_center=args.keypoint_normalize_center,
+        keypoint_scale_range=args.keypoint_scale_range,
+        keypoint_translate_range=args.keypoint_translate_range,
+        keypoint_rotate_range=args.keypoint_rotate_range,
+        keypoint_resample_range=args.keypoint_resample_range,
     )
     return DataLoader(
         dataset,

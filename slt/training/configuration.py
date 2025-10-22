@@ -111,6 +111,11 @@ class DataConfig:
     tokenizer: Optional[str] = None
     max_target_length: int = 128
     mix_streams: Dict[str, float] = field(default_factory=dict)
+    keypoint_normalize_center: bool = True
+    keypoint_scale_range: Optional[Tuple[float, float]] = None
+    keypoint_translate_range: Optional[Tuple[float, float, float, float]] = None
+    keypoint_rotate_range: Optional[Tuple[float, float]] = None
+    keypoint_resample_range: Optional[Tuple[float, float]] = None
 
 
 def dataclass_defaults(cls: Type[T]) -> Dict[str, Any]:
