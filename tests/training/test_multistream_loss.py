@@ -49,14 +49,18 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
     fused_logits, fused_temporal = fused_head.forward_with_intermediate(features)
     fused_mask = torch.ones(1, time_steps, dtype=torch.bool)
     stream_mask = fused_mask.clone()
-    teacher_logits = fused_logits.detach()
-
     fused_probs = torch.softmax(fused_logits, dim=-1)
     stream_probs = torch.softmax(stream_logits, dim=-1)
-    teacher_probs = torch.softmax(teacher_logits, dim=-1)
     fused_temporal_probs = torch.softmax(fused_temporal, dim=1)
     stream_temporal_probs = torch.softmax(stream_temporal, dim=1)
-    teacher_temporal_probs = torch.softmax(fused_temporal.detach(), dim=1)
+    combined_stack = torch.stack([fused_probs, stream_probs], dim=0)
+    combined_probs = combined_stack.mean(dim=0).detach()
+    eps = torch.finfo(combined_probs.dtype).eps
+    combined_logits = torch.log(combined_probs.clamp_min(eps))
+    combined_temporal_stack = torch.stack(
+        [fused_temporal_probs, stream_temporal_probs], dim=0
+    )
+    combined_temporal_probs = combined_temporal_stack.mean(dim=0).detach()
 
     outputs = SimpleNamespace(
         logits=logits,
@@ -69,15 +73,23 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
             },
             "stream": {"pose": stream_logits},
             "frame_masks": {"pose": stream_mask},
-            "distillation": {"pose": teacher_logits},
+            "distillation": {"pose": combined_logits},
+            "combined": {
+                "logits": combined_logits,
+                "mask": fused_mask,
+                "probs": combined_probs,
+                "temporal_probs": combined_temporal_probs,
+            },
             "probabilities": {
                 "fused": fused_probs,
+                "ensemble": combined_probs,
                 "stream": {"pose": stream_probs},
-                "distillation": {"pose": teacher_probs},
+                "distillation": {"pose": combined_probs},
                 "temporal": {
                     "fused": fused_temporal_probs,
+                    "ensemble": combined_temporal_probs,
                     "stream": {"pose": stream_temporal_probs},
-                    "distillation": {"pose": teacher_temporal_probs},
+                    "distillation": {"pose": combined_temporal_probs},
                 },
             },
             "temporal_features": {
@@ -130,7 +142,7 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
 
     temperature = 2.0
     student = stream_logits / temperature
-    teacher = teacher_logits / temperature
+    teacher = combined_logits / temperature
     log_probs = F.log_softmax(student, dim=-1)
     teacher_probs_temp = F.softmax(teacher, dim=-1)
     per_token = F.kl_div(log_probs, teacher_probs_temp, reduction="none").sum(dim=-1)
@@ -146,3 +158,20 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
         + components["loss_distillation_weighted"]
     )
     assert torch.allclose(loss, expected_total)
+
+    assert "ctc_ensemble_logits" in components
+    assert torch.allclose(
+        components["ctc_ensemble_logits"], combined_logits.detach(), atol=1e-6
+    )
+    assert "ctc_ensemble_sequence" in components
+    expected_path = combined_probs.argmax(dim=-1)[0, : ctc_mask.sum().item()].tolist()
+    collapsed: list[int] = []
+    previous = None
+    for token in expected_path:
+        if token == 0:
+            previous = None
+            continue
+        if token != previous:
+            collapsed.append(token)
+        previous = token
+    assert components["ctc_ensemble_sequence"] == [collapsed]

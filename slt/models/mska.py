@@ -914,18 +914,19 @@ class MSKAEncoder(nn.Module):
             output.fused_embedding
         )
         use_teacher = self.detach_teacher if detach_teacher is None else detach_teacher
-        teacher_logits = fused_logits.detach() if use_teacher else fused_logits
         fused_probs = torch.softmax(fused_logits, dim=-1)
-        teacher_probs = torch.softmax(teacher_logits, dim=-1)
+        teacher_fused_logits = fused_logits.detach() if use_teacher else fused_logits
+        teacher_fused_probs = torch.softmax(teacher_fused_logits, dim=-1)
         fused_temporal_probs = torch.softmax(fused_temporal, dim=1)
-        teacher_temporal_source = fused_temporal.detach() if use_teacher else fused_temporal
-        teacher_temporal_probs = torch.softmax(teacher_temporal_source, dim=1)
+        teacher_fused_temporal = fused_temporal.detach() if use_teacher else fused_temporal
+        teacher_fused_temporal_probs = torch.softmax(teacher_fused_temporal, dim=1)
 
         stream_logits: Dict[str, Tensor] = {}
-        distillation: Dict[str, Tensor] = {}
         stream_probs: Dict[str, Tensor] = {}
         stream_temporal_features: Dict[str, Tensor] = {}
         stream_temporal_probs: Dict[str, Tensor] = {}
+        teacher_stream_probs: Dict[str, Tensor] = {}
+        teacher_stream_temporal_probs: Dict[str, Tensor] = {}
 
         for name, embeddings in output.stream_embeddings.items():
             joint_embeddings = output.joint_embeddings.get(name)
@@ -935,20 +936,46 @@ class MSKAEncoder(nn.Module):
                 head_inputs, mask=joint_mask
             )
             stream_logits[name] = logits
-            distillation[name] = teacher_logits
             stream_probs[name] = torch.softmax(logits, dim=-1)
             stream_temporal_features[name] = temporal_features
             stream_temporal_probs[name] = torch.softmax(temporal_features, dim=1)
+            teacher_stream = logits.detach() if use_teacher else logits
+            teacher_stream_probs[name] = torch.softmax(teacher_stream, dim=-1)
+            teacher_temporal = temporal_features.detach() if use_teacher else temporal_features
+            teacher_stream_temporal_probs[name] = torch.softmax(teacher_temporal, dim=1)
+
+        ensemble_sources = list(teacher_stream_probs.values()) + [teacher_fused_probs]
+        stacked = torch.stack(ensemble_sources, dim=0)
+        ensemble_probs = stacked.mean(dim=0)
+        eps = torch.finfo(ensemble_probs.dtype).eps
+        ensemble_logits = torch.log(ensemble_probs.clamp_min(eps))
+        if use_teacher:
+            ensemble_probs = ensemble_probs.detach()
+            ensemble_logits = ensemble_logits.detach()
+
+        temporal_sources = list(teacher_stream_temporal_probs.values()) + [
+            teacher_fused_temporal_probs
+        ]
+        temporal_stacked = torch.stack(temporal_sources, dim=0)
+        ensemble_temporal_probs = temporal_stacked.mean(dim=0)
+        if use_teacher:
+            ensemble_temporal_probs = ensemble_temporal_probs.detach()
+
+        distillation: Dict[str, Tensor] = {
+            name: ensemble_logits for name in stream_logits
+        }
 
         probabilities = {
             "fused": fused_probs,
             "stream": stream_probs,
-            "distillation": {name: teacher_probs for name in stream_logits},
+            "ensemble": ensemble_probs,
+            "distillation": {name: ensemble_probs for name in stream_logits},
             "temporal": {
                 "fused": fused_temporal_probs,
                 "stream": stream_temporal_probs,
+                "ensemble": ensemble_temporal_probs,
                 "distillation": {
-                    name: teacher_temporal_probs for name in stream_logits
+                    name: ensemble_temporal_probs for name in stream_logits
                 },
             },
         }
@@ -960,6 +987,12 @@ class MSKAEncoder(nn.Module):
                 "mask": output.fused_mask,
                 "probs": fused_probs,
                 "temporal_probs": fused_temporal_probs,
+            },
+            "combined": {
+                "logits": ensemble_logits,
+                "mask": output.fused_mask,
+                "probs": ensemble_probs,
+                "temporal_probs": ensemble_temporal_probs,
             },
             "distillation": distillation,
             "frame_masks": output.frame_masks,
