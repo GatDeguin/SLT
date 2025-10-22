@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -489,7 +490,11 @@ def main() -> None:
         scaler = torch.cuda.amp.GradScaler()
         autocast_dtype = torch.float16
 
-    def _loss_fn(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def _loss_fn(
+        outputs: Any,
+        targets: torch.Tensor,
+        _: Optional[Mapping[str, Any]] = None,
+    ) -> torch.Tensor:
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         vocab = logits.size(-1)
         return F.cross_entropy(

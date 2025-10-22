@@ -14,12 +14,11 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
-from torch import nn
 from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
-from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig
-from slt.models.single_signer import load_single_signer_components
+from slt.training.configuration import ModelConfig
+from slt.training.models import MultiStreamClassifier
 from slt.utils.text import (
     TokenizerValidationError,
     character_error_rate,
@@ -49,28 +48,6 @@ class PredictionItem:
 
 
 @dataclass
-class ModelConfig:
-    """Configuración del modelo utilizada durante la evaluación."""
-
-    image_size: int = 224
-    projector_dim: int = 128
-    d_model: int = 128
-    pose_landmarks: int = 13
-    projector_dropout: float = 0.05
-    fusion_dropout: float = 0.05
-    temporal_nhead: int = 4
-    temporal_layers: int = 3
-    temporal_dim_feedforward: int = 384
-    temporal_dropout: float = 0.05
-    sequence_length: int = 128
-    decoder_layers: int = 2
-    decoder_heads: int = 4
-    decoder_dropout: float = 0.1
-    pretrained: Optional[str] = "single_signer"
-    pretrained_checkpoint: Optional[Path] = None
-
-
-@dataclass
 class EvaluationResult:
     """Resumen de evaluación asociado a un checkpoint específico."""
 
@@ -78,164 +55,6 @@ class EvaluationResult:
     predictions: List[PredictionItem]
     metrics: Dict[str, float]
     examples: List[PredictionItem]
-
-
-class MultiStreamClassifier(nn.Module):
-    """Ensamble encoder/decoder utilizado tanto en entrenamiento como en inferencia."""
-
-    def __init__(self, config: ModelConfig, tokenizer: PreTrainedTokenizerBase) -> None:
-        super().__init__()
-
-        pretrained = (config.pretrained or "").strip().lower()
-        if pretrained and pretrained not in {"none", "false"}:
-            if pretrained not in {"single_signer", "single-signer"}:
-                raise ValueError(
-                    "Identificador de pesos no soportado. Usa 'single_signer' o 'none'."
-                )
-            encoder, decoder, metadata = load_single_signer_components(
-                tokenizer,
-                checkpoint_path=config.pretrained_checkpoint,
-                map_location=torch.device("cpu"),
-                strict=True,
-            )
-            self.encoder = encoder
-            self.decoder = decoder
-            setattr(self, "pretrained_metadata", metadata)
-            return
-
-        vit_config = ViTConfig(image_size=config.image_size)
-        temporal_kwargs = {
-            "nhead": config.temporal_nhead,
-            "nlayers": config.temporal_layers,
-            "dim_feedforward": config.temporal_dim_feedforward,
-            "dropout": config.temporal_dropout,
-        }
-
-        self.encoder = MultiStreamEncoder(
-            backbone_config=vit_config,
-            projector_dim=config.projector_dim,
-            d_model=config.d_model,
-            pose_dim=3 * config.pose_landmarks,
-            positional_num_positions=config.sequence_length,
-            projector_dropout=config.projector_dropout,
-            fusion_dropout=config.fusion_dropout,
-            temporal_kwargs=temporal_kwargs,
-        )
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if not vocab_size:
-            vocab_size = len(tokenizer)
-        self.decoder = TextSeq2SeqDecoder(
-            d_model=config.d_model,
-            vocab_size=int(vocab_size),
-            num_layers=config.decoder_layers,
-            num_heads=config.decoder_heads,
-            dropout=config.decoder_dropout,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-        )
-
-    def forward(
-        self,
-        *,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        miss_mask_hl: Optional[torch.Tensor] = None,
-        miss_mask_hr: Optional[torch.Tensor] = None,
-        pose_conf_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        decoder_attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        **extra_inputs: Any,
-    ) -> torch.Tensor:
-        encoded = self.encoder(
-            face,
-            hand_l,
-            hand_r,
-            pose,
-            pad_mask=pad_mask,
-            miss_mask_hl=miss_mask_hl,
-            miss_mask_hr=miss_mask_hr,
-            pose_conf_mask=pose_conf_mask,
-            **extra_inputs,
-        )
-        if encoder_attention_mask is None and pad_mask is not None:
-            encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            labels=labels,
-            decoder_attention_mask=decoder_attention_mask,
-        )
-
-    def generate(
-        self,
-        *,
-        face: torch.Tensor,
-        hand_l: torch.Tensor,
-        hand_r: torch.Tensor,
-        pose: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        miss_mask_hl: Optional[torch.Tensor] = None,
-        miss_mask_hr: Optional[torch.Tensor] = None,
-        pose_conf_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> torch.LongTensor:
-        encoder_extra_keys = {
-            "keypoints",
-            "keypoints_mask",
-            "keypoints_frame_mask",
-            "keypoints_body",
-            "keypoints_body_mask",
-            "keypoints_body_frame_mask",
-            "keypoints_hand_l",
-            "keypoints_hand_l_mask",
-            "keypoints_hand_l_frame_mask",
-            "keypoints_hand_r",
-            "keypoints_hand_r_mask",
-            "keypoints_hand_r_frame_mask",
-            "keypoints_face",
-            "keypoints_face_mask",
-            "keypoints_face_frame_mask",
-            "keypoints_lengths",
-            "ctc_labels",
-            "ctc_mask",
-            "ctc_lengths",
-            "gloss_sequences",
-            "gloss_texts",
-        }
-        extra_inputs = {
-            name: value for name, value in kwargs.items() if name in encoder_extra_keys
-        }
-        generation_kwargs = {
-            name: value for name, value in kwargs.items() if name not in encoder_extra_keys
-        }
-        encoded = self.encoder(
-            face,
-            hand_l,
-            hand_r,
-            pose,
-            pad_mask=pad_mask,
-            miss_mask_hl=miss_mask_hl,
-            miss_mask_hr=miss_mask_hr,
-            pose_conf_mask=pose_conf_mask,
-            **extra_inputs,
-        )
-        if encoder_attention_mask is None and pad_mask is not None:
-            encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder.generate(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            **generation_kwargs,
-        )
-
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -308,6 +127,57 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Dropout interno del decoder seq2seq",
     )
     parser.add_argument(
+        "--use-mska",
+        dest="use_mska",
+        action="store_true",
+        help="Habilita la rama MSKA durante la evaluación",
+    )
+    parser.add_argument(
+        "--no-mska",
+        dest="use_mska",
+        action="store_false",
+        help="Desactiva la rama MSKA aunque el checkpoint la incluya",
+    )
+    parser.set_defaults(use_mska=None)
+    parser.add_argument(
+        "--mska-heads",
+        type=int,
+        help="Número de cabezales de atención utilizados por MSKA",
+    )
+    parser.add_argument(
+        "--mska-ff-multiplier",
+        type=int,
+        help="Multiplicador del feed-forward interno de MSKA",
+    )
+    parser.add_argument(
+        "--mska-dropout",
+        type=float,
+        help="Dropout aplicado dentro del encoder MSKA",
+    )
+    parser.add_argument(
+        "--mska-input-dim",
+        type=int,
+        help="Dimensión de los vectores de keypoints para MSKA",
+    )
+    parser.add_argument(
+        "--mska-ctc-vocab",
+        type=int,
+        help="Tamaño de vocabulario de las cabezas CTC de MSKA",
+    )
+    parser.add_argument(
+        "--mska-detach-teacher",
+        dest="mska_detach_teacher",
+        action="store_true",
+        help="Detiene gradientes en el profesor MSKA durante distilación",
+    )
+    parser.add_argument(
+        "--mska-attach-teacher",
+        dest="mska_detach_teacher",
+        action="store_false",
+        help="Permite retropropagación a través del profesor MSKA",
+    )
+    parser.set_defaults(mska_detach_teacher=None)
+    parser.add_argument(
         "--tokenizer",
         type=str,
         required=True,
@@ -352,7 +222,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.set_defaults(compute_metrics=True)
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    explicit_bool_flags = set()
+    for name in ("use_mska", "mska_detach_teacher"):
+        if getattr(args, name, None) is not None:
+            explicit_bool_flags.add(name)
+    args._explicit_bool_flags = explicit_bool_flags
+    return args
 
 
 def _setup_logging(level: str) -> None:
@@ -403,10 +279,24 @@ def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -
         pretrained=args.pretrained,
         pretrained_checkpoint=args.pretrained_checkpoint,
     )
+    if args.use_mska is not None:
+        config.use_mska = bool(args.use_mska)
+    if args.mska_heads is not None:
+        config.mska_heads = args.mska_heads
+    if args.mska_ff_multiplier is not None:
+        config.mska_ff_multiplier = args.mska_ff_multiplier
+    if args.mska_dropout is not None:
+        config.mska_dropout = args.mska_dropout
+    if args.mska_input_dim is not None:
+        config.mska_input_dim = args.mska_input_dim
+    if args.mska_ctc_vocab is not None:
+        config.mska_ctc_vocab = args.mska_ctc_vocab
+    if args.mska_detach_teacher is not None:
+        config.mska_detach_teacher = bool(args.mska_detach_teacher)
     return MultiStreamClassifier(config, tokenizer)
 
 
-def _load_checkpoint(model: nn.Module, path: Path, device: torch.device) -> None:
+def _load_checkpoint(model: torch.nn.Module, path: Path, device: torch.device) -> None:
     checkpoint = torch.load(path, map_location=device)
     if isinstance(checkpoint, dict):
         state_dict = checkpoint.get("model_state") or checkpoint.get("state_dict")

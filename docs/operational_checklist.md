@@ -12,7 +12,7 @@ técnicas; cada ítem enlaza con la documentación correspondiente.
 2. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
    para comprobar que los componentes de datos, entrenamiento y exportación
    funcionan integrados. Si trabajas con flujos basados en keypoints, valida
-   también `tools/train_slt_lsa_mska_v13.py` con un fragmento representativo.
+   también `tools/train_slt_multistream_v9.py --use-mska` (o el wrapper) con un fragmento representativo.
 3. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
    producido por la demo y revisa los reportes con
    `docs/metrics_dashboard_integration.py`.

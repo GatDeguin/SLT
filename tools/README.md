@@ -33,9 +33,9 @@ cuando necesites procesar videos o ejecutar demos.
 - `train_slt_multistream_v9.py`: entrenamiento completo multi-stream. Admite
   configuración declarativa (`--config`), sobrescrituras (`--set`) y mezcla de
   streams (`--mix-stream`). Consulta [la guía dedicada](../docs/train_slt_multistream_v9.md).
-- `train_slt_lsa_mska_v13.py`: flujo alternativo basado en keypoints (formato
-  `.npy`) y decodificador mBART-50. Implementa lectura tolerante de CSV,
-  congelamiento selectivo del decoder y reporte opcional de BLEU.
+- `train_slt_lsa_mska_v13.py`: *wrapper* de compatibilidad que reenvía los
+  argumentos a `train_slt_multistream_v9.py --use-mska`. Utiliza el flujo unificado
+  para entrenar con keypoints y pérdidas auxiliares configurables.
 
 ## Evaluación y exportación
 
