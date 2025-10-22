@@ -391,6 +391,21 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
     fused_temporal_sums = fused["temporal_probs"].sum(dim=1)
     assert torch.allclose(fused_temporal_sums, torch.ones_like(fused_temporal_sums), atol=1e-5)
 
+    combined = auxiliary["combined"]
+    assert combined["logits"].shape == (batch, time, 7)
+    assert combined["mask"].shape == (batch, time)
+    assert combined["probs"].shape == (batch, time, 7)
+    assert torch.allclose(
+        torch.softmax(combined["logits"], dim=-1), combined["probs"], atol=1e-6
+    )
+    assert not combined["logits"].requires_grad
+    combined_temporal = combined["temporal_probs"]
+    assert combined_temporal.shape == (batch, time, 10)
+    combined_temporal_sums = combined_temporal.sum(dim=1)
+    assert torch.allclose(
+        combined_temporal_sums, torch.ones_like(combined_temporal_sums), atol=1e-5
+    )
+
     temporal_features = auxiliary["temporal_features"]
     assert temporal_features["fused"].shape == (batch, time, 10)
     stream_temporal_feats = temporal_features["stream"]
@@ -400,6 +415,7 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
 
     probabilities = auxiliary["probabilities"]
     assert torch.allclose(fused["probs"], probabilities["fused"], atol=1e-6)
+    assert torch.allclose(combined["probs"], probabilities["ensemble"], atol=1e-6)
 
     stream_probs = probabilities["stream"]
     assert set(stream_probs.keys()) == {"face", "hand_left", "pose"}
@@ -414,10 +430,11 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
         assert probs.shape == (batch, time, 7)
         sums = probs.sum(dim=-1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
-    assert not teacher_probs["face"].requires_grad
+        assert not probs.requires_grad
 
     temporal_probs = probabilities["temporal"]
     assert torch.allclose(temporal_probs["fused"], fused["temporal_probs"], atol=1e-6)
+    assert torch.allclose(temporal_probs["ensemble"], combined["temporal_probs"], atol=1e-6)
     for probs in temporal_probs["stream"].values():
         assert probs.shape == (batch, time, 10)
         sums = probs.sum(dim=1)
@@ -427,6 +444,35 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
         sums = probs.sum(dim=1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
         assert not probs.requires_grad
+
+    stream_prob_stack = torch.stack(
+        [fused["probs"], *(stream_probs[name] for name in ("face", "hand_left", "pose"))],
+        dim=0,
+    )
+    expected_combined = stream_prob_stack.mean(dim=0)
+    assert torch.allclose(combined["probs"], expected_combined, atol=1e-6)
+
+    stream_temporal_stack = torch.stack(
+        [
+            fused["temporal_probs"],
+            *(
+                temporal_probs["stream"][name]
+                for name in ("face", "hand_left", "pose")
+            ),
+        ],
+        dim=0,
+    )
+    expected_temporal = stream_temporal_stack.mean(dim=0)
+    assert torch.allclose(combined["temporal_probs"], expected_temporal, atol=1e-6)
+
+    distillation = auxiliary["distillation"]
+    assert set(distillation.keys()) == {"face", "hand_left", "pose"}
+    for logits in distillation.values():
+        assert logits.shape == (batch, time, 7)
+        assert not logits.requires_grad
+        assert torch.allclose(
+            torch.softmax(logits, dim=-1), combined["probs"], atol=1e-6
+        )
 
     loss = fused["logits"].sum()
     for logits in auxiliary["stream"].values():

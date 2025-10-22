@@ -513,6 +513,35 @@ def _ctc_loss_from_logits(
     )
 
 
+def _ctc_greedy_decode(
+    logits: torch.Tensor, mask: Optional[torch.Tensor], blank: int = 0
+) -> list[list[int]]:
+    predictions = logits.detach().softmax(dim=-1).argmax(dim=-1)
+    predictions_cpu = predictions.cpu()
+    mask_cpu = None
+    if mask is not None:
+        mask_cpu = mask.to(device=predictions.device, dtype=torch.bool).cpu()
+    batch, time = predictions_cpu.shape
+    sequences: list[list[int]] = []
+    for idx in range(batch):
+        if mask_cpu is not None:
+            length = int(mask_cpu[idx].sum().item())
+        else:
+            length = time
+        tokens = predictions_cpu[idx, :length].tolist()
+        collapsed: list[int] = []
+        previous: Optional[int] = None
+        for token in tokens:
+            if token == blank:
+                previous = None
+                continue
+            if previous != token:
+                collapsed.append(token)
+            previous = token
+        sequences.append(collapsed)
+    return sequences
+
+
 def _distillation_loss(
     student_logits: torch.Tensor,
     teacher_logits: Optional[torch.Tensor],
@@ -547,7 +576,7 @@ def multistream_loss(
     distillation_weight: float = 0.0,
     distillation_temperature: float = 1.0,
     translation_key: str = "translation",
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
     labels = targets.get(translation_key)
     if labels is None:
         raise KeyError(
@@ -559,12 +588,13 @@ def multistream_loss(
     )
     weighted_translation = translation_loss * float(translation_weight)
     total_loss = weighted_translation
-    components: Dict[str, torch.Tensor] = {
+    components: Dict[str, Any] = {
         "loss_translation": translation_loss.detach(),
         "loss_translation_weighted": weighted_translation.detach(),
     }
 
     auxiliary = getattr(outputs, "auxiliary", None)
+    combined_entry = auxiliary.get("combined") if auxiliary else None
     ctc_loss_value = None
     if ctc_weight != 0 and auxiliary:
         ctc_labels = targets.get("ctc_labels")
@@ -605,9 +635,12 @@ def multistream_loss(
         streams = auxiliary.get("stream", {})
         teachers = auxiliary.get("distillation", {})
         frame_masks = auxiliary.get("frame_masks", {})
+        default_teacher = None
+        if combined_entry is not None:
+            default_teacher = combined_entry.get("logits")
         losses: list[torch.Tensor] = []
         for name, stream_logits in streams.items():
-            teacher_logits = teachers.get(name)
+            teacher_logits = teachers.get(name, default_teacher)
             mask = frame_masks.get(name)
             dist = _distillation_loss(
                 stream_logits,
@@ -623,5 +656,14 @@ def multistream_loss(
             total_loss = total_loss + weighted_dist
             components["loss_distillation"] = distillation_loss_value.detach()
             components["loss_distillation_weighted"] = weighted_dist.detach()
+
+    if combined_entry is not None:
+        combined_logits = combined_entry.get("logits")
+        if combined_logits is not None:
+            components["ctc_ensemble_logits"] = combined_logits.detach()
+            combined_mask = combined_entry.get("mask")
+            components["ctc_ensemble_sequence"] = _ctc_greedy_decode(
+                combined_logits, combined_mask
+            )
 
     return total_loss, components
