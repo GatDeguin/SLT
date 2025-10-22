@@ -185,16 +185,20 @@ def test_ctc_heads_preserve_temporal_dimension() -> None:
     stream_head = StreamCTCHead(dim, vocab, dropout=0.0)
     fused_head = FusedCTCHead(dim, vocab, dropout=0.0)
 
-    stream_logits = stream_head(features)
-    fused_logits = fused_head(features)
+    stream_logits, stream_temporal = stream_head.forward_with_intermediate(features)
+    fused_logits, fused_temporal = fused_head.forward_with_intermediate(features)
 
     assert stream_logits.shape == (batch, time, vocab)
     assert fused_logits.shape == (batch, time, vocab)
+    assert stream_temporal.shape == (batch, time, dim)
+    assert fused_temporal.shape == (batch, time, dim)
 
     stream_convs = [module for module in stream_head.modules() if isinstance(module, nn.Conv1d)]
     fused_convs = [module for module in fused_head.modules() if isinstance(module, nn.Conv1d)]
+    stream_convs2d = [module for module in stream_head.modules() if isinstance(module, nn.Conv2d)]
     assert stream_convs and stream_convs[0].kernel_size == (3,)
     assert fused_convs and fused_convs[0].kernel_size == (3,)
+    assert stream_convs2d and stream_convs2d[0].kernel_size == (3, 3)
 
     stream_probs = torch.softmax(stream_logits, dim=-1)
     fused_probs = torch.softmax(fused_logits, dim=-1)
@@ -202,6 +206,18 @@ def test_ctc_heads_preserve_temporal_dimension() -> None:
     fused_sums = fused_probs.sum(dim=-1)
     assert torch.allclose(stream_sums, torch.ones_like(stream_sums), atol=1e-5)
     assert torch.allclose(fused_sums, torch.ones_like(fused_sums), atol=1e-5)
+
+    joints = 4
+    joint_features = torch.randn(batch, time, joints, dim)
+    joint_mask = torch.ones(batch, time, joints, dtype=torch.bool)
+    logits_4d, temporal_4d = stream_head.forward_with_intermediate(
+        joint_features, mask=joint_mask
+    )
+    assert logits_4d.shape == (batch, time, vocab)
+    assert temporal_4d.shape == (batch, time, dim)
+    temporal_probs = torch.softmax(temporal_4d, dim=1)
+    temporal_sums = temporal_probs.sum(dim=1)
+    assert torch.allclose(temporal_sums, torch.ones_like(temporal_sums), atol=1e-5)
 
 
 def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
@@ -243,6 +259,17 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
     assert fused["mask"].shape == (batch, time)
     assert "probs" in fused
     assert fused["probs"].shape == (batch, time, 7)
+    assert "temporal_probs" in fused
+    assert fused["temporal_probs"].shape == (batch, time, 10)
+    fused_temporal_sums = fused["temporal_probs"].sum(dim=1)
+    assert torch.allclose(fused_temporal_sums, torch.ones_like(fused_temporal_sums), atol=1e-5)
+
+    temporal_features = auxiliary["temporal_features"]
+    assert temporal_features["fused"].shape == (batch, time, 10)
+    stream_temporal_feats = temporal_features["stream"]
+    assert set(stream_temporal_feats.keys()) == {"face", "hand_left", "pose"}
+    for features_tensor in stream_temporal_feats.values():
+        assert features_tensor.shape == (batch, time, 10)
 
     probabilities = auxiliary["probabilities"]
     assert torch.allclose(fused["probs"], probabilities["fused"], atol=1e-6)
@@ -261,6 +288,18 @@ def test_mska_encoder_auxiliary_logits_and_gradients() -> None:
         sums = probs.sum(dim=-1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
     assert not teacher_probs["face"].requires_grad
+
+    temporal_probs = probabilities["temporal"]
+    assert torch.allclose(temporal_probs["fused"], fused["temporal_probs"], atol=1e-6)
+    for probs in temporal_probs["stream"].values():
+        assert probs.shape == (batch, time, 10)
+        sums = probs.sum(dim=1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+    for probs in temporal_probs["distillation"].values():
+        assert probs.shape == (batch, time, 10)
+        sums = probs.sum(dim=1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+        assert not probs.requires_grad
 
     loss = fused["logits"].sum()
     for logits in auxiliary["stream"].values():
