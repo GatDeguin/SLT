@@ -8,7 +8,19 @@ import inspect
 import warnings
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, DefaultDict, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +28,9 @@ from torch import Tensor
 
 from .backbones import BackboneSpec, ViTConfig, load_backbone
 from .modules import FuseConcatLinear, PositionalEncodingLearned, StreamProjector
+
+if TYPE_CHECKING:
+    from .mska import MSKAEncoder, MSKAOutput
 from .temporal import TemporalEncoder
 
 __all__ = ["MultiStreamEncoder"]
@@ -58,6 +73,7 @@ class MultiStreamEncoder(torch.nn.Module):
         mask_combiner: Optional[
             Callable[[Optional[Tensor], Optional[Tensor]], Optional[Tensor]]
         ] = None,
+        mska: Optional["MSKAEncoder"] = None,
     ) -> None:
         super().__init__()
         temporal_kwargs = temporal_kwargs or {}
@@ -74,7 +90,9 @@ class MultiStreamEncoder(torch.nn.Module):
             "hand_right": "hand_right_projector",
             "pose": "pose_projector",
         }
-        self._backbone_factories: DefaultDict[str, Dict[str, Callable[[], torch.nn.Module]]] = defaultdict(dict)
+        self._backbone_factories: DefaultDict[
+            str, Dict[str, Callable[[], torch.nn.Module]]
+        ] = defaultdict(dict)
         self._backbone_instances: DefaultDict[str, Dict[str, torch.nn.Module]] = defaultdict(dict)
         self._backbone_indices: DefaultDict[str, Dict[str, int]] = defaultdict(dict)
         self._active_backbone_names: Dict[str, str] = {}
@@ -118,6 +136,22 @@ class MultiStreamEncoder(torch.nn.Module):
             for stream in self._stream_to_projector
         }
         self._auto_configure_components()
+        self.mska_encoder = mska
+        self._last_mska_output: Optional["MSKAOutput"] = None
+        if self.mska_encoder is not None:
+            if getattr(self.mska_encoder, "embed_dim", projector_dim) != projector_dim:
+                raise ValueError(
+                    "MSKA encoder output dimensionality must match projector_dim"
+                )
+            self._mska_fusion_adapter = torch.nn.Linear(projector_dim, d_model)
+            self._mska_streams = {
+                name: name
+                for name in self.mska_encoder.stream_names
+                if name in self._stream_to_projector
+            }
+        else:
+            self._mska_fusion_adapter = None
+            self._mska_streams = {}
 
     @classmethod
     def from_pretrained(
@@ -153,6 +187,7 @@ class MultiStreamEncoder(torch.nn.Module):
         miss_mask_hl: Optional[Tensor] = None,
         miss_mask_hr: Optional[Tensor] = None,
         pose_conf_mask: Optional[Tensor] = None,
+        keypoint_streams: Optional[Mapping[str, Mapping[str, Tensor]]] = None,
         **unused_inputs: Any,
     ) -> Tensor:
         """Encode multi-stream inputs returning a temporal sequence tensor."""
@@ -181,6 +216,35 @@ class MultiStreamEncoder(torch.nn.Module):
         if pose_mask is not None:
             self._emit("pose.mask", pose_mask.to(torch.float32))
 
+        mska_output: Optional["MSKAOutput"] = None
+        if self.mska_encoder is not None and keypoint_streams:
+            try:
+                mska_output = self.mska_encoder(keypoint_streams)
+            except ValueError:
+                mska_output = None
+            if mska_output is not None:
+                self._emit("mska.fused", mska_output.fused_embedding)
+                for stream_name, projector_attr in self._mska_streams.items():
+                    stream_embedding = mska_output.stream_embeddings.get(stream_name)
+                    if stream_embedding is None:
+                        continue
+                    if projector_attr == "face":
+                        face_proj = face_proj + stream_embedding
+                    elif projector_attr == "hand_left":
+                        hand_l_proj = hand_l_proj + stream_embedding
+                    elif projector_attr == "hand_right":
+                        hand_r_proj = hand_r_proj + stream_embedding
+                    elif projector_attr == "pose":
+                        pose_proj = pose_proj + stream_embedding
+                if self._mska_fusion_adapter is not None:
+                    fusion_residual = self._mska_fusion_adapter(mska_output.fused_embedding)
+                else:
+                    fusion_residual = None
+            else:
+                fusion_residual = None
+        else:
+            fusion_residual = None
+
         combined_hand_mask = self._combine_missing_masks(hand_l_mask, hand_r_mask)
         self._last_combined_hand_mask = combined_hand_mask
         if combined_hand_mask is not None:
@@ -189,6 +253,8 @@ class MultiStreamEncoder(torch.nn.Module):
         fused = self._call_fusion(
             (face_proj, hand_l_proj, hand_r_proj, pose_proj), combined_hand_mask
         )
+        if fusion_residual is not None:
+            fused = fused + fusion_residual
         self._emit("fusion.output", fused)
         fused = self.positional(fused)
 
@@ -197,6 +263,7 @@ class MultiStreamEncoder(torch.nn.Module):
         if src_key_padding_mask is not None:
             self._emit("pad.mask", src_key_padding_mask.to(torch.float32))
         encoded = self.temporal(fused, src_key_padding_mask=src_key_padding_mask)
+        self._last_mska_output = mska_output
         self._emit("temporal.output", encoded)
         return encoded
 
@@ -252,6 +319,12 @@ class MultiStreamEncoder(torch.nn.Module):
         """Return the most recent pose confidence mask."""
 
         return self._last_pose_mask
+
+    @property
+    def last_mska_output(self) -> Optional["MSKAOutput"]:
+        """Return the last MSKA output if available."""
+
+        return self._last_mska_output
 
     def active_backbone_name(self, stream: str) -> Optional[str]:
         """Return the currently active backbone identifier for ``stream``."""

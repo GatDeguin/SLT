@@ -10,6 +10,7 @@ from torch import nn
 from transformers import AutoConfig, PreTrainedTokenizerBase
 
 from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig, load_dinov2_backbone
+from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import load_single_signer_components
 
 from .configuration import ModelConfig
@@ -52,6 +53,7 @@ class MultiStreamClassifier(nn.Module):
             self.encoder = encoder
             self.decoder = decoder
             setattr(self, "pretrained_metadata", metadata)
+            self._mska_enabled = False
             return
 
         vit_config = ViTConfig(image_size=config.image_size)
@@ -72,6 +74,28 @@ class MultiStreamClassifier(nn.Module):
             if spec:
                 external_backbones[stream] = load_dinov2_backbone(spec, freeze=freeze_flag)
 
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if not vocab_size:
+            vocab_size = len(tokenizer)
+
+        mska_encoder: Optional[MSKAEncoder] = None
+        if config.mska:
+            mska_vocab = config.mska_ctc_vocab or vocab_size
+            mska_encoder = MSKAEncoder(
+                input_dim=config.mska_input_dim,
+                embed_dim=config.projector_dim,
+                stream_names=("face", "hand_left", "hand_right", "pose"),
+                num_heads=config.mska_heads,
+                ff_multiplier=config.mska_ff_multiplier,
+                dropout=config.mska_dropout,
+                ctc_vocab_size=int(mska_vocab),
+                detach_teacher=config.mska_detach_teacher,
+            )
+
         self.encoder = MultiStreamEncoder(
             backbone_config=vit_config,
             projector_dim=config.projector_dim,
@@ -82,14 +106,9 @@ class MultiStreamClassifier(nn.Module):
             fusion_dropout=config.fusion_dropout,
             temporal_kwargs=temporal_kwargs,
             backbones=external_backbones if external_backbones else None,
+            mska=mska_encoder,
         )
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if not vocab_size:
-            vocab_size = len(tokenizer)
+        self._mska_enabled = mska_encoder is not None
 
         decoder_config = None
         if config.decoder_config:
@@ -132,6 +151,61 @@ class MultiStreamClassifier(nn.Module):
                 config_kwargs=config.decoder_kwargs,
             )
 
+    @staticmethod
+    def _prepare_keypoint_streams(
+        payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
+        mapping = {
+            "face": (
+                "keypoints_face",
+                "keypoints_face_mask",
+                "keypoints_face_frame_mask",
+            ),
+            "hand_left": (
+                "keypoints_hand_l",
+                "keypoints_hand_l_mask",
+                "keypoints_hand_l_frame_mask",
+            ),
+            "hand_right": (
+                "keypoints_hand_r",
+                "keypoints_hand_r_mask",
+                "keypoints_hand_r_frame_mask",
+            ),
+            "pose": (
+                "keypoints_body",
+                "keypoints_body_mask",
+                "keypoints_body_frame_mask",
+            ),
+        }
+
+        streams: Dict[str, Dict[str, torch.Tensor]] = {}
+        for name, keys in mapping.items():
+            points = payload.pop(keys[0], None)
+            mask = payload.pop(keys[1], None)
+            frame_mask = payload.pop(keys[2], None)
+            if points is None or not isinstance(points, torch.Tensor) or points.numel() == 0:
+                continue
+            stream_payload: Dict[str, torch.Tensor] = {"points": points}
+            if isinstance(mask, torch.Tensor):
+                stream_payload["mask"] = mask
+            if isinstance(frame_mask, torch.Tensor):
+                stream_payload["frame_mask"] = frame_mask
+            streams[name] = stream_payload
+
+        if "pose" not in streams:
+            points = payload.pop("keypoints", None)
+            if isinstance(points, torch.Tensor) and points.numel() != 0:
+                mask = payload.pop("keypoints_mask", None)
+                frame_mask = payload.pop("keypoints_frame_mask", None)
+                stream_payload = {"points": points}
+                if isinstance(mask, torch.Tensor):
+                    stream_payload["mask"] = mask
+                if isinstance(frame_mask, torch.Tensor):
+                    stream_payload["frame_mask"] = frame_mask
+                streams["pose"] = stream_payload
+
+        return streams or None
+
     def forward(
         self,
         *,
@@ -148,6 +222,11 @@ class MultiStreamClassifier(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         **extra_inputs: Any,
     ) -> torch.Tensor:
+        keypoint_streams = None
+        encoder_kwargs = extra_inputs
+        if self._mska_enabled:
+            encoder_kwargs = dict(extra_inputs)
+            keypoint_streams = self._prepare_keypoint_streams(encoder_kwargs)
         encoded = self.encoder(
             face,
             hand_l,
@@ -157,16 +236,24 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
             pose_conf_mask=pose_conf_mask,
-            **extra_inputs,
+            keypoint_streams=keypoint_streams,
+            **encoder_kwargs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
-        return self.decoder(
+        decoder_output = self.decoder(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
             labels=labels,
             decoder_attention_mask=decoder_attention_mask,
         )
+        auxiliary = None
+        if self._mska_enabled and self.encoder.mska_encoder is not None:
+            mska_output = self.encoder.last_mska_output
+            if mska_output is not None:
+                auxiliary = self.encoder.mska_encoder.auxiliary_logits(mska_output)
+        setattr(decoder_output, "auxiliary", auxiliary)
+        return decoder_output
 
     def generate(
         self,
@@ -205,12 +292,16 @@ class MultiStreamClassifier(nn.Module):
             "gloss_sequences",
             "gloss_texts",
         }
-        extra_inputs = {
+        encoder_kwargs = {
             name: value for name, value in kwargs.items() if name in encoder_extra_keys
         }
         decoder_kwargs = {
             name: value for name, value in kwargs.items() if name not in encoder_extra_keys
         }
+        keypoint_streams = None
+        if self._mska_enabled:
+            encoder_kwargs = dict(encoder_kwargs)
+            keypoint_streams = self._prepare_keypoint_streams(encoder_kwargs)
         encoded = self.encoder(
             face,
             hand_l,
@@ -220,7 +311,8 @@ class MultiStreamClassifier(nn.Module):
             miss_mask_hl=miss_mask_hl,
             miss_mask_hr=miss_mask_hr,
             pose_conf_mask=pose_conf_mask,
-            **extra_inputs,
+            keypoint_streams=keypoint_streams,
+            **encoder_kwargs,
         )
         if encoder_attention_mask is None and pad_mask is not None:
             encoder_attention_mask = pad_mask.to(torch.long)
