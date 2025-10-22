@@ -87,8 +87,18 @@ Artefactos generados en `--work-dir`:
 | `--pretrained` | Selecciona `single_signer` (default) o `none` para inicializar pesos. |
 | `--pretrained-checkpoint` | Ruta al checkpoint `single_signer` descargado. |
 | `--use-mska` | Activa la rama MSKA (requiere keypoints y glosas). |
-| `--mska-*` | Hiperparámetros MSKA (`heads`, `ff-multiplier`, `dropout`, `input-dim`, `ctc-vocab`, `detach-teacher`). |
-| `--mska-translation-weight`, `--mska-ctc-weight`, `--mska-distillation-weight` | Pesos de la combinación de pérdidas. |
+| `--mska-heads` | Número de cabezas en la atención multi-stream. |
+| `--mska-ff-multiplier` | Factor del bloque feed-forward dentro de la atención. |
+| `--mska-dropout` | Dropout aplicado a proyectores y cabezas MSKA. |
+| `--mska-input-dim` | Dimensionalidad de los keypoints de entrada. |
+| `--mska-ctc-vocab` | Tamaño del vocabulario para las cabezas CTC auxiliares. |
+| `--mska-detach-teacher` | Controla si los logits fusionados participan en la distilación. |
+| `--mska-stream-heads` | Número de cabezas en la atención por articulación. |
+| `--mska-temporal-blocks` | Cantidad de bloques convolucionales temporales por stream. |
+| `--mska-temporal-kernel` | Tamaño del kernel temporal usado en dichos bloques. |
+| `--mska-translation-weight` | Peso de la pérdida de traducción. |
+| `--mska-ctc-weight` | Peso del término CTC auxiliar. |
+| `--mska-distillation-weight` | Peso del término de distilación. |
 | `--mska-distillation-temperature` | Temperatura aplicada al término de distilación. |
 
 ### Optimización y ejecución

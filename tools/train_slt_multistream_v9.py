@@ -290,6 +290,21 @@ def parse_args() -> argparse.Namespace:
         help="Dropout probability applied by MSKA encoders and heads",
     )
     parser.add_argument(
+        "--mska-stream-heads",
+        type=int,
+        help="Number of attention heads inside each keypoint stream encoder",
+    )
+    parser.add_argument(
+        "--mska-temporal-blocks",
+        type=int,
+        help="Number of temporal convolutional blocks applied per stream",
+    )
+    parser.add_argument(
+        "--mska-temporal-kernel",
+        type=int,
+        help="Temporal kernel size used by the stream convolutional blocks",
+    )
+    parser.add_argument(
         "--mska-input-dim",
         type=int,
         help="Dimensionality of the keypoint vectors provided to MSKA",
