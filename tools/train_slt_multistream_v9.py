@@ -305,6 +305,11 @@ def parse_args() -> argparse.Namespace:
         help="Temporal kernel size used by the stream convolutional blocks",
     )
     parser.add_argument(
+        "--mska-temporal-dilation",
+        type=int,
+        help="Temporal dilation factor applied by the stream convolutional blocks",
+    )
+    parser.add_argument(
         "--mska-input-dim",
         type=int,
         help="Dimensionality of the keypoint vectors provided to MSKA",

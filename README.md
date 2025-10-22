@@ -258,7 +258,8 @@ python tools/train_slt_multistream_v9.py \
 ```
 
 Ajusta la atención por articulación y los bloques temporales con
-`--mska-stream-heads`, `--mska-temporal-blocks` y `--mska-temporal-kernel`, tal
+`--mska-stream-heads`, `--mska-temporal-blocks`, `--mska-temporal-kernel` y
+`--mska-temporal-dilation`, tal
 como se describe en la Sección 3.2.2 del paper y en
 `docs/train_slt_multistream_v9.md`.
 

@@ -31,7 +31,7 @@ class KeypointStreamOutput:
 
 
 class _TanhMultiHeadAttention(nn.Module):
-    """Self-attention module with ``tanh``-activated logits and shared normalisation."""
+    """Multi-head self-attention with ``tanh`` logits and global normalisation."""
 
     def __init__(self, embed_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -78,36 +78,42 @@ class _TanhMultiHeadAttention(nn.Module):
         scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
         scores = torch.tanh(scores)
 
+        mask: Optional[Tensor] = None
         if key_padding_mask is not None:
             if key_padding_mask.shape != (batch, length):
                 raise ValueError(
                     "key_padding_mask must have shape (batch, length) matching the inputs"
                 )
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(~mask, float("-inf"))
+            mask = key_padding_mask.to(dtype=torch.bool)
+            scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
 
-        flat_scores = scores.view(batch * self.num_heads * length, length)
-        if key_padding_mask is not None:
-            flat_mask = key_padding_mask[:, None, None, :].expand(
-                batch, self.num_heads, length, length
-            )
-            flat_mask = flat_mask.reshape(batch * self.num_heads * length, length)
-            weights = torch.zeros_like(flat_scores)
-            valid_rows = flat_mask.any(dim=-1)
-            if valid_rows.any():
-                valid_scores = flat_scores[valid_rows]
-                weights_valid = torch.softmax(valid_scores, dim=-1)
-                weights[valid_rows] = weights_valid
-            weights = weights.view(batch, self.num_heads, length, length)
-        else:
-            weights = torch.softmax(flat_scores, dim=-1)
-            weights = weights.view(batch, self.num_heads, length, length)
-
+        finite_scores = torch.where(
+            torch.isfinite(scores),
+            scores,
+            torch.full_like(scores, -torch.finfo(scores.dtype).max),
+        )
+        max_per_sample = finite_scores.amax(dim=(-1, -2, -3), keepdim=True)
+        max_per_sample = torch.where(
+            torch.isfinite(max_per_sample), max_per_sample, torch.zeros_like(max_per_sample)
+        )
+        stabilised = scores - max_per_sample
+        exp_scores = torch.exp(stabilised)
+        exp_scores = torch.where(torch.isfinite(scores), exp_scores, torch.zeros_like(exp_scores))
+        if mask is not None:
+            key_mask = mask[:, None, None, :].to(dtype=exp_scores.dtype)
+            query_mask = mask[:, None, :, None].to(dtype=exp_scores.dtype)
+            exp_scores = exp_scores * key_mask * query_mask
+        denom = exp_scores.sum(dim=(-1, -2, -3), keepdim=True)
+        denom = denom.clamp_min(torch.finfo(exp_scores.dtype).tiny)
+        weights = exp_scores / denom
         weights = self.dropout(weights)
+        renorm = weights.sum(dim=(-1, -2, -3), keepdim=True)
+        renorm = renorm.clamp_min(torch.finfo(weights.dtype).tiny)
+        weights = weights / renorm
         attended = torch.matmul(weights, value)
 
-        if key_padding_mask is not None:
-            query_mask = key_padding_mask.unsqueeze(1).unsqueeze(-1).to(attended.dtype)
+        if mask is not None:
+            query_mask = mask[:, None, :, None].to(dtype=attended.dtype)
             attended = attended * query_mask
 
         attended = attended.transpose(1, 2).contiguous().view(batch, length, self.embed_dim)
@@ -118,19 +124,24 @@ class _TanhMultiHeadAttention(nn.Module):
 class _TemporalConvBlock(nn.Module):
     """Temporal 2D convolutional block operating over time and joints."""
 
-    def __init__(self, embed_dim: int, kernel_size: int, dropout: float) -> None:
+    def __init__(
+        self, embed_dim: int, kernel_size: int, dropout: float, dilation: int = 1
+    ) -> None:
         super().__init__()
         if kernel_size <= 0:
             raise ValueError("kernel_size must be positive")
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd to preserve temporal dimensions")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive integer")
 
-        padding = (kernel_size // 2, 0)
+        padding = (dilation * (kernel_size - 1) // 2, 0)
         self.depthwise = nn.Conv2d(
             embed_dim,
             embed_dim,
             kernel_size=(kernel_size, 1),
             padding=padding,
+            dilation=(dilation, 1),
             groups=embed_dim,
             bias=False,
         )
@@ -164,6 +175,7 @@ class KeypointStreamEncoder(nn.Module):
         num_heads: int = 4,
         temporal_blocks: int = 2,
         temporal_kernel: int = 3,
+        temporal_dilation: int = 1,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -173,23 +185,31 @@ class KeypointStreamEncoder(nn.Module):
             raise ValueError("embed_dim must be a positive integer")
         if temporal_blocks < 0:
             raise ValueError("temporal_blocks must be non-negative")
+        if temporal_dilation <= 0:
+            raise ValueError("temporal_dilation must be a positive integer")
 
         self.in_dim = int(in_dim)
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self.temporal_blocks = int(temporal_blocks)
         self.temporal_kernel = int(temporal_kernel)
+        self.temporal_dilation = int(temporal_dilation)
 
         self.input_norm = nn.LayerNorm(self.in_dim)
         self.input_projection = nn.Linear(self.in_dim, self.embed_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.projection_dropout = nn.Dropout(dropout)
         self.self_attention = _TanhMultiHeadAttention(
             self.embed_dim, self.num_heads, dropout
         )
         self.attention_norm = nn.LayerNorm(self.embed_dim)
         self.temporal_layers = nn.ModuleList(
             [
-                _TemporalConvBlock(self.embed_dim, self.temporal_kernel, dropout)
+                _TemporalConvBlock(
+                    self.embed_dim,
+                    self.temporal_kernel,
+                    dropout,
+                    dilation=self.temporal_dilation,
+                )
                 for _ in range(self.temporal_blocks)
             ]
         )
@@ -260,12 +280,11 @@ class KeypointStreamEncoder(nn.Module):
         batch, time, joints, _ = keypoints.shape
         normed = self.input_norm(keypoints)
         projected = self.input_projection(normed)
-        projected = self.dropout(projected)
-
         positional = self._joint_positional_encoding(
             joints, device=projected.device, dtype=projected.dtype
         )
         projected = projected + positional.view(1, 1, joints, self.embed_dim)
+        projected = self.projection_dropout(projected)
 
         mask_bool: Optional[Tensor]
         if mask is not None:
@@ -568,6 +587,7 @@ class MSKAEncoder(nn.Module):
         stream_attention_heads: int = 4,
         stream_temporal_blocks: int = 2,
         stream_temporal_kernel: int = 3,
+        stream_temporal_dilation: int = 1,
     ) -> None:
         super().__init__()
         if not stream_names:
@@ -584,6 +604,7 @@ class MSKAEncoder(nn.Module):
                     num_heads=stream_attention_heads,
                     temporal_blocks=stream_temporal_blocks,
                     temporal_kernel=stream_temporal_kernel,
+                    temporal_dilation=stream_temporal_dilation,
                     dropout=dropout,
                 )
                 for name in self.stream_names
