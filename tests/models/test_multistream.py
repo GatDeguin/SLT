@@ -489,3 +489,34 @@ def test_from_pretrained_returns_loaded_encoder(tmp_path: Path, monkeypatch: pyt
     assert metadata.encoder_kwargs
     assert metadata.backbone_kwargs["features"] == 16
     monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
+
+
+def test_gloss_mlp_uses_leaky_relu_activation() -> None:
+    class DummyMSKA(torch.nn.Module):
+        def __init__(self, embed_dim: int) -> None:
+            super().__init__()
+            self.embed_dim = embed_dim
+            self.stream_names = ("face", "hand_left", "hand_right", "pose")
+
+    slope = 0.15
+    dummy_mska = DummyMSKA(embed_dim=8)
+    encoder = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=16,
+        temporal_kwargs={"nhead": 2, "nlayers": 1, "dim_feedforward": 32},
+        mska=dummy_mska,
+        mska_gloss_hidden_dim=12,
+        mska_gloss_activation="leaky_relu",
+        leaky_relu_negative_slope=slope,
+    )
+
+    mlp = encoder._mska_gloss_mlp
+    assert mlp is not None
+    activation = next(
+        (module for module in mlp if isinstance(module, torch.nn.LeakyReLU)),
+        None,
+    )
+    assert activation is not None
+    assert abs(activation.negative_slope - slope) < 1e-6

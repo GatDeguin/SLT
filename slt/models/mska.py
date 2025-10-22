@@ -225,7 +225,13 @@ class _TemporalConvBlock(nn.Module):
     """Temporal 2D convolutional block operating over time and joints."""
 
     def __init__(
-        self, embed_dim: int, kernel_size: int, dropout: float, dilation: int = 1
+        self,
+        embed_dim: int,
+        kernel_size: int,
+        dropout: float,
+        *,
+        dilation: int = 1,
+        negative_slope: float = 0.01,
     ) -> None:
         super().__init__()
         if kernel_size <= 0:
@@ -234,6 +240,8 @@ class _TemporalConvBlock(nn.Module):
             raise ValueError("kernel_size must be odd to preserve temporal dimensions")
         if dilation <= 0:
             raise ValueError("dilation must be a positive integer")
+        if negative_slope < 0:
+            raise ValueError("negative_slope must be non-negative")
 
         padding = (dilation * (kernel_size - 1) // 2, 0)
         self.depthwise = nn.Conv2d(
@@ -246,7 +254,7 @@ class _TemporalConvBlock(nn.Module):
             bias=False,
         )
         self.pointwise = nn.Conv2d(embed_dim, embed_dim, kernel_size=1, bias=False)
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU(negative_slope=negative_slope, inplace=True)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, inputs: Tensor) -> Tensor:
@@ -280,6 +288,7 @@ class KeypointStreamEncoder(nn.Module):
         use_global_attention: bool = False,
         global_attention_activation: str = "softmax",
         global_attention_mix: float = 0.5,
+        leaky_relu_negative_slope: float = 0.01,
     ) -> None:
         super().__init__()
         if in_dim <= 0:
@@ -290,6 +299,8 @@ class KeypointStreamEncoder(nn.Module):
             raise ValueError("temporal_blocks must be non-negative")
         if temporal_dilation <= 0:
             raise ValueError("temporal_dilation must be a positive integer")
+        if leaky_relu_negative_slope < 0:
+            raise ValueError("leaky_relu_negative_slope must be non-negative")
 
         self.in_dim = int(in_dim)
         self.embed_dim = int(embed_dim)
@@ -297,6 +308,7 @@ class KeypointStreamEncoder(nn.Module):
         self.temporal_blocks = int(temporal_blocks)
         self.temporal_kernel = int(temporal_kernel)
         self.temporal_dilation = int(temporal_dilation)
+        self.leaky_relu_negative_slope = float(leaky_relu_negative_slope)
 
         self.input_norm = nn.LayerNorm(self.in_dim)
         self.input_projection = nn.Linear(self.in_dim, self.embed_dim, bias=False)
@@ -317,6 +329,7 @@ class KeypointStreamEncoder(nn.Module):
                     self.temporal_kernel,
                     dropout,
                     dilation=self.temporal_dilation,
+                    negative_slope=self.leaky_relu_negative_slope,
                 )
                 for _ in range(self.temporal_blocks)
             ]
@@ -631,18 +644,30 @@ class MSKAOutput:
 class StreamCTCHead(nn.Module):
     """CTC classification head with temporal convolutions for individual streams."""
 
-    def __init__(self, in_dim: int, vocab_size: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        vocab_size: int,
+        dropout: float = 0.0,
+        *,
+        negative_slope: float = 0.01,
+    ) -> None:
         super().__init__()
         if in_dim <= 0:
             raise ValueError("in_dim must be positive")
         if vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
+        if negative_slope < 0:
+            raise ValueError("negative_slope must be non-negative")
         self.in_dim = int(in_dim)
         self.vocab_size = int(vocab_size)
         self.hidden_dim = self.in_dim
+        self.negative_slope = float(negative_slope)
 
         self.input_linear = nn.Linear(self.in_dim, self.hidden_dim)
-        self.input_activation = nn.ReLU(inplace=True)
+        self.input_activation = nn.LeakyReLU(
+            negative_slope=self.negative_slope, inplace=True
+        )
         self.input_norm_1d = nn.BatchNorm1d(self.hidden_dim)
         self.input_norm_2d = nn.BatchNorm2d(self.hidden_dim)
         self.temporal_conv_1d = nn.Conv1d(
@@ -726,8 +751,20 @@ class StreamCTCHead(nn.Module):
 class FusedCTCHead(StreamCTCHead):
     """CTC head operating on the fused stream representation with temporal context."""
 
-    def __init__(self, in_dim: int, vocab_size: int, dropout: float = 0.0) -> None:
-        super().__init__(in_dim, vocab_size, dropout=dropout)
+    def __init__(
+        self,
+        in_dim: int,
+        vocab_size: int,
+        dropout: float = 0.0,
+        *,
+        negative_slope: float = 0.01,
+    ) -> None:
+        super().__init__(
+            in_dim,
+            vocab_size,
+            dropout=dropout,
+            negative_slope=negative_slope,
+        )
 
 
 class MSKAEncoder(nn.Module):
@@ -752,16 +789,20 @@ class MSKAEncoder(nn.Module):
         global_attention_activation: str = "softmax",
         global_attention_mix: float = 0.5,
         global_attention_shared: bool = False,
+        leaky_relu_negative_slope: float = 0.01,
     ) -> None:
         super().__init__()
         if not stream_names:
             raise ValueError("stream_names must contain at least one entry")
         if not 0.0 <= global_attention_mix <= 1.0:
             raise ValueError("global_attention_mix must be between 0 and 1 inclusive")
+        if leaky_relu_negative_slope < 0:
+            raise ValueError("leaky_relu_negative_slope must be non-negative")
 
         self.embed_dim = embed_dim
         self.stream_names = tuple(stream_names)
         self.detach_teacher = detach_teacher
+        self.leaky_relu_negative_slope = float(leaky_relu_negative_slope)
         self._shared_global_store: Optional[_GlobalAttentionStore]
         if use_global_attention and global_attention_shared:
             self._shared_global_store = _GlobalAttentionStore()
@@ -780,6 +821,7 @@ class MSKAEncoder(nn.Module):
                     use_global_attention=use_global_attention,
                     global_attention_activation=global_attention_activation,
                     global_attention_mix=global_attention_mix,
+                    leaky_relu_negative_slope=self.leaky_relu_negative_slope,
                 )
                 for name in self.stream_names
             }
@@ -796,11 +838,21 @@ class MSKAEncoder(nn.Module):
         )
         self.stream_heads = nn.ModuleDict(
             {
-                name: StreamCTCHead(embed_dim, ctc_vocab_size, dropout=dropout)
+                name: StreamCTCHead(
+                    embed_dim,
+                    ctc_vocab_size,
+                    dropout=dropout,
+                    negative_slope=self.leaky_relu_negative_slope,
+                )
                 for name in self.stream_names
             }
         )
-        self.fuse_head = FusedCTCHead(embed_dim, ctc_vocab_size, dropout=dropout)
+        self.fuse_head = FusedCTCHead(
+            embed_dim,
+            ctc_vocab_size,
+            dropout=dropout,
+            negative_slope=self.leaky_relu_negative_slope,
+        )
         self._last_output: Optional[MSKAOutput] = None
 
     def forward(

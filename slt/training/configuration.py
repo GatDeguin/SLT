@@ -20,6 +20,7 @@ class ModelConfig:
     pose_landmarks: int = 13
     projector_dropout: float = 0.05
     fusion_dropout: float = 0.05
+    leaky_relu_negative_slope: float = 0.01
     temporal_nhead: int = 4
     temporal_layers: int = 3
     temporal_dim_feedforward: int = 384
@@ -60,7 +61,7 @@ class ModelConfig:
     mska_distillation_weight: float = 0.0
     mska_distillation_temperature: float = 1.0
     mska_gloss_hidden_dim: Optional[int] = None
-    mska_gloss_activation: str = "gelu"
+    mska_gloss_activation: str = "leaky_relu"
     mska_gloss_dropout: float = 0.0
     mska_gloss_fusion: str = "add"
 

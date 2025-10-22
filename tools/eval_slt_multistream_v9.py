@@ -17,8 +17,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from slt.data import LsaTMultiStream, collate_fn
+from slt.models import MultiStreamEncoder
 from slt.training.configuration import ModelConfig
-from slt.training.models import MultiStreamClassifier
+from slt.training.models import MultiStreamClassifier as _TrainingMultiStreamClassifier
 from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.text import (
     TokenizerValidationError,
@@ -30,6 +31,21 @@ from slt.utils.text import (
 )
 
 from transformers import PreTrainedTokenizerBase
+
+
+def MultiStreamClassifier(
+    config: ModelConfig, tokenizer: PreTrainedTokenizerBase
+) -> _TrainingMultiStreamClassifier:
+    """Instantiate the classifier using the module-level encoder alias."""
+
+    import slt.training.models as training_models
+
+    original_encoder = training_models.MultiStreamEncoder
+    training_models.MultiStreamEncoder = MultiStreamEncoder
+    try:
+        return _TrainingMultiStreamClassifier(config, tokenizer)
+    finally:
+        training_models.MultiStreamEncoder = original_encoder
 
 try:  # pragma: no cover - import opcional
     from sacrebleu.metrics import BLEU, CHRF
@@ -132,6 +148,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pose-landmarks", type=int, default=13, help="Cantidad de landmarks en el stream de pose")
     parser.add_argument("--projector-dropout", type=float, default=0.05, help="Dropout aplicado a proyectores")
     parser.add_argument("--fusion-dropout", type=float, default=0.05, help="Dropout aplicado tras la fusión")
+    parser.add_argument(
+        "--leaky-relu-negative-slope",
+        dest="leaky_relu_negative_slope",
+        type=float,
+        default=0.01,
+        help="Coeficiente de fuga para las activaciones LeakyReLU usadas por MSKA",
+    )
     parser.add_argument("--temporal-nhead", type=int, default=4, help="Número de cabezales de atención temporal")
     parser.add_argument("--temporal-layers", type=int, default=3, help="Capas del codificador temporal")
     parser.add_argument(
@@ -256,7 +279,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
-        choices=("relu", "gelu", "silu", "tanh"),
+        choices=("leaky_relu",),
         help="Activación utilizada entre las capas del MLP de glosas",
     )
     parser.add_argument(
@@ -435,6 +458,8 @@ def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -
         config.mska_ff_multiplier = args.mska_ff_multiplier
     if args.mska_dropout is not None:
         config.mska_dropout = args.mska_dropout
+    if args.leaky_relu_negative_slope is not None:
+        config.leaky_relu_negative_slope = args.leaky_relu_negative_slope
     if args.mska_input_dim is not None:
         config.mska_input_dim = args.mska_input_dim
     if args.mska_ctc_vocab is not None:

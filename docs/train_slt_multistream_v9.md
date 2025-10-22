@@ -30,9 +30,9 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
    combina automáticamente las pérdidas activas y registra cada término en
    `metrics.jsonl`. Cuando MSKA está activado, la representación fusionada de
    keypoints se proyecta mediante un MLP configurable de dos capas
-   (`Linear → activación → Dropout opcional → Linear`) y se expone al decoder
-   como secuencia de glosas para aplicar la combinación LSLT de traducción y
-   reconocimiento.
+   (`Linear → LeakyReLU → Dropout opcional → Linear`) cuyo coeficiente de fuga es
+   configurable (0.01 por defecto) y se expone al decoder como secuencia de
+   glosas para aplicar la combinación LSLT de traducción y reconocimiento.
 4. **Evaluación y exportación**: reutiliza las mismas banderas MSKA en
    `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
    mantener consistencia entre entrenamiento, evaluación y despliegue.
@@ -122,6 +122,7 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--mska-heads` | Número de cabezas en la atención multi-stream. |
 | `--mska-ff-multiplier` | Factor del bloque feed-forward dentro de la atención. |
 | `--mska-dropout` | Dropout aplicado a proyectores y cabezas MSKA. |
+| `--leaky-relu-negative-slope` | Coeficiente de fuga de LeakyReLU en MSKA (default: 0.01). |
 | `--mska-input-dim` | Dimensionalidad de los keypoints de entrada. |
 | `--mska-use-sgr` / `--mska-no-sgr` | Activa o desactiva la matriz global compartida (SGR). |
 | `--mska-sgr-activation` | Activación aplicada a la matriz SGR (`softmax`/`sigmoid`/`tanh`/`relu`/`identity`). |
@@ -138,7 +139,7 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--mska-distillation-weight` | Peso del término de distilación. |
 | `--mska-distillation-temperature` | Temperatura aplicada al término de distilación. |
 | `--mska-gloss-hidden-dim` | Dimensión oculta del MLP que proyecta la secuencia MSKA. |
-| `--mska-gloss-activation` | Activación empleada entre las dos capas del MLP de glosas. |
+| `--mska-gloss-activation` | Activación del MLP de glosas (`leaky_relu`). |
 | `--mska-gloss-dropout` | Dropout aplicado entre las capas del MLP de glosas. |
 | `--mska-gloss-fusion` | Fusión de glosas con el decoder (`add`/`concat`/`none`). |
 

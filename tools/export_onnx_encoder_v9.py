@@ -58,6 +58,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int, default=128, help="Temporal length used to build the dummy inputs")
     parser.add_argument("--projector-dropout", type=float, default=0.05, help="Dropout applied inside the projectors")
     parser.add_argument("--fusion-dropout", type=float, default=0.05, help="Dropout applied before stream fusion")
+    parser.add_argument(
+        "--leaky-relu-negative-slope",
+        dest="leaky_relu_negative_slope",
+        type=float,
+        default=0.01,
+        help="Negative slope used by LeakyReLU activations within MSKA components",
+    )
     parser.add_argument("--temporal-nhead", type=int, default=4, help="Number of attention heads in the temporal encoder")
     parser.add_argument("--temporal-layers", type=int, default=3, help="Number of transformer layers in the temporal encoder")
     parser.add_argument(
@@ -143,7 +150,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
-        choices=("relu", "gelu", "silu", "tanh"),
+        choices=("leaky_relu",),
         help="Activation function applied inside the gloss MLP",
     )
     parser.add_argument(
@@ -314,8 +321,13 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         "dim_feedforward": args.temporal_dim_feedforward,
         "dropout": args.temporal_dropout,
     }
+    leaky_slope = getattr(args, "leaky_relu_negative_slope", 0.01)
+    setattr(args, "leaky_relu_negative_slope", leaky_slope)
+    gloss_hidden = getattr(args, "mska_gloss_hidden_dim", None)
+    gloss_activation = getattr(args, "mska_gloss_activation", None)
+    gloss_dropout = getattr(args, "mska_gloss_dropout", None)
     mska_encoder = None
-    if args.use_mska:
+    if getattr(args, "use_mska", False):
         if args.mska_ctc_vocab is None:
             raise ValueError("--mska-ctc-vocab is required when --use-mska is set")
         heads = args.mska_heads if args.mska_heads is not None else 4
@@ -340,6 +352,7 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
             global_attention_activation=sgr_activation,
             global_attention_mix=sgr_mix,
             global_attention_shared=shared_sgr,
+            leaky_relu_negative_slope=leaky_slope,
         )
 
     encoder = MultiStreamEncoder(
@@ -350,11 +363,12 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         positional_num_positions=args.sequence_length,
         projector_dropout=args.projector_dropout,
         fusion_dropout=args.fusion_dropout,
+        leaky_relu_negative_slope=leaky_slope,
         temporal_kwargs=temporal_kwargs,
-        mska=mska_encoder,
-        mska_gloss_hidden_dim=args.mska_gloss_hidden_dim,
-        mska_gloss_activation=args.mska_gloss_activation or "gelu",
-        mska_gloss_dropout=args.mska_gloss_dropout if args.mska_gloss_dropout is not None else 0.0,
+            mska=mska_encoder,
+        mska_gloss_hidden_dim=gloss_hidden,
+        mska_gloss_activation=gloss_activation or "leaky_relu",
+        mska_gloss_dropout=gloss_dropout if gloss_dropout is not None else 0.0,
     )
     setattr(args, "_packaged_meta", {})
     return encoder
