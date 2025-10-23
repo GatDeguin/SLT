@@ -143,6 +143,7 @@ class MultiStreamClassifier(nn.Module):
             backbones=external_backbones if external_backbones else None,
             mska=mska_encoder,
             mska_gloss_hidden_dim=config.mska_gloss_hidden_dim,
+            mska_gloss_second_hidden_dim=config.mska_gloss_second_hidden_dim,
             mska_gloss_activation=config.mska_gloss_activation,
             mska_gloss_dropout=config.mska_gloss_dropout,
         )

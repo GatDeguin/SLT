@@ -48,6 +48,8 @@ cuando necesites procesar videos o ejecutar demos.
   distilación.
 - `--mska-ctc-vocab`, `--mska-input-dim`, `--mska-detach-teacher`: parámetros
   estructurales del encoder MSKA.
+- `--mska-gloss-hidden-dim`, `--mska-gloss-second-hidden-dim`,
+  `--mska-gloss-dropout`: definen el MLP aplicado a la secuencia de glosas MSKA.
 
 ### Augmentaciones de keypoints
 
@@ -95,6 +97,9 @@ model:
   mska_ctc_weight: 0.2
   mska_distillation_weight: 0.1
   mska_distillation_temperature: 2.0
+  mska_gloss_hidden_dim: 192
+  mska_gloss_second_hidden_dim: 128
+  mska_gloss_dropout: 0.1
 training:
   epochs: 30
 optim:
@@ -123,7 +128,10 @@ optim:
     "mska_translation_weight": 0.7,
     "mska_ctc_weight": 0.2,
     "mska_distillation_weight": 0.1,
-    "mska_distillation_temperature": 2.0
+    "mska_distillation_temperature": 2.0,
+    "mska_gloss_hidden_dim": 192,
+    "mska_gloss_second_hidden_dim": 128,
+    "mska_gloss_dropout": 0.1
   },
   "training": {
     "epochs": 30

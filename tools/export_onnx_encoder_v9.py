@@ -148,6 +148,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Hidden dimension of the MSKA gloss MLP",
     )
     parser.add_argument(
+        "--mska-gloss-second-hidden-dim",
+        dest="mska_gloss_second_hidden_dim",
+        type=int,
+        help="Second hidden size used inside the MSKA gloss MLP",
+    )
+    parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
         choices=("leaky_relu",),
@@ -281,6 +287,18 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         )
         args.projector_dropout = float(encoder_kwargs.get("projector_dropout", args.projector_dropout))
         args.fusion_dropout = float(encoder_kwargs.get("fusion_dropout", args.fusion_dropout))
+        if "mska_gloss_hidden_dim" in encoder_kwargs:
+            setattr(
+                args,
+                "mska_gloss_hidden_dim",
+                encoder_kwargs["mska_gloss_hidden_dim"],
+            )
+        if "mska_gloss_second_hidden_dim" in encoder_kwargs:
+            setattr(
+                args,
+                "mska_gloss_second_hidden_dim",
+                encoder_kwargs["mska_gloss_second_hidden_dim"],
+            )
         args.temporal_nhead = int(temporal_kwargs.get("nhead", args.temporal_nhead))
         args.temporal_layers = int(temporal_kwargs.get("nlayers", args.temporal_layers))
         args.temporal_dim_feedforward = int(
@@ -324,6 +342,7 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
     leaky_slope = getattr(args, "leaky_relu_negative_slope", 0.01)
     setattr(args, "leaky_relu_negative_slope", leaky_slope)
     gloss_hidden = getattr(args, "mska_gloss_hidden_dim", None)
+    gloss_second_hidden = getattr(args, "mska_gloss_second_hidden_dim", None)
     gloss_activation = getattr(args, "mska_gloss_activation", None)
     gloss_dropout = getattr(args, "mska_gloss_dropout", None)
     mska_encoder = None
@@ -365,8 +384,9 @@ def _build_encoder(args: argparse.Namespace) -> MultiStreamEncoder:
         fusion_dropout=args.fusion_dropout,
         leaky_relu_negative_slope=leaky_slope,
         temporal_kwargs=temporal_kwargs,
-            mska=mska_encoder,
+        mska=mska_encoder,
         mska_gloss_hidden_dim=gloss_hidden,
+        mska_gloss_second_hidden_dim=gloss_second_hidden,
         mska_gloss_activation=gloss_activation or "leaky_relu",
         mska_gloss_dropout=gloss_dropout if gloss_dropout is not None else 0.0,
     )

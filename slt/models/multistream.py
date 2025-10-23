@@ -76,6 +76,7 @@ class MultiStreamEncoder(torch.nn.Module):
         ] = None,
         mska: Optional["MSKAEncoder"] = None,
         mska_gloss_hidden_dim: Optional[int] = None,
+        mska_gloss_second_hidden_dim: Optional[int] = None,
         mska_gloss_activation: str = "leaky_relu",
         mska_gloss_dropout: float = 0.0,
     ) -> None:
@@ -156,18 +157,38 @@ class MultiStreamEncoder(torch.nn.Module):
             hidden_dim = int(mska_gloss_hidden_dim) if mska_gloss_hidden_dim else d_model
             if hidden_dim <= 0:
                 raise ValueError("mska_gloss_hidden_dim must be positive")
+            second_hidden_dim: Optional[int]
+            if mska_gloss_second_hidden_dim is None:
+                second_hidden_dim = None
+            else:
+                second_hidden_dim = int(mska_gloss_second_hidden_dim)
+                if second_hidden_dim <= 0:
+                    raise ValueError("mska_gloss_second_hidden_dim must be positive")
             if mska_gloss_dropout < 0:
                 raise ValueError("mska_gloss_dropout must be non-negative")
-            activation = self._build_gloss_activation(
-                mska_gloss_activation, self._leaky_relu_negative_slope
-            )
+            def _make_activation() -> torch.nn.Module:
+                return self._build_gloss_activation(
+                    mska_gloss_activation, self._leaky_relu_negative_slope
+                )
+
             layers: list[torch.nn.Module] = [
                 torch.nn.Linear(projector_dim, hidden_dim),
-                activation,
+                _make_activation(),
             ]
             if mska_gloss_dropout > 0.0:
                 layers.append(torch.nn.Dropout(mska_gloss_dropout))
-            layers.append(torch.nn.Linear(hidden_dim, d_model))
+            output_dim = hidden_dim
+            if second_hidden_dim is not None:
+                layers.extend(
+                    [
+                        torch.nn.Linear(hidden_dim, second_hidden_dim),
+                        _make_activation(),
+                    ]
+                )
+                if mska_gloss_dropout > 0.0:
+                    layers.append(torch.nn.Dropout(mska_gloss_dropout))
+                output_dim = second_hidden_dim
+            layers.append(torch.nn.Linear(output_dim, d_model))
             self._mska_gloss_mlp = torch.nn.Sequential(*layers)
             self._mska_streams = {
                 name: name

@@ -415,6 +415,12 @@ def parse_args() -> argparse.Namespace:
         help="Hidden dimension of the gloss MLP applied to MSKA fused embeddings",
     )
     parser.add_argument(
+        "--mska-gloss-second-hidden-dim",
+        dest="mska_gloss_second_hidden_dim",
+        type=int,
+        help="Second hidden size of the MSKA gloss MLP before the projection",
+    )
+    parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
         choices=("leaky_relu",),
