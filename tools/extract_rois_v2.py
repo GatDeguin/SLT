@@ -29,6 +29,15 @@ _MP_WARNING = (
 )
 
 
+FACE_KEEP_MOUTH_IDXS = list(range(0, 18)) + list(range(61, 91))
+FACE_KEEP_LEFT_EYE_IDXS = list(range(33, 134))
+FACE_KEEP_RIGHT_EYE_IDXS = list(range(263, 363))
+FACE_KEEP_INDICES = set(
+    FACE_KEEP_MOUTH_IDXS + FACE_KEEP_LEFT_EYE_IDXS + FACE_KEEP_RIGHT_EYE_IDXS
+)
+FACE_POSE_INDICES = tuple(range(11))
+
+
 def ensure_dir(path: str | os.PathLike[str]) -> Path:
     """Crea el directorio indicado (y padres) si no existe."""
 
@@ -152,40 +161,161 @@ def resolve_hand_bbox(
     return None, "black"
 
 
-def blur_face_preserve_eyes_mouth(
-    frame: np.ndarray,
+def face_bbox_from_pose(
+    pose_landmarks: Optional[object],
+    frame_width: int,
+    frame_height: int,
+    scale: float = 1.4,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Construye un *bounding box* facial aproximado a partir de la pose."""
+
+    if pose_landmarks is None:
+        return None
+
+    try:
+        iterator = pose_landmarks.landmark  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+
+    xs: List[int] = []
+    ys: List[int] = []
+    for idx in FACE_POSE_INDICES:
+        try:
+            landmark = iterator[idx]
+        except (IndexError, TypeError):
+            continue
+        lx = getattr(landmark, "x", None)
+        ly = getattr(landmark, "y", None)
+        if lx is None or ly is None:
+            continue
+        xs.append(int(round(float(lx) * frame_width)))
+        ys.append(int(round(float(ly) * frame_height)))
+
+    if not xs or not ys:
+        return None
+
+    x_min = max(0, min(xs))
+    y_min = max(0, min(ys))
+    x_max = min(frame_width, max(xs))
+    y_max = min(frame_height, max(ys))
+
+    width = x_max - x_min
+    height = y_max - y_min
+    if width <= 0 or height <= 0:
+        return None
+
+    x, y, w, h = expand_clamp_bbox(
+        x_min,
+        y_min,
+        width,
+        height,
+        scale,
+        frame_width,
+        frame_height,
+    )
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def resolve_face_bbox(
+    detected_bbox: Optional[Tuple[int, int, int, int]],
+    pose_landmarks: Optional[object],
+    prev_bbox: Optional[Tuple[int, int, int, int]],
+    frame_width: int,
+    frame_height: int,
+    scale: float = 1.4,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str]:
+    """Selecciona el *bounding box* más apropiado para la cara."""
+
+    if detected_bbox and detected_bbox[2] > 0 and detected_bbox[3] > 0:
+        return detected_bbox, "detected"
+
+    if prev_bbox is not None and prev_bbox[2] > 0 and prev_bbox[3] > 0:
+        return prev_bbox, "previous"
+
+    pose_bbox = face_bbox_from_pose(pose_landmarks, frame_width, frame_height, scale)
+    if pose_bbox is not None:
+        return pose_bbox, "pose"
+
+    return None, "black"
+
+
+def build_face_keep_mask(
     face_landmarks: Optional[object],
+    bbox: Tuple[int, int, int, int],
+    frame_shape: Tuple[int, int],
     keep_radius: int = 6,
 ) -> np.ndarray:
-    """Aplica desenfoque a la cara conservando ojos y boca."""
+    """Genera una máscara binaria para preservar ojos y boca."""
 
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return np.zeros((max(h, 0), max(w, 0)), dtype=np.uint8)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
     if face_landmarks is None:
-        return frame
+        return mask
 
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    height, width = frame.shape[:2]
+    try:
+        iterator = face_landmarks.landmark  # type: ignore[attr-defined]
+    except AttributeError:
+        return mask
 
-    # Índices aproximados basados en la malla MediaPipe Face Mesh.
-    mouth_idxs = list(range(0, 18)) + list(range(61, 91))
-    left_eye_idxs = list(range(33, 134))
-    right_eye_idxs = list(range(263, 363))
-    keep_indices = set(mouth_idxs + left_eye_idxs + right_eye_idxs)
-
-    for idx, landmark in enumerate(face_landmarks.landmark):
-        if idx not in keep_indices:
+    frame_height, frame_width = frame_shape
+    for idx in FACE_KEEP_INDICES:
+        try:
+            landmark = iterator[idx]
+        except (IndexError, TypeError):
             continue
-        px = int(round(landmark.x * width))
-        py = int(round(landmark.y * height))
-        if 0 <= px < width and 0 <= py < height:
+        lx = getattr(landmark, "x", None)
+        ly = getattr(landmark, "y", None)
+        if lx is None or ly is None:
+            continue
+        px = int(round(float(lx) * frame_width)) - x
+        py = int(round(float(ly) * frame_height)) - y
+        if 0 <= px < w and 0 <= py < h:
             cv2.circle(mask, (px, py), keep_radius, 255, -1)
 
-    if mask.max() == 0:
-        return frame
+    return mask
 
-    blurred = cv2.GaussianBlur(frame, (31, 31), 0)
+
+def apply_face_partial_grayscale(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Convierte a escala de grises fuera de las zonas preservadas."""
+
+    if patch.size == 0:
+        return patch
+
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if mask.size == 0 or mask.max() == 0:
+        return gray_bgr
+
     mask3 = cv2.merge([mask, mask, mask])
     inv_mask = cv2.bitwise_not(mask3)
-    return cv2.bitwise_and(blurred, inv_mask) + cv2.bitwise_and(frame, mask3)
+    color_part = cv2.bitwise_and(patch, mask3)
+    gray_part = cv2.bitwise_and(gray_bgr, inv_mask)
+    return cv2.add(color_part, gray_part)
+
+
+def blur_face_preserve_eyes_mouth(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Aplica desenfoque manteniendo intactas las zonas preservadas."""
+
+    if patch.size == 0:
+        return patch
+
+    gray_full = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    gray_full_bgr = cv2.cvtColor(gray_full, cv2.COLOR_GRAY2BGR)
+
+    if mask.size == 0 or mask.max() == 0:
+        return cv2.GaussianBlur(gray_full_bgr, (31, 31), 0)
+
+    mask3 = cv2.merge([mask, mask, mask])
+    inv_mask = cv2.bitwise_not(mask3)
+    blurred = cv2.GaussianBlur(gray_full_bgr, (31, 31), 0)
+    kept = cv2.bitwise_and(patch, mask3)
+    blurred_rest = cv2.bitwise_and(blurred, inv_mask)
+    return cv2.add(kept, blurred_rest)
 
 
 def _ensure_mediapipe_available() -> bool:
@@ -223,6 +353,7 @@ def process_video(
     }
 
     metadata["fallbacks"] = {
+        "face": {"pose": 0, "previous": 0, "black": 0},
         "hand_left": {"pose": 0, "previous": 0, "black": 0},
         "hand_right": {"pose": 0, "previous": 0, "black": 0},
     }
@@ -285,24 +416,64 @@ def process_video(
                 face_result = face_mesh.process(rgb)
                 hands_result = hands.process(rgb)
                 pose_result = pose.process(rgb)
+                pose_landmarks = getattr(pose_result, "pose_landmarks", None)
 
                 # Cara
                 face_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
-                if face_result.multi_face_landmarks:
-                    face_landmarks = face_result.multi_face_landmarks[0]
+                face_landmarks = (
+                    face_result.multi_face_landmarks[0]
+                    if face_result.multi_face_landmarks
+                    else None
+                )
+                detected_face_bbox: Optional[Tuple[int, int, int, int]] = None
+                if face_landmarks is not None:
                     xs = [int(landmark.x * width) for landmark in face_landmarks.landmark]
                     ys = [int(landmark.y * height) for landmark in face_landmarks.landmark]
                     x1 = max(0, min(xs))
                     y1 = max(0, min(ys))
                     x2 = min(width, max(xs))
                     y2 = min(height, max(ys))
-                    x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
+                    detected_face_bbox = expand_clamp_bbox(
+                        x1,
+                        y1,
+                        x2 - x1,
+                        y2 - y1,
+                        1.2,
+                        width,
+                        height,
+                    )
 
-                    source_frame = blur_face_preserve_eyes_mouth(frame, face_landmarks) if face_blur else frame
-                    patch = source_frame[y : y + h, x : x + w]
-                    face_crop = crop_square(patch, 0, 0, patch.shape[1], patch.shape[0], 224)
-                    if w > 0 and h > 0:
-                        prev_face_bbox = (x, y, w, h)
+                face_bbox, face_source = resolve_face_bbox(
+                    detected_face_bbox,
+                    pose_landmarks,
+                    prev_face_bbox,
+                    width,
+                    height,
+                )
+                if face_source != "detected":
+                    metadata["fallbacks"]["face"][face_source] += 1
+
+                if face_bbox is not None and face_bbox[2] > 0 and face_bbox[3] > 0:
+                    x, y, w, h = face_bbox
+                    face_patch = frame[y : y + h, x : x + w]
+                    mask = build_face_keep_mask(face_landmarks, face_bbox, (height, width))
+                    gray_patch = apply_face_partial_grayscale(face_patch, mask)
+                    processed_patch = (
+                        blur_face_preserve_eyes_mouth(gray_patch, mask)
+                        if face_blur
+                        else gray_patch
+                    )
+                    face_crop = crop_square(
+                        processed_patch,
+                        0,
+                        0,
+                        processed_patch.shape[1],
+                        processed_patch.shape[0],
+                        224,
+                    )
+                    prev_face_bbox = face_bbox
+                else:
+                    prev_face_bbox = None
 
                 cv2.imwrite(str(face_out / f"{basename}_f{out_index:06d}.jpg"), face_crop)
 
@@ -326,7 +497,6 @@ def process_video(
                         else:
                             right_detected = bbox
 
-                pose_landmarks = getattr(pose_result, "pose_landmarks", None)
                 left_bbox, left_source = resolve_hand_bbox(
                     left_detected,
                     pose_landmarks,
