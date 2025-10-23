@@ -520,3 +520,83 @@ def test_gloss_mlp_uses_leaky_relu_activation() -> None:
     )
     assert activation is not None
     assert abs(activation.negative_slope - slope) < 1e-6
+
+def test_gloss_mlp_two_hidden_layers_produce_expected_sequence() -> None:
+    class DummyMSKA(torch.nn.Module):
+        def __init__(self, embed_dim: int, seq_len: int) -> None:
+            super().__init__()
+            self.embed_dim = embed_dim
+            self.stream_names = ("face", "hand_left", "hand_right", "pose")
+            self._seq_len = seq_len
+
+        def forward(self, keypoint_streams):
+            first_stream = next(iter(keypoint_streams.values()))
+            batch = first_stream["points"].shape[0]
+            fused_embedding = torch.ones(batch, self._seq_len, self.embed_dim)
+            fused_mask = torch.ones(batch, self._seq_len, dtype=torch.bool)
+            stream_embeddings = {
+                name: torch.zeros(batch, self._seq_len, self.embed_dim)
+                for name in self.stream_names
+            }
+            payload = {
+                "stream_embeddings": stream_embeddings,
+                "joint_embeddings": {},
+                "stream_masks": {},
+                "frame_masks": {},
+                "fused_embedding": fused_embedding,
+                "fused_mask": fused_mask,
+                "attention": None,
+            }
+            return types.SimpleNamespace(**payload)
+
+    batch, time = 2, 3
+    projector_dim = 8
+    d_model = 16
+    first_hidden = 12
+    second_hidden = 10
+    dummy_mska = DummyMSKA(embed_dim=projector_dim, seq_len=time)
+    encoder = _make_encoder(
+        projector_dim=projector_dim,
+        d_model=d_model,
+        pose_dim=39,
+        positional_num_positions=time,
+        temporal_kwargs={"nhead": 2, "nlayers": 1, "dim_feedforward": 32},
+        mska=dummy_mska,
+        mska_gloss_hidden_dim=first_hidden,
+        mska_gloss_second_hidden_dim=second_hidden,
+        mska_gloss_dropout=0.25,
+    )
+
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+    keypoint_streams = {
+        name: {"points": torch.randn(batch, time, 3)}
+        for name in ("face", "hand_left", "hand_right", "pose")
+    }
+
+    _ = encoder(
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        keypoint_streams=keypoint_streams,
+    )
+
+    gloss_sequence = encoder.last_gloss_sequence
+    gloss_mask = encoder.last_gloss_mask
+    assert gloss_sequence is not None
+    assert gloss_sequence.shape == (batch, time, d_model)
+    assert gloss_mask is not None
+    assert gloss_mask.shape == (batch, time)
+
+    mlp = encoder._mska_gloss_mlp
+    assert mlp is not None
+    assert isinstance(mlp[0], torch.nn.Linear)
+    assert isinstance(mlp[3], torch.nn.Linear)
+    assert isinstance(mlp[-1], torch.nn.Linear)
+    assert mlp[0].out_features == first_hidden
+    assert mlp[3].out_features == second_hidden
+    assert mlp[-1].in_features == second_hidden
+

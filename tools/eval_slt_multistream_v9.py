@@ -277,6 +277,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Dimensión oculta del MLP de glosas aplicado a MSKA",
     )
     parser.add_argument(
+        "--mska-gloss-second-hidden-dim",
+        dest="mska_gloss_second_hidden_dim",
+        type=int,
+        help="Segunda dimensión oculta del MLP de glosas antes de proyectar",
+    )
+    parser.add_argument(
         "--mska-gloss-activation",
         dest="mska_gloss_activation",
         choices=("leaky_relu",),
@@ -476,6 +482,8 @@ def _build_model(args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase) -
         config.mska_detach_teacher = bool(args.mska_detach_teacher)
     if args.mska_gloss_hidden_dim is not None:
         config.mska_gloss_hidden_dim = args.mska_gloss_hidden_dim
+    if args.mska_gloss_second_hidden_dim is not None:
+        config.mska_gloss_second_hidden_dim = args.mska_gloss_second_hidden_dim
     if args.mska_gloss_activation is not None:
         config.mska_gloss_activation = args.mska_gloss_activation
     if args.mska_gloss_dropout is not None:

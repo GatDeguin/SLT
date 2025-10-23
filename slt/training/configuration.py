@@ -61,6 +61,7 @@ class ModelConfig:
     mska_distillation_weight: float = 0.0
     mska_distillation_temperature: float = 1.0
     mska_gloss_hidden_dim: Optional[int] = None
+    mska_gloss_second_hidden_dim: Optional[int] = None
     mska_gloss_activation: str = "leaky_relu"
     mska_gloss_dropout: float = 0.0
     mska_gloss_fusion: str = "add"

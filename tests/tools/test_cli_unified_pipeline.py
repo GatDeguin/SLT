@@ -189,6 +189,7 @@ def test_unified_cli_pipeline_with_mska(tmp_path: Path, monkeypatch: pytest.Monk
             "mska_distillation_weight": 0.1,
             "mska_distillation_temperature": 2.0,
             "mska_gloss_hidden_dim": 12,
+            "mska_gloss_second_hidden_dim": 10,
             "mska_gloss_activation": "leaky_relu",
             "mska_gloss_dropout": 0.1,
             "mska_gloss_fusion": "add",

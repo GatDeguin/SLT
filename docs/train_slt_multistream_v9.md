@@ -29,9 +29,11 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
    `--mska-distillation-weight` según el objetivo del experimento. El modelo
    combina automáticamente las pérdidas activas y registra cada término en
    `metrics.jsonl`. Cuando MSKA está activado, la representación fusionada de
-   keypoints se proyecta mediante un MLP configurable de dos capas
-   (`Linear → LeakyReLU → Dropout opcional → Linear`) cuyo coeficiente de fuga es
-   configurable (0.01 por defecto) y se expone al decoder como secuencia de
+   keypoints se proyecta mediante un MLP con hasta dos capas ocultas
+   (`Linear → LeakyReLU → Dropout opcional → Linear → LeakyReLU → Dropout
+   opcional → Linear`) controladas por `--mska-gloss-hidden-dim` y
+   `--mska-gloss-second-hidden-dim`; el coeficiente de fuga (0.01 por defecto)
+   se mantiene compartido y la secuencia resultante se expone al decoder como
    glosas para aplicar la combinación LSLT de traducción y reconocimiento.
 4. **Evaluación y exportación**: reutiliza las mismas banderas MSKA en
    `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
@@ -139,6 +141,7 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--mska-distillation-weight` | Peso del término de distilación. |
 | `--mska-distillation-temperature` | Temperatura aplicada al término de distilación. |
 | `--mska-gloss-hidden-dim` | Dimensión oculta del MLP que proyecta la secuencia MSKA. |
+| `--mska-gloss-second-hidden-dim` | Segunda capa oculta del MLP de glosas. |
 | `--mska-gloss-activation` | Activación del MLP de glosas (`leaky_relu`). |
 | `--mska-gloss-dropout` | Dropout aplicado entre las capas del MLP de glosas. |
 | `--mska-gloss-fusion` | Fusión de glosas con el decoder (`add`/`concat`/`none`). |
@@ -177,6 +180,16 @@ training:
   epochs: 40
 optim:
   lr: 0.0005
+```
+
+Ejemplo de MLP MSKA con dos capas ocultas y dropout:
+
+```yaml
+model:
+  use_mska: true
+  mska_gloss_hidden_dim: 256
+  mska_gloss_second_hidden_dim: 128
+  mska_gloss_dropout: 0.1
 ```
 
 Sobrescribe campos puntuales usando `--set clave=valor`, por ejemplo:
