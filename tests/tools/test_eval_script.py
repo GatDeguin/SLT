@@ -42,7 +42,11 @@ def synthetic_dataset(tmp_path: Path) -> dict:
         save_frame(hand_r_dir, i)
 
     pose = np.random.rand(4, 3 * 13).astype("float32")
-    np.savez(pose_dir / f"{video_id}.npz", pose=pose)
+    np.savez(
+        pose_dir / f"{video_id}.npz",
+        pose=pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
     keypoints = np.random.rand(4, 79, 3).astype("float32")
     keypoints[:, :, 2] = np.random.uniform(0.7, 1.0, size=(4, 79)).astype("float32")

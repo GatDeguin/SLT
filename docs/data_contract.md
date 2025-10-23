@@ -36,8 +36,12 @@ Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
   de ROIs.
 - `processed/face/`, `processed/hand_l/`, `processed/hand_r/`: recortes en JPEG
   con patrón `<video_id>_fXXXXXX.jpg`, normalizados a RGB.
-- `processed/pose/`: archivos `.npz` que contienen un arreglo `pose` de forma
-  `(T, 3 * landmarks)` con `float32` y opcionalmente un `pose_conf`.
+- `processed/pose/`: archivos `.npz` con un arreglo `pose` de forma
+  `(T, 3 * landmarks)` en `float32` y la clave `pose_norm="signing_space_v1"`.
+  Las coordenadas `(x, y)` se normalizan al *signing space* (ancho de 6 y alto
+  de 7 unidades de cabeza) para quedar en el rango `[0, 1]` centradas en
+  `(0.5, 0.5)`. Cuando no hay landmarks válidos se escribe un sentinel con
+  `-1` en las coordenadas y visibilidad `0`.
 - `processed/keypoints/`: matrices `.npy` o `.npz` con keypoints MediaPipe en
   formato `(T, landmarks, 3)` donde la última dimensión guarda `(x, y, conf)`.
 - `index/*.csv`: listas de `video_id` (una columna, sin encabezado) utilizadas
@@ -81,9 +85,10 @@ Cada ejemplo entregado por el dataset incluye:
 
 - `face`, `hand_l`, `hand_r`: tensores `(T, 3, H, W)` normalizados con medias y
   desviaciones de ImageNet.
-- `pose`: tensor `(T, 3 * landmarks)` con poses reescaladas a `[-1, 1]`.
+- `pose`: tensor `(T, 3 * landmarks)` con coordenadas en `[0, 1]` dentro del
+  *signing space* y sentinels `-1` cuando no hay detección confiable.
 - `pose_conf_mask`: máscara booleana `(T, landmarks)` para filtrar poses
-  inestables.
+  inestables; ignora automáticamente los sentinels negativos.
 - `pad_mask`: máscara booleana `(T,)` con los frames válidos tras truncado.
 - `length`: longitud efectiva calculada como `pad_mask.sum()`.
 - `miss_mask_hl` / `miss_mask_hr`: marcan frames sin detección confiable de

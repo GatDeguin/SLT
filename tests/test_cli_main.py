@@ -39,7 +39,11 @@ def cli_dataset(tmp_path: Path) -> SimpleNamespace:
             Image.fromarray(frame, mode="RGB").save(path)
 
     pose = np.random.RandomState(0).rand(3, 3 * 13).astype("float32")
-    np.savez(pose_dir / f"{video_id}.npz", pose=pose)
+    np.savez(
+        pose_dir / f"{video_id}.npz",
+        pose=pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
     return SimpleNamespace(
         face_dir=face_dir,

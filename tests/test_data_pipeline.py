@@ -32,7 +32,11 @@ def sample_dataset_paths(tmp_path):
 
     pose = np.zeros((3, 17 * 3), dtype=np.float32)
     pose[:, 2::3] = 0.9
-    np.savez_compressed(pose_dir / "vid1.npz", pose=pose)
+    np.savez_compressed(
+        pose_dir / "vid1.npz",
+        pose=pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
     keypoints = np.random.rand(3, 79, 3).astype(np.float32)
     keypoints[:, :, 2] = np.random.uniform(0.7, 1.0, size=(3, 79)).astype(np.float32)
