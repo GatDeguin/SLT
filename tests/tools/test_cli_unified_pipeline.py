@@ -14,6 +14,7 @@ torch = pytest.importorskip("torch")
 
 from slt.training.loops import LoopResult
 from tools import train_slt_multistream_v9 as train_module
+from tools import _pretrain_dino as pretrain_module
 from tests._synthetic import SyntheticDatasetSpec, generate_multistream_dataset
 
 
@@ -280,3 +281,26 @@ def test_unified_cli_pipeline_with_mska(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved_paths
     assert any(path.name == "last.pt" for path in saved_paths)
     assert work_dir.exists()
+
+
+def test_pretrain_cli_minimal(tmp_path: Path) -> None:
+    data_dir = tmp_path / "images"
+    output_dir = tmp_path / "outputs"
+    data_dir.mkdir()
+    output_dir.mkdir()
+
+    argv = [
+        "--train-dir",
+        str(data_dir),
+        "--output-dir",
+        str(output_dir),
+        "--koleo-weight",
+        "0.25",
+        "--koleo-epsilon",
+        "5e-4",
+    ]
+
+    args = pretrain_module._parse_args(argv, default_stream="face")
+
+    assert args.koleo_weight == pytest.approx(0.25)
+    assert args.koleo_epsilon == pytest.approx(5e-4)

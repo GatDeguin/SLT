@@ -26,6 +26,7 @@ from tools.pretrain_utils import (
     DINOLoss,
     DINOMultiCropAugmentation,
     IBOTLoss,
+    KoLeoLoss,
     ProjectionHead,
     apply_ema,
     build_dataloader,
@@ -86,6 +87,8 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
         "student_temp",
         "teacher_temp",
         "center_momentum",
+        "koleo_epsilon",
+        "koleo_weight",
         "seed",
         "device",
         "resume",
@@ -319,6 +322,18 @@ def _parse_args(argv: Iterable[str] | None, default_stream: str) -> argparse.Nam
     parser.add_argument("--student-temp", type=float, default=0.1, help="Temperatura del estudiante")
     parser.add_argument("--teacher-temp", type=float, default=0.04, help="Temperatura del maestro")
     parser.add_argument("--center-momentum", type=float, default=0.9, help="Momentum del centro para DINO")
+    parser.add_argument(
+        "--koleo-epsilon",
+        type=float,
+        default=1e-4,
+        help="Epsilon numérico para el regularizador KoLeo",
+    )
+    parser.add_argument(
+        "--koleo-weight",
+        type=float,
+        default=0.0,
+        help="Peso del regularizador KoLeo aplicado sobre los embeddings del estudiante",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Semilla PRNG")
     parser.add_argument("--device", type=str, default=None, help="Dispositivo a utilizar")
     parser.add_argument(
@@ -681,6 +696,10 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             "weight_decay": args.weight_decay,
             "warmup_epochs": args.warmup_epochs,
         },
+        "regularization": {
+            "koleo_epsilon": args.koleo_epsilon,
+            "koleo_weight": args.koleo_weight,
+        },
         "teacher_momentum": {
             "base": args.teacher_momentum_base,
             "final": args.teacher_momentum_final,
@@ -766,6 +785,11 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
         if args.algorithm == "ibot"
         else None
     )
+    koleo_loss_fn = (
+        KoLeoLoss(epsilon=args.koleo_epsilon).to(device)
+        if args.koleo_weight > 0
+        else None
+    )
 
     best_checkpoint = output_dir / args.checkpoint_best_name
     last_checkpoint = output_dir / args.checkpoint_last_name
@@ -776,6 +800,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
         if student_patch_head is not None:
             student_patch_head.train()
         epoch_loss = 0.0
+        epoch_koleo = 0.0
         for step, images in enumerate(dataloader, start=1):
             optimizer.zero_grad(set_to_none=True)
             teacher_backbone.eval()
@@ -806,9 +831,12 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
 
             student_outputs = []
             student_patch_outputs = []
+            student_global_embeddings = []
             for idx, crop in enumerate(global_views + local_views):
                 cls_tokens, patch_tokens = student_backbone.forward_with_patches(crop)
                 student_outputs.append(student_head(cls_tokens))
+                if idx < len(global_views):
+                    student_global_embeddings.append(cls_tokens)
                 if student_patch_head is not None and idx < len(global_views):
                     student_patch_outputs.append(student_patch_head(patch_tokens))
 
@@ -829,6 +857,17 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
                     teacher_patches,
                     mask,
                 )
+
+            koleo_loss_term: torch.Tensor | None = None
+            if koleo_loss_fn is not None and student_global_embeddings:
+                terms = [
+                    koleo_loss_fn(embeddings)
+                    for embeddings in student_global_embeddings
+                ]
+                if terms:
+                    koleo_loss_term = torch.stack(terms).sum()
+                    loss = loss + args.koleo_weight * koleo_loss_term
+                    epoch_koleo += float(koleo_loss_term.item())
 
             loss.backward()
             if args.clip_grad_norm > 0:
@@ -855,20 +894,27 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             epoch_loss += loss.item()
             global_step += 1
             if step % args.log_interval == 0:
-                LOGGER.info("Época %d - iter %d/%d - pérdida %.4f", epoch, step, len(dataloader), loss.item())
-                tracker.log_metrics(
-                    global_step,
-                    {"loss": float(loss.item()), "epoch": epoch, "step": step},
-                    context="train_step",
+                LOGGER.info(
+                    "Época %d - iter %d/%d - pérdida %.4f",
+                    epoch,
+                    step,
+                    len(dataloader),
+                    loss.item(),
                 )
+                metrics = {"loss": float(loss.item()), "epoch": epoch, "step": step}
+                if koleo_loss_term is not None:
+                    metrics["koleo_loss"] = float(koleo_loss_term.item())
+                tracker.log_metrics(global_step, metrics, context="train_step")
 
-        avg_loss = epoch_loss / max(len(dataloader), 1)
+        num_batches = len(dataloader)
+        denominator = max(num_batches, 1)
+        avg_loss = epoch_loss / denominator
+        avg_koleo = epoch_koleo / denominator if num_batches else 0.0
         LOGGER.info("Época %d completada - pérdida media %.4f", epoch, avg_loss)
-        tracker.log_metrics(
-            global_step,
-            {"loss": float(avg_loss), "epoch": epoch},
-            context="train_epoch",
-        )
+        epoch_metrics = {"loss": float(avg_loss), "epoch": epoch}
+        if koleo_loss_fn is not None:
+            epoch_metrics["koleo_loss"] = float(avg_koleo)
+        tracker.log_metrics(global_step, epoch_metrics, context="train_epoch")
 
         new_best = avg_loss < best_loss
         best_loss = min(best_loss, avg_loss)
@@ -886,6 +932,10 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             },
             "best_loss": best_loss,
             "global_step": global_step,
+            "regularization": {
+                "koleo_epsilon": args.koleo_epsilon,
+                "koleo_weight": args.koleo_weight,
+            },
         }
         if student_patch_head is not None and teacher_patch_head is not None:
             metadata["student_patch"] = student_patch_head.state_dict()
