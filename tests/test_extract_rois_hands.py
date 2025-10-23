@@ -1,19 +1,8 @@
-"""Pruebas unitarias para ``extract_rois_v2``."""
+"""Pruebas unitarias para ``extract_rois_v2`` centradas en manos."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
-import types
-from typing import List
-
-
-if "cv2" not in sys.modules:
-    sys.modules["cv2"] = types.SimpleNamespace(
-        CAP_PROP_FPS=0,
-        COLOR_BGR2RGB=0,
-        INTER_LINEAR=1,
-    )
 
 from tools.extract_rois_v2 import hand_bbox_from_pose, resolve_hand_bbox
 
@@ -27,11 +16,11 @@ class _DummyLandmark:
 
 @dataclass
 class _DummyPose:
-    landmark: List[_DummyLandmark]
+    landmark: list[_DummyLandmark]
 
 
-def _build_pose(points: List[tuple[float, float]]) -> _DummyPose:
-    landmarks: List[_DummyLandmark] = []
+def _build_pose(points: list[tuple[float, float]]) -> _DummyPose:
+    landmarks: list[_DummyLandmark] = []
     for idx in range(33):
         if idx < len(points):
             x, y = points[idx]
