@@ -40,7 +40,11 @@ def synthetic_dataset(tmp_path: Path) -> dict:
     # sin mano derecha para probar máscara de ausencia
 
     pose = np.random.rand(7, 3 * 13).astype("float32")
-    np.savez(pose_dir / f"{video_id}.npz", pose=pose)
+    np.savez(
+        pose_dir / f"{video_id}.npz",
+        pose=pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
     keypoints = np.zeros((6, 79, 3), dtype="float32")
     for frame in range(6):
@@ -251,7 +255,11 @@ def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:
     low_conf_pose[2, 0:3] = [0.9, 0.1, 0.2]
     low_conf_pose[2, 3:6] = [0.3, 0.4, 0.95]
 
-    np.savez(pose_path, pose=low_conf_pose)
+    np.savez(
+        pose_path,
+        pose=low_conf_pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
     ds = LsaTMultiStream(T=3, img_size=32, min_conf=0.5, flip_prob=0.0, **synthetic_dataset)
     random.seed(0)
@@ -277,6 +285,61 @@ def test_pose_low_confidence_zeroing(synthetic_dataset: dict) -> None:
     assert mask[2, 0].item() is False
     assert mask[2, 1].item() is True
     assert torch.allclose(pose[2, 1, :2], torch.tensor([0.3, 0.4]))
+
+
+def test_pose_preserves_normalized_values(synthetic_dataset: dict) -> None:
+    pose_path = Path(synthetic_dataset["pose_dir"]) / "vid001.npz"
+
+    normalized_pose = np.zeros((3, 3 * 13), dtype="float32")
+    normalized_pose[0, 0:3] = [0.1, 0.2, 0.95]
+    normalized_pose[1, 0:3] = [0.6, 0.4, 0.9]
+    normalized_pose[2, 0:3] = [0.75, 0.65, 0.85]
+
+    np.savez(
+        pose_path,
+        pose=normalized_pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
+
+    random.seed(0)
+    ds = LsaTMultiStream(T=3, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+
+    pose = sample.pose.view(3, 13, 3)
+    assert pytest.approx(pose[0, 0, 0].item()) == 0.1
+    assert pytest.approx(pose[1, 0, 0].item()) == 0.6
+    assert pytest.approx(pose[2, 0, 0].item()) == 0.75
+    assert torch.all(pose[:, :, :2] >= 0.0)
+    assert torch.all(pose[:, :, :2] <= 1.0)
+
+
+def test_pose_sentinel_frames_are_preserved(synthetic_dataset: dict) -> None:
+    pose_path = Path(synthetic_dataset["pose_dir"]) / "vid001.npz"
+
+    sentinel_pose = np.full((2, 3 * 13), -1.0, dtype="float32")
+    sentinel_pose[:, 2::3] = 0.0
+    for landmark in range(13):
+        sentinel_pose[1, 3 * landmark] = 0.4
+        sentinel_pose[1, 3 * landmark + 1] = 0.6
+        sentinel_pose[1, 3 * landmark + 2] = 0.9
+
+    np.savez(
+        pose_path,
+        pose=sentinel_pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
+
+    ds = LsaTMultiStream(T=2, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    sample = ds[0]
+
+    pose = sample.pose.view(2, 13, 3)
+    mask = sample.pose_conf_mask
+
+    assert torch.allclose(pose[0, :, :2], torch.full((13, 2), -1.0))
+    assert not mask[0].any()
+    assert mask[1].all()
+    assert torch.all(pose[1, :, :2] >= 0.0)
+    assert torch.all(pose[1, :, :2] <= 1.0)
 
 
 def test_missing_metadata_columns_raise(tmp_path: Path) -> None:

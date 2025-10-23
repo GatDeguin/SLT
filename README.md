@@ -155,7 +155,11 @@ para conocer las verificaciones recomendadas tras la instalación.
    ```
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
-   fuese necesario.
+   fuese necesario. Las poses se guardan normalizadas en `[0, 1]` dentro del
+   *signing space* (ancho 6, alto 7 unidades de cabeza) y los `.npz` incluyen la
+   clave `pose_norm="signing_space_v1"`. Cuando MediaPipe no reporta landmarks
+   se replica la pose previa o se rellena con `-1` y visibilidad `0` como
+   sentinel.
 4. Genera o copia los keypoints multistream en
    `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
    `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en

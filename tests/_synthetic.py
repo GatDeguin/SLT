@@ -60,7 +60,11 @@ def _write_pose(path: Path, frames: int, landmarks: int, seed: int) -> None:
     pose = rng.random((frames, 3 * landmarks), dtype=np.float32)
     conf = rng.uniform(0.7, 1.0, size=(frames, landmarks)).astype(np.float32)
     pose[:, 2::3] = conf.reshape(frames, landmarks)
-    np.savez_compressed(path, pose=pose)
+    np.savez_compressed(
+        path,
+        pose=pose,
+        pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+    )
 
 
 def _write_keypoints(path: Path, frames: int, seed: int, total_landmarks: int = 79) -> None:

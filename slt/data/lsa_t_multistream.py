@@ -13,6 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import Dataset
 
+_POSE_SENTINEL = -1.0
+_POSE_SIGNING_WIDTH = 6.0
+_POSE_SIGNING_HEIGHT = 7.0
+
 
 @lru_cache(maxsize=None)
 def _lazy_import(name: str):
@@ -198,6 +202,8 @@ class LsaTMultiStream(Dataset):
         self._gloss_texts: Dict[str, str] = {}
         self._ctc_labels: Dict[str, torch.Tensor] = {}
         self._ctc_masks: Dict[str, torch.Tensor] = {}
+        self._pose_norm_flags: Dict[str, bool] = {}
+        self._legacy_pose_warning_emitted = False
         self._keypoint_source_total: int = 0
 
         df = pd.read_csv(csv_path, sep=";")
@@ -428,6 +434,7 @@ class LsaTMultiStream(Dataset):
 
         pose_path = os.path.join(self.pose_dir, f"{vid}.npz")
         pose = self._load_pose(pose_path)
+        pose_norm = self._pose_norm_flags.get(pose_path)
         pose_length = pose.shape[0] if hasattr(pose, "shape") else 0
         stream_lengths["pose"] = pose_length
 
@@ -487,7 +494,7 @@ class LsaTMultiStream(Dataset):
         hand_l = torch.stack(hl_list, dim=0)
         hand_r = torch.stack(hr_list, dim=0)
 
-        pose_t, pose_mask = self._sample_pose(pose)
+        pose_t, pose_mask = self._sample_pose(pose, normalized=pose_norm)
         keypoints_data = self._sample_keypoints(kp_processed, idxs)
         effective_length = self._effective_length(stream_lengths)
 
@@ -616,10 +623,27 @@ class LsaTMultiStream(Dataset):
     def _load_pose(self, pose_path: str) -> Any:
         np = self._np
         if not os.path.exists(pose_path):
+            self._pose_norm_flags[pose_path] = False
             return np.zeros((1, self.lkp_count * 3), dtype="float32")
 
         try:
             with np.load(pose_path) as pose_npz:
+                normalized = False
+                for key in ("pose_norm", "pose_normalization", "pose_norm_tag"):
+                    if key in pose_npz.files:
+                        raw = pose_npz[key]
+                        try:
+                            value = raw.tolist()  # type: ignore[assignment]
+                        except AttributeError:
+                            value = raw
+                        if isinstance(value, (list, tuple)):
+                            value = value[0]
+                        if isinstance(value, bytes):
+                            value = value.decode("utf-8", "ignore")
+                        normalized = bool(str(value).strip())
+                        break
+                self._pose_norm_flags[pose_path] = normalized
+
                 pose = pose_npz.get("pose")
                 if pose is None:
                     return np.zeros((1, self.lkp_count * 3), dtype="float32")
@@ -665,9 +689,10 @@ class LsaTMultiStream(Dataset):
                 out[:, :copy_landmarks, : pose_arr.shape[2]] = pose_arr[:, :copy_landmarks, : pose_arr.shape[2]]
                 return out.reshape(frames, self.lkp_count * 3)
         except (OSError, ValueError):
+            self._pose_norm_flags[pose_path] = False
             return np.zeros((1, self.lkp_count * 3), dtype="float32")
 
-    def _sample_pose(self, pose: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_pose(self, pose: Any, normalized: Optional[bool] = None) -> tuple[torch.Tensor, torch.Tensor]:
         np = self._np
         pose_arr = np.asarray(pose, dtype="float32")
         T0p = pose_arr.shape[0] if pose_arr.size > 0 else 0
@@ -698,12 +723,122 @@ class LsaTMultiStream(Dataset):
             else:
                 pose_s = np.zeros((self.T, self.lkp_count, 3), dtype="float32")
 
-        conf = pose_s[:, :, 2]
-        mask = conf >= self.min_conf
-        pose_s[:, :, :2] *= mask[..., None].astype("float32")
+        pose_s = self._prepare_pose_array(pose_s, normalized)
         pose_tensor = torch.from_numpy(pose_s.reshape(self.T, self.lkp_count * 3))
-        mask_tensor = torch.from_numpy(mask.astype("bool"))
+        mask_tensor = torch.from_numpy(self._pose_mask_from_array(pose_s))
         return pose_tensor, mask_tensor
+
+    def _prepare_pose_array(
+        self,
+        pose_arr: Any,
+        normalized: Optional[bool] = None,
+    ) -> Any:
+        np = self._np
+        if pose_arr.ndim != 3 or pose_arr.shape[-1] < 3:
+            return np.zeros((self.T, self.lkp_count, 3), dtype="float32")
+
+        processed = pose_arr.astype("float32", copy=True)
+        normalized_flag = bool(normalized)
+
+        if normalized is None:
+            normalized_flag = self._infer_pose_normalization(processed)
+
+        if not normalized_flag:
+            processed = self._normalize_legacy_pose(processed)
+            if not self._legacy_pose_warning_emitted:
+                warnings.warn(
+                    (
+                        "Se detectó un stream de pose sin normalizar. Aplicando "
+                        "reescalado de compatibilidad en LsaTMultiStream."
+                    ),
+                    RuntimeWarning,
+                )
+                self._legacy_pose_warning_emitted = True
+
+        coords = processed[:, :, :2]
+        conf = processed[:, :, 2]
+        sentinel_mask = (coords < 0).any(axis=2)
+        valid_mask = (conf >= self.min_conf) & (~sentinel_mask)
+
+        coords = coords * valid_mask[..., None].astype("float32")
+        coords[sentinel_mask] = _POSE_SENTINEL
+        processed[:, :, :2] = coords
+        processed[sentinel_mask, 2] = 0.0
+        return processed
+
+    def _pose_mask_from_array(self, pose_arr: Any) -> Any:
+        np = self._np
+        if pose_arr.ndim != 3 or pose_arr.shape[-1] < 3:
+            return np.zeros((self.T, self.lkp_count), dtype="bool")
+
+        conf = pose_arr[:, :, 2]
+        coords = pose_arr[:, :, :2]
+        sentinel_mask = (coords < 0).any(axis=2)
+        mask = (conf >= self.min_conf) & (~sentinel_mask)
+        return mask.astype("bool")
+
+    def _infer_pose_normalization(self, pose_arr: Any) -> bool:
+        coords = pose_arr[:, :, :2]
+        if coords.size == 0:
+            return False
+        # Datos nuevos se esperan en [0, 1] y con posibles sentinels negativos.
+        if (coords <= _POSE_SENTINEL).any():
+            return True
+        min_val = coords.min()
+        max_val = coords.max()
+        if min_val < -0.05 or max_val > 1.05:
+            return False
+        return True
+
+    def _normalize_legacy_pose(self, pose_arr: Any) -> Any:
+        np = self._np
+        normalized = pose_arr.astype("float32", copy=True)
+        if normalized.ndim != 3 or normalized.shape[-1] < 2:
+            return normalized
+
+        frames, landmarks, _ = normalized.shape
+        for frame_idx in range(frames):
+            coords = normalized[frame_idx, :, :2]
+            center, width, height = self._legacy_signing_space(coords)
+            translated = coords - center[None, :]
+            if width <= 0 or height <= 0:
+                continue
+            translated[:, 0] /= width
+            translated[:, 1] /= height
+            translated += 0.5
+            np.clip(translated, 0.0, 1.0, out=translated)
+            normalized[frame_idx, :, :2] = translated
+        return normalized
+
+    def _legacy_signing_space(self, coords: Any) -> tuple[Any, float, float]:
+        np = self._np
+        if coords.size == 0:
+            return np.array([0.5, 0.5], dtype="float32"), 1.0, 1.0
+
+        nose = coords[0]
+        shoulders: List[np.ndarray] = []
+        if coords.shape[0] > 11:
+            shoulders.append(coords[11])
+        if coords.shape[0] > 12:
+            shoulders.append(coords[12])
+
+        if shoulders:
+            center = np.mean(np.stack(shoulders, axis=0), axis=0)
+        else:
+            center = nose
+
+        head_unit = float(np.linalg.norm(nose - center))
+        if not math.isfinite(head_unit) or head_unit <= 1e-6:
+            if coords.shape[0] > 5:
+                left_eye = coords[min(2, coords.shape[0] - 1)]
+                right_eye = coords[min(5, coords.shape[0] - 1)]
+                head_unit = float(np.linalg.norm(left_eye - right_eye))
+        if not math.isfinite(head_unit) or head_unit <= 1e-6:
+            head_unit = 1.0 / _POSE_SIGNING_HEIGHT
+
+        width = max(head_unit * _POSE_SIGNING_WIDTH, 1e-6)
+        height = max(head_unit * _POSE_SIGNING_HEIGHT, 1e-6)
+        return center.astype("float32"), float(width), float(height)
 
     # ------------------------------------------------------------------
     # Keypoint helpers
