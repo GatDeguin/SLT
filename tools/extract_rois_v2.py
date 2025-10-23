@@ -93,6 +93,65 @@ def crop_square(
     return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
 
 
+def hand_bbox_from_pose(
+    pose_landmarks: Optional[object],
+    indices: Tuple[int, int, int],
+    frame_width: int,
+    frame_height: int,
+    scale: float = 1.2,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Construye un *bounding box* cuadrado a partir de la pose."""
+
+    if pose_landmarks is None:
+        return None
+
+    try:
+        points = [pose_landmarks.landmark[idx] for idx in indices]
+    except (AttributeError, IndexError):
+        return None
+
+    xs = [int(round(pt.x * frame_width)) for pt in points]
+    ys = [int(round(pt.y * frame_height)) for pt in points]
+
+    x_min = max(0, min(xs, default=0))
+    y_min = max(0, min(ys, default=0))
+    x_max = min(frame_width, max(xs, default=0))
+    y_max = min(frame_height, max(ys, default=0))
+
+    side = max(x_max - x_min, y_max - y_min)
+    if side <= 0:
+        return None
+
+    x, y, w, h = expand_clamp_bbox(x_min, y_min, side, side, scale, frame_width, frame_height)
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def resolve_hand_bbox(
+    detected_bbox: Optional[Tuple[int, int, int, int]],
+    pose_landmarks: Optional[object],
+    indices: Tuple[int, int, int],
+    prev_bbox: Optional[Tuple[int, int, int, int]],
+    frame_width: int,
+    frame_height: int,
+    scale: float = 1.2,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str]:
+    """Selecciona el *bounding box* más apropiado para una mano."""
+
+    if detected_bbox and detected_bbox[2] > 0 and detected_bbox[3] > 0:
+        return detected_bbox, "detected"
+
+    pose_bbox = hand_bbox_from_pose(pose_landmarks, indices, frame_width, frame_height, scale)
+    if pose_bbox is not None:
+        return pose_bbox, "pose"
+
+    if prev_bbox is not None and prev_bbox[2] > 0 and prev_bbox[3] > 0:
+        return prev_bbox, "previous"
+
+    return None, "black"
+
+
 def blur_face_preserve_eyes_mouth(
     frame: np.ndarray,
     face_landmarks: Optional[object],
@@ -163,6 +222,11 @@ def process_video(
         "face_blur": face_blur,
     }
 
+    metadata["fallbacks"] = {
+        "hand_left": {"pose": 0, "previous": 0, "black": 0},
+        "hand_right": {"pose": 0, "previous": 0, "black": 0},
+    }
+
     if not _ensure_mediapipe_available():  # pragma: no cover - dependencias opcionales
         metadata["error"] = "mediapipe-no-disponible"
         return metadata
@@ -193,6 +257,9 @@ def process_video(
         metadata["stride"] = stride
 
         pose_frames: List[np.ndarray] = []
+        prev_face_bbox: Optional[Tuple[int, int, int, int]] = None
+        prev_left_bbox: Optional[Tuple[int, int, int, int]] = None
+        prev_right_bbox: Optional[Tuple[int, int, int, int]] = None
 
         with (
             mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh,
@@ -233,12 +300,14 @@ def process_video(
                     source_frame = blur_face_preserve_eyes_mouth(frame, face_landmarks) if face_blur else frame
                     patch = source_frame[y : y + h, x : x + w]
                     face_crop = crop_square(patch, 0, 0, patch.shape[1], patch.shape[0], 224)
+                    if w > 0 and h > 0:
+                        prev_face_bbox = (x, y, w, h)
 
                 cv2.imwrite(str(face_out / f"{basename}_f{out_index:06d}.jpg"), face_crop)
 
                 # Manos
-                left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
-                right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                left_detected: Optional[Tuple[int, int, int, int]] = None
+                right_detected: Optional[Tuple[int, int, int, int]] = None
                 if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
                     for landmarks, handedness in zip(
                         hands_result.multi_hand_landmarks, hands_result.multi_handedness
@@ -249,13 +318,49 @@ def process_video(
                         y1 = max(0, min(ys))
                         x2 = min(width, max(xs))
                         y2 = min(height, max(ys))
-                        x, y, w, h = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
-                        crop = crop_square(frame, x, y, w, h, 224)
+                        bbox = expand_clamp_bbox(x1, y1, x2 - x1, y2 - y1, 1.2, width, height)
                         label = handedness.classification[0].label.lower()
                         if label.startswith("left"):
-                            left_crop = crop
+                            left_detected = bbox
                         else:
-                            right_crop = crop
+                            right_detected = bbox
+
+                pose_landmarks = getattr(pose_result, "pose_landmarks", None)
+                left_bbox, left_source = resolve_hand_bbox(
+                    left_detected,
+                    pose_landmarks,
+                    (17, 19, 21),
+                    prev_left_bbox,
+                    width,
+                    height,
+                )
+                right_bbox, right_source = resolve_hand_bbox(
+                    right_detected,
+                    pose_landmarks,
+                    (18, 20, 22),
+                    prev_right_bbox,
+                    width,
+                    height,
+                )
+
+                if left_source != "detected":
+                    metadata["fallbacks"]["hand_left"][left_source] += 1
+                if right_source != "detected":
+                    metadata["fallbacks"]["hand_right"][right_source] += 1
+
+                if left_bbox is not None:
+                    left_crop = crop_square(frame, *left_bbox, 224)
+                    prev_left_bbox = left_bbox if left_bbox[2] > 0 and left_bbox[3] > 0 else None
+                else:
+                    left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                    prev_left_bbox = None
+
+                if right_bbox is not None:
+                    right_crop = crop_square(frame, *right_bbox, 224)
+                    prev_right_bbox = right_bbox if right_bbox[2] > 0 and right_bbox[3] > 0 else None
+                else:
+                    right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                    prev_right_bbox = None
 
                 cv2.imwrite(str(hand_l_out / f"{basename}_f{out_index:06d}.jpg"), left_crop)
                 cv2.imwrite(str(hand_r_out / f"{basename}_f{out_index:06d}.jpg"), right_crop)
