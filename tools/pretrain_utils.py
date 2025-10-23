@@ -31,6 +31,7 @@ from typing import Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
@@ -266,6 +267,37 @@ class DINOMultiCropAugmentation:
 # ---------------------------------------------------------------------------
 # Losses and model heads
 # ---------------------------------------------------------------------------
+
+
+class KoLeoLoss(nn.Module):
+    """Kozachenko-Leonenko regularizer for spreading student embeddings."""
+
+    def __init__(self, epsilon: float = 1e-4) -> None:
+        super().__init__()
+        self.epsilon = float(epsilon)
+        self.pdist = nn.PairwiseDistance(2, eps=self.epsilon)
+
+    def _pairwise_nn_indices(self, embeddings: Tensor) -> Tensor:
+        dots = torch.mm(embeddings, embeddings.t())
+        n = embeddings.shape[0]
+        dots.view(-1)[:: n + 1].fill_(-1)
+        _, indices = torch.max(dots, dim=1)
+        return indices
+
+    def forward(self, student_embeddings: Tensor) -> Tensor:
+        if student_embeddings.dim() != 2:
+            raise ValueError("KoLeoLoss expects a 2D tensor of shape (batch, dim)")
+
+        embeddings = F.normalize(
+            student_embeddings.to(dtype=torch.float32),
+            p=2,
+            dim=-1,
+            eps=self.epsilon,
+        )
+        indices = self._pairwise_nn_indices(embeddings)
+        distances = self.pdist(embeddings, embeddings[indices])
+        loss = -(distances + self.epsilon).log().mean()
+        return loss
 
 
 class ProjectionHead(nn.Module):

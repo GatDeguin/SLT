@@ -23,6 +23,15 @@ backbones compatibles con `load_dinov2_backbone`.
      --algorithm dino \
      --export-backbone work_dirs/dino_face/backbone.pt
    ```
+   Activa el regularizador KoLeo cuando busques diversificar los embeddings del
+   estudiante:
+   ```bash
+   python tools/pretrain_dino_face.py \
+     --train-dir data/single_signer/processed/face \
+     --output-dir work_dirs/dino_face \
+     --koleo-weight 0.5 \
+     --koleo-epsilon 1e-4
+   ```
 5. Repite el proceso para manos con `tools/pretrain_dino_hands.py` ajustando
    `--train-dir` a `hand_l` o `hand_r`.
 6. Carga los backbones exportados desde `tools/train_slt_multistream_v9.py`
@@ -66,6 +75,13 @@ notes = "Primer experimento con augmentations agresivos."
 
 Los parámetros definidos en el archivo actúan como defaults y pueden
 sobrescribirse desde la CLI.
+
+### Regularización KoLeo
+
+- `--koleo-weight`: peso (por defecto 0) aplicado sobre la suma de pérdidas KoLeo por crop
+  global.
+- `--koleo-epsilon`: margen numérico para evitar distancias nulas al estimar la entropía.
+  Mantiene un valor base de `1e-4`, alineado con la implementación empleada por DINOv2.
 
 ## Artefactos generados
 

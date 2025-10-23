@@ -331,7 +331,9 @@ pesos auto-supervisados compatibles con `load_dinov2_backbone`. Soportan
 entrenamientos declarativos vía `--config`, exportación de backbones (`--export-backbone`)
 y registro de métricas en `metrics.jsonl`. Sigue la guía en `docs/pretraining.md`
 para elegir hiperparámetros, controlar augmentations y conectar los pesos
-resultantes con `tools/train_slt_multistream_v9.py`.
+resultantes con `tools/train_slt_multistream_v9.py`. La misma guía detalla cómo
+activar el regularizador KoLeo mediante `--koleo-weight` y ajustar la estabilidad
+numérica con `--koleo-epsilon`.
 
 ## Control de calidad y pruebas
 
