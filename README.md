@@ -75,6 +75,14 @@ encoder = MultiStreamEncoder.from_pretrained(
 )
 ```
 
+### Pesos Phoenix 2014
+
+Acordamos utilizar el checkpoint MSKA entrenado sobre Phoenix 2014 distribuido
+como `best.pth`. Coloca el archivo en `data/phoenix_2014/best.pth` o define la
+variable `SLT_PHOENIX_CHECKPOINT` apuntando a su ubicación. Las herramientas en
+`tools/` permiten cargarlo pasando `--pretrained phoenix_2014` junto a
+`--pretrained-checkpoint data/phoenix_2014/best.pth`.
+
 ## Instalación
 
 Configura un entorno virtual, instala PyTorch compatible con tu hardware y

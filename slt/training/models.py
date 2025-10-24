@@ -10,7 +10,13 @@ import torch
 from torch import nn
 from transformers import AutoConfig, PreTrainedTokenizerBase
 
-from slt.models import MultiStreamEncoder, TextSeq2SeqDecoder, ViTConfig, load_dinov2_backbone
+from slt.models import (
+    MultiStreamEncoder,
+    TextSeq2SeqDecoder,
+    ViTConfig,
+    apply_phoenix_weights,
+    load_dinov2_backbone,
+)
 from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import load_single_signer_components
 
@@ -64,11 +70,19 @@ class MultiStreamClassifier(nn.Module):
         super().__init__()
 
         pretrained = (config.pretrained or "").strip().lower()
+        use_single_signer = False
+        use_phoenix = False
         if pretrained and pretrained not in {"none", "false"}:
-            if pretrained not in {"single_signer", "single-signer"}:
+            if pretrained in {"single_signer", "single-signer"}:
+                use_single_signer = True
+            elif pretrained in {"phoenix_2014", "phoenix"}:
+                use_phoenix = True
+            else:
                 raise ValueError(
-                    "Unsupported pretrained identifier. Only 'single_signer' is available."
+                    "Unsupported pretrained identifier. Available options: "
+                    "'single_signer', 'phoenix_2014'."
                 )
+        if use_single_signer:
             encoder, decoder, metadata = load_single_signer_components(
                 tokenizer,
                 checkpoint_path=config.pretrained_checkpoint,
@@ -194,6 +208,17 @@ class MultiStreamClassifier(nn.Module):
                 config=decoder_config,
                 config_kwargs=config.decoder_kwargs,
             )
+
+        if use_phoenix:
+            metadata = apply_phoenix_weights(
+                self.encoder,
+                decoder=self.decoder,
+                checkpoint_path=config.pretrained_checkpoint,
+                map_location=torch.device("cpu"),
+                strict=True,
+            )
+            setattr(self, "pretrained_metadata", metadata)
+            self._mska_enabled = self.encoder.mska_encoder is not None
 
     @staticmethod
     def _prepare_keypoint_streams(

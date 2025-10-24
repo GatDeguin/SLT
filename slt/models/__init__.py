@@ -8,6 +8,7 @@ from .mska import (  # noqa: F401
     MultiStreamKeypointAttention,
 )
 from .multistream import MultiStreamEncoder  # noqa: F401
+from .phoenix import apply_phoenix_weights, load_phoenix_encoder  # noqa: F401
 from .single_signer import load_single_signer_components, load_single_signer_encoder  # noqa: F401
 from .temporal import TemporalEncoder, TextSeq2SeqDecoder  # noqa: F401
 
@@ -23,6 +24,8 @@ __all__ = [
     "TemporalEncoder",
     "TextSeq2SeqDecoder",
     "MultiStreamEncoder",
+    "load_phoenix_encoder",
+    "apply_phoenix_weights",
     "load_single_signer_encoder",
     "load_single_signer_components",
 ]
