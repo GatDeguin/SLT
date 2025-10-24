@@ -38,6 +38,98 @@ FACE_KEEP_INDICES = set(
 FACE_POSE_INDICES = tuple(range(11))
 
 
+_HAS_CV2_CIRCLE = hasattr(cv2, "circle")
+_HAS_CV2_CVTCOLOR = hasattr(cv2, "cvtColor")
+_HAS_CV2_GAUSSIAN = hasattr(cv2, "GaussianBlur")
+_HAS_CV2_MERGE = hasattr(cv2, "merge")
+_HAS_CV2_BITWISE_AND = hasattr(cv2, "bitwise_and")
+_HAS_CV2_BITWISE_NOT = hasattr(cv2, "bitwise_not")
+_HAS_CV2_ADD = hasattr(cv2, "add")
+
+
+def _ensure_uint8(array: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(array), 0, 255).astype(np.uint8)
+
+
+def _fill_circle(mask: np.ndarray, center: tuple[int, int], radius: int, value: int) -> None:
+    """Rellena un disco en la máscara sin depender de cv2.circle."""
+
+    if _HAS_CV2_CIRCLE:
+        cv2.circle(mask, center, radius, value, -1)
+        return
+
+    cx, cy = center
+    yy, xx = np.ogrid[: mask.shape[0], : mask.shape[1]]
+    disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius**2
+    mask[disk] = value
+
+
+def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
+    if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_BGR2GRAY"):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("Se requiere una imagen BGR")
+    weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+    gray = np.tensordot(image.astype(np.float32), weights, axes=([2], [0]))
+    return _ensure_uint8(gray)
+
+
+def _gray_to_bgr(image: np.ndarray) -> np.ndarray:
+    if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_GRAY2BGR"):
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.ndim != 2:
+        raise ValueError("Se requiere una imagen en escala de grises")
+    return np.stack([image, image, image], axis=-1)
+
+
+def _merge_channels(channels: list[np.ndarray]) -> np.ndarray:
+    if _HAS_CV2_MERGE:
+        return cv2.merge(channels)
+    return np.stack(channels, axis=-1)
+
+
+def _bitwise_not(image: np.ndarray) -> np.ndarray:
+    if _HAS_CV2_BITWISE_NOT:
+        return cv2.bitwise_not(image)
+    return np.bitwise_not(image)
+
+
+def _bitwise_and(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    if _HAS_CV2_BITWISE_AND:
+        return cv2.bitwise_and(lhs, rhs)
+    return np.bitwise_and(lhs, rhs)
+
+
+def _add_images(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    if _HAS_CV2_ADD:
+        return cv2.add(lhs, rhs)
+    return _ensure_uint8(lhs.astype(np.int32) + rhs.astype(np.int32))
+
+
+def _gaussian_blur(image: np.ndarray, kernel: tuple[int, int], sigma: float) -> np.ndarray:
+    if _HAS_CV2_GAUSSIAN:
+        return cv2.GaussianBlur(image, kernel, sigma)
+
+    kx, ky = kernel
+    if kx % 2 == 0 or ky % 2 == 0:
+        raise ValueError("Los kernels deben ser impares")
+
+    pad_x = kx // 2
+    pad_y = ky // 2
+    if image.ndim == 2:
+        padded = np.pad(image.astype(np.float32), ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+        out = np.empty_like(image, dtype=np.float32)
+        window = kx * ky
+        for row in range(image.shape[0]):
+            for col in range(image.shape[1]):
+                region = padded[row : row + ky, col : col + kx]
+                out[row, col] = float(np.sum(region) / window)
+        return _ensure_uint8(out)
+
+    channels = [_gaussian_blur(image[:, :, idx], kernel, sigma) for idx in range(image.shape[2])]
+    return np.stack(channels, axis=-1)
+
+
 def ensure_dir(path: str | os.PathLike[str]) -> Path:
     """Crea el directorio indicado (y padres) si no existe."""
 
@@ -275,7 +367,7 @@ def build_face_keep_mask(
         px = int(round(float(lx) * frame_width)) - x
         py = int(round(float(ly) * frame_height)) - y
         if 0 <= px < w and 0 <= py < h:
-            cv2.circle(mask, (px, py), keep_radius, 255, -1)
+            _fill_circle(mask, (px, py), keep_radius, 255)
 
     return mask
 
@@ -286,16 +378,16 @@ def apply_face_partial_grayscale(patch: np.ndarray, mask: np.ndarray) -> np.ndar
     if patch.size == 0:
         return patch
 
-    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    gray = _bgr_to_gray(patch)
+    gray_bgr = _gray_to_bgr(gray)
     if mask.size == 0 or mask.max() == 0:
         return gray_bgr
 
-    mask3 = cv2.merge([mask, mask, mask])
-    inv_mask = cv2.bitwise_not(mask3)
-    color_part = cv2.bitwise_and(patch, mask3)
-    gray_part = cv2.bitwise_and(gray_bgr, inv_mask)
-    return cv2.add(color_part, gray_part)
+    mask3 = _merge_channels([mask, mask, mask])
+    inv_mask = _bitwise_not(mask3)
+    color_part = _bitwise_and(patch, mask3)
+    gray_part = _bitwise_and(gray_bgr, inv_mask)
+    return _add_images(color_part, gray_part)
 
 
 def blur_face_preserve_eyes_mouth(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -304,18 +396,18 @@ def blur_face_preserve_eyes_mouth(patch: np.ndarray, mask: np.ndarray) -> np.nda
     if patch.size == 0:
         return patch
 
-    gray_full = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    gray_full_bgr = cv2.cvtColor(gray_full, cv2.COLOR_GRAY2BGR)
+    gray_full = _bgr_to_gray(patch)
+    gray_full_bgr = _gray_to_bgr(gray_full)
 
     if mask.size == 0 or mask.max() == 0:
-        return cv2.GaussianBlur(gray_full_bgr, (31, 31), 0)
+        return _gaussian_blur(gray_full_bgr, (31, 31), 0)
 
-    mask3 = cv2.merge([mask, mask, mask])
-    inv_mask = cv2.bitwise_not(mask3)
-    blurred = cv2.GaussianBlur(gray_full_bgr, (31, 31), 0)
-    kept = cv2.bitwise_and(patch, mask3)
-    blurred_rest = cv2.bitwise_and(blurred, inv_mask)
-    return cv2.add(kept, blurred_rest)
+    mask3 = _merge_channels([mask, mask, mask])
+    inv_mask = _bitwise_not(mask3)
+    blurred = _gaussian_blur(gray_full_bgr, (31, 31), 0)
+    kept = _bitwise_and(patch, mask3)
+    blurred_rest = _bitwise_and(blurred, inv_mask)
+    return _add_images(kept, blurred_rest)
 
 
 def _ensure_mediapipe_available() -> bool:
