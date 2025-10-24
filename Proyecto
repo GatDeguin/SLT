@@ -24,6 +24,14 @@ encoder.
 2. Entrenar con `python -m slt` o `tools/train_slt_multistream_v9.py`.
 3. Evaluar y exportar los modelos generados para integrarlos en demos.
 
+### Checkpoint Phoenix 2014
+
+- Colocar `best.pth` entrenado con MSKA sobre Phoenix 2014 en
+  `data/phoenix_2014/best.pth` o exponer su ruta mediante
+  `SLT_PHOENIX_CHECKPOINT`.
+- Ejecutar las CLI con `--pretrained phoenix_2014` y
+  `--pretrained-checkpoint data/phoenix_2014/best.pth` para utilizarlo.
+
 ## Referencias rápidas
 
 - [README](README.md): flujo completo y comandos de referencia.

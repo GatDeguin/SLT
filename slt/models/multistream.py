@@ -210,17 +210,26 @@ class MultiStreamEncoder(torch.nn.Module):
         """Instantiate the encoder with the validated single-signer weights."""
 
         normalized = preset.replace("-", "_").strip().lower()
-        if normalized != "single_signer":
-            raise ValueError(
-                f"Unknown pretrained preset '{preset}'. Available options: 'single_signer'"
-            )
-        from .single_signer import load_single_signer_encoder
+        if normalized == "single_signer":
+            from .single_signer import load_single_signer_encoder
 
-        encoder, metadata, _ = load_single_signer_encoder(
-            checkpoint_path=checkpoint_path, map_location=map_location, strict=strict
+            encoder, metadata, _ = load_single_signer_encoder(
+                checkpoint_path=checkpoint_path, map_location=map_location, strict=strict
+            )
+            setattr(encoder, "pretrained_metadata", metadata)
+            return encoder
+        if normalized in {"phoenix_2014", "phoenix"}:
+            from .phoenix import load_phoenix_encoder
+
+            encoder, metadata, _ = load_phoenix_encoder(
+                checkpoint_path=checkpoint_path, map_location=map_location, strict=strict
+            )
+            setattr(encoder, "pretrained_metadata", metadata)
+            return encoder
+        raise ValueError(
+            f"Unknown pretrained preset '{preset}'. Available options: 'single_signer', "
+            "'phoenix_2014'"
         )
-        setattr(encoder, "pretrained_metadata", metadata)
-        return encoder
 
     def forward(
         self,
