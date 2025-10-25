@@ -151,3 +151,21 @@ def test_levenshtein_distance_symmetry() -> None:
     assert forward == backward == 1
     assert levenshtein_distance([], ["hola"]) == 1
 
+
+def test_error_rates_handle_mismatched_lengths() -> None:
+    references = ["hola", "mundo"]
+    predictions = ["hola"]
+    cer = character_error_rate(references, predictions)
+    wer = word_error_rate(references, predictions)
+    assert cer == pytest.approx(55.5555, rel=1e-4)
+    assert wer == pytest.approx(50.0)
+
+
+def test_error_rates_penalize_extra_predictions() -> None:
+    references = []
+    predictions = ["hola"]
+    cer = character_error_rate(references, predictions)
+    wer = word_error_rate(references, predictions)
+    assert cer == pytest.approx(100.0)
+    assert wer == pytest.approx(100.0)
+
