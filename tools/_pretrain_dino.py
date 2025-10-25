@@ -30,6 +30,7 @@ from tools.pretrain_utils import (
     ProjectionHead,
     apply_ema,
     build_dataloader,
+    build_multistream_dataloader,
     build_vit_backbone,
     cosine_scheduler,
     export_for_dinov2,
@@ -105,10 +106,17 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
         "global_crop_scale",
         "local_crop_scale",
         "stream",
+        "train_dir_face",
+        "train_dir_hand_left",
+        "train_dir_hand_right",
     }
     for key in simple_keys:
         if key in data:
             normalized[key] = data[key]
+    for key, value in data.items():
+        if isinstance(key, str) and key.endswith("_dir"):
+            stream_key = key[:-4]
+            normalized.setdefault(f"train_dir_{stream_key}", value)
 
     dataset_section = _ensure_mapping(data.get("dataset") or data.get("dataloader"))
     for key in ("batch_size", "num_workers"):
@@ -117,6 +125,10 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
     for key in ("shuffle", "pin_memory", "persistent_workers"):
         if key in dataset_section:
             normalized[f"dataset_{key}"] = dataset_section[key]
+    for key, value in dataset_section.items():
+        if isinstance(key, str) and key.endswith("_dir"):
+            stream_key = key[:-4]
+            normalized.setdefault(f"train_dir_{stream_key}", value)
 
     augmentation_section = _ensure_mapping(
         data.get("augmentation") or data.get("augmentations")
@@ -193,8 +205,8 @@ def _momentum_schedule(base: float, final: float, total_steps: int) -> list[floa
 
 
 def _update_teacher(
-    student_backbone: nn.Module,
-    teacher_backbone: nn.Module,
+    student_backbone: nn.Module | Mapping[str, nn.Module],
+    teacher_backbone: nn.Module | Mapping[str, nn.Module],
     student_head: nn.Module,
     teacher_head: nn.Module,
     momentum: float,
@@ -202,7 +214,13 @@ def _update_teacher(
     student_patch_head: nn.Module | None = None,
     teacher_patch_head: nn.Module | None = None,
 ) -> None:
-    apply_ema(student_backbone, teacher_backbone, momentum)
+    if isinstance(student_backbone, Mapping) and isinstance(teacher_backbone, Mapping):
+        for stream in student_backbone:
+            if stream not in teacher_backbone:
+                raise KeyError(f"Stream '{stream}' no encontrado en el maestro")
+            apply_ema(student_backbone[stream], teacher_backbone[stream], momentum)
+    else:
+        apply_ema(student_backbone, teacher_backbone, momentum)
     apply_ema(student_head, teacher_head, momentum)
     if student_patch_head is not None and teacher_patch_head is not None:
         apply_ema(student_patch_head, teacher_patch_head, momentum)
@@ -226,7 +244,33 @@ def _compute_dino_loss(
     return loss
 
 
-def _parse_args(argv: Iterable[str] | None, default_stream: str) -> argparse.Namespace:
+def _combine_cls_tokens(tokens: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not tokens:
+        raise ValueError("No se recibieron embeddings CLS para combinar")
+    if len(tokens) == 1:
+        return tokens[0]
+    stacked = torch.stack(tokens, dim=0)
+    return stacked.mean(dim=0)
+
+
+def _combine_patch_tokens(tokens: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not tokens:
+        raise ValueError("No se recibieron embeddings de parches para combinar")
+    if len(tokens) == 1:
+        return tokens[0]
+    stacked = torch.stack(tokens, dim=0)
+    return stacked.mean(dim=0)
+
+
+def _stream_option_name(stream: str) -> str:
+    return stream.replace("_", "-")
+
+
+def _parse_args(
+    argv: Iterable[str] | None,
+    default_stream: str,
+    multi_streams: Sequence[str] | None = None,
+) -> argparse.Namespace:
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument(
         "--config",
@@ -247,17 +291,31 @@ def _parse_args(argv: Iterable[str] | None, default_stream: str) -> argparse.Nam
         description="Self-supervised DINO/iBOT pre-training",
         parents=[base_parser],
     )
-    parser.set_defaults(stream=default_stream)
+    active_streams = list(multi_streams) if multi_streams else [default_stream]
+    stream_default = "+".join(active_streams) if multi_streams else default_stream
+    parser.set_defaults(stream=stream_default)
     if defaults:
         parser.set_defaults(**defaults)
 
-    parser.add_argument(
-        "--train-dir",
-        nargs="+",
-        type=Path,
-        default=None,
-        help="Carpetas con recortes del stream",
-    )
+    if multi_streams:
+        for stream in active_streams:
+            option = _stream_option_name(stream)
+            parser.add_argument(
+                f"--{option}-dir",
+                nargs="+",
+                type=Path,
+                dest=f"train_dir_{stream}",
+                default=None,
+                help=f"Carpetas con recortes del stream '{stream}'",
+            )
+    else:
+        parser.add_argument(
+            "--train-dir",
+            nargs="+",
+            type=Path,
+            default=None,
+            help="Carpetas con recortes del stream",
+        )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -522,13 +580,32 @@ def _parse_args(argv: Iterable[str] | None, default_stream: str) -> argparse.Nam
 
     args = parser.parse_args(remaining)
 
-    if not args.train_dir:
-        parser.error("Debe especificarse al menos un --train-dir o declararlo en la configuración")
+    if multi_streams:
+        train_dir_map: dict[str, list[Path]] = {}
+        for stream in active_streams:
+            attr = f"train_dir_{stream}"
+            directories = getattr(args, attr, None)
+            if not directories:
+                option = _stream_option_name(stream)
+                parser.error(
+                    "Debe especificarse al menos un --"
+                    f"{option}-dir o declararlo en la configuración"
+                )
+            train_dir_map[stream] = directories
+        args.train_dir = train_dir_map
+    else:
+        if not args.train_dir:
+            parser.error(
+                "Debe especificarse al menos un --train-dir o declararlo en la configuración"
+            )
+
     if not args.output_dir:
         parser.error("Debe indicar --output-dir o declararlo en la configuración")
 
     if args.experiment_tag is None:
         args.experiment_tag = []
+
+    args.streams = list(active_streams)
 
     return args
 
@@ -575,10 +652,66 @@ def _build_models(
     )
 
 
+def _build_multistream_models(
+    args: argparse.Namespace,
+    device: torch.device,
+    streams: Sequence[str],
+) -> tuple[
+    dict[str, nn.Module],
+    dict[str, nn.Module],
+    nn.Module,
+    nn.Module,
+    nn.Module | None,
+    nn.Module | None,
+]:
+    backbone_cfg = BackboneConfig(
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        embed_dim=args.vit_embed_dim,
+        depth=args.vit_depth,
+        num_heads=args.vit_num_heads,
+        mlp_ratio=args.vit_mlp_ratio,
+    )
+    student_backbones: dict[str, nn.Module] = {}
+    teacher_backbones: dict[str, nn.Module] = {}
+    for stream in streams:
+        student_module = build_vit_backbone(backbone_cfg).to(device)
+        teacher_module = build_vit_backbone(backbone_cfg).to(device)
+        teacher_module.load_state_dict(student_module.state_dict())
+        for param in teacher_module.parameters():
+            param.requires_grad_(False)
+        student_backbones[stream] = student_module
+        teacher_backbones[stream] = teacher_module
+
+    student_head = ProjectionHead(args.vit_embed_dim, args.out_dim, args.head_hidden_dim).to(device)
+    teacher_head = ProjectionHead(args.vit_embed_dim, args.out_dim, args.head_hidden_dim).to(device)
+    teacher_head.load_state_dict(student_head.state_dict())
+    for param in teacher_head.parameters():
+        param.requires_grad_(False)
+
+    student_patch_head: nn.Module | None = None
+    teacher_patch_head: nn.Module | None = None
+    if args.algorithm == "ibot":
+        student_patch_head = nn.Linear(args.vit_embed_dim, args.patch_out_dim).to(device)
+        teacher_patch_head = nn.Linear(args.vit_embed_dim, args.patch_out_dim).to(device)
+        teacher_patch_head.load_state_dict(student_patch_head.state_dict())
+        for param in teacher_patch_head.parameters():
+            param.requires_grad_(False)
+
+    return (
+        student_backbones,
+        teacher_backbones,
+        student_head,
+        teacher_head,
+        student_patch_head,
+        teacher_patch_head,
+    )
+
+
 def _resume_if_needed(
     args: argparse.Namespace,
-    student_backbone: nn.Module,
-    teacher_backbone: nn.Module,
+    student_backbone: nn.Module | Mapping[str, nn.Module],
+    teacher_backbone: nn.Module | Mapping[str, nn.Module],
     student_head: nn.Module,
     teacher_head: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -589,8 +722,20 @@ def _resume_if_needed(
     if not args.resume:
         return 1, float("inf"), 0
     state = load_checkpoint(args.resume)
-    student_backbone.load_state_dict(state.student)
-    teacher_backbone.load_state_dict(state.teacher)
+    if isinstance(student_backbone, Mapping) and isinstance(teacher_backbone, Mapping):
+        student_state = state.student
+        teacher_state = state.teacher
+        for stream in student_backbone:
+            if stream not in student_state or stream not in teacher_state:
+                raise KeyError(
+                    "El checkpoint no contiene pesos para el stream "
+                    f"'{stream}'"
+                )
+            student_backbone[stream].load_state_dict(student_state[stream])  # type: ignore[index]
+            teacher_backbone[stream].load_state_dict(teacher_state[stream])  # type: ignore[index]
+    else:
+        student_backbone.load_state_dict(state.student)  # type: ignore[call-arg]
+        teacher_backbone.load_state_dict(state.teacher)  # type: ignore[call-arg]
     student_head.load_state_dict(state.head)
     if state.teacher_head:
         teacher_head.load_state_dict(state.teacher_head)
@@ -993,4 +1138,528 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             args.export_backbone,
             name="exported_backbone",
             metadata=export_metadata,
+        )
+
+
+def run_multistream(
+    argv: Iterable[str] | None = None,
+    *,
+    streams: Sequence[str],
+) -> None:
+    if not streams:
+        raise ValueError("Debe proporcionar al menos un stream para el modo multistream")
+
+    primary_stream = streams[0]
+    args = _parse_args(argv, primary_stream, multi_streams=streams)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    if getattr(args, "config", None):
+        args.config = args.config.expanduser().resolve()
+        config_dir = args.config.parent
+    else:
+        config_dir = None
+
+    train_dirs = {
+        stream: [_resolve_path(path, config_dir) for path in directories]
+        for stream, directories in args.train_dir.items()
+    }
+    output_dir = _resolve_path(args.output_dir, config_dir)
+    resume_path = _resolve_path(args.resume, config_dir) if args.resume else None
+    export_path = (
+        _resolve_path(args.export_backbone, config_dir) if args.export_backbone else None
+    )
+
+    args.train_dir = train_dirs
+    args.output_dir = output_dir
+    args.resume = resume_path
+    args.export_backbone = export_path
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    LOGGER.info("Usando dispositivo %s", device)
+    _seed_everything(args.seed)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataloader = build_multistream_dataloader(
+        train_dirs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=bool(args.dataset_shuffle),
+        pin_memory=bool(args.dataset_pin_memory),
+        persistent_workers=bool(args.dataset_persistent_workers),
+    )
+
+    augment_cfg = AugmentationConfig(
+        image_size=args.image_size,
+        global_crop_scale=tuple(float(x) for x in args.global_crop_scale),
+        local_crop_size=args.local_crop_size,
+        local_crop_scale=tuple(float(x) for x in args.local_crop_scale),
+        num_local_crops=args.num_local_crops,
+        brightness=args.aug_brightness,
+        contrast=args.aug_contrast,
+        saturation=args.aug_saturation,
+        hue=args.aug_hue,
+        color_jitter_prob=args.aug_color_jitter_prob,
+        grayscale_prob=args.aug_grayscale_prob,
+        gaussian_blur_prob=args.aug_gaussian_blur_prob,
+        solarize_prob=args.aug_solarize_prob,
+        hflip_prob=args.aug_hflip_prob,
+        mean=tuple(float(x) for x in args.aug_mean),
+        std=tuple(float(x) for x in args.aug_std),
+    )
+    augmenter = DINOMultiCropAugmentation(augment_cfg)
+
+    backbone_meta = BackboneConfig(
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        embed_dim=args.vit_embed_dim,
+        depth=args.vit_depth,
+        num_heads=args.vit_num_heads,
+        mlp_ratio=args.vit_mlp_ratio,
+    )
+
+    tracker = ExperimentTracker(
+        output_dir,
+        history_filename=args.checkpoint_history_file,
+    )
+    experiment_info = {
+        "name": args.experiment_name,
+        "notes": args.experiment_notes,
+        "tags": list(args.experiment_tag or []),
+    }
+    experiment_info = {
+        key: value
+        for key, value in experiment_info.items()
+        if value not in (None, "", [])
+    }
+    tracker_payload: dict[str, Any] = {
+        "algorithm": args.algorithm,
+        "streams": list(streams),
+        "train_dirs": {
+            stream: [str(path) for path in directories]
+            for stream, directories in train_dirs.items()
+        },
+        "output_dir": str(output_dir),
+        "epochs": args.epochs,
+        "seed": args.seed,
+        "optimizer": {
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "warmup_epochs": args.warmup_epochs,
+        },
+        "regularization": {
+            "koleo_epsilon": args.koleo_epsilon,
+            "koleo_weight": args.koleo_weight,
+        },
+        "teacher_momentum": {
+            "base": args.teacher_momentum_base,
+            "final": args.teacher_momentum_final,
+        },
+        "dataset": {
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "shuffle": bool(args.dataset_shuffle),
+            "pin_memory": bool(args.dataset_pin_memory),
+            "persistent_workers": bool(args.dataset_persistent_workers),
+        },
+        "augmentation": asdict(augment_cfg),
+        "backbone": asdict(backbone_meta),
+        "checkpointing": {
+            "best": args.checkpoint_best_name,
+            "last": args.checkpoint_last_name,
+            "history_file": args.checkpoint_history_file,
+        },
+    }
+    if experiment_info:
+        tracker_payload["experiment"] = experiment_info
+    if args.config:
+        tracker_payload["config_file"] = str(args.config)
+    if resume_path:
+        tracker_payload["resume"] = str(resume_path)
+    if export_path:
+        tracker_payload["export_backbone"] = str(export_path)
+    tracker.log_params(tracker_payload)
+
+    (
+        student_backbones,
+        teacher_backbones,
+        student_head,
+        teacher_head,
+        student_patch_head,
+        teacher_patch_head,
+    ) = _build_multistream_models(args, device, streams)
+
+    parameters: list[nn.Parameter] = []
+    for module in student_backbones.values():
+        parameters.extend(module.parameters())
+    parameters.extend(student_head.parameters())
+    if args.algorithm == "ibot" and student_patch_head is not None:
+        parameters.extend(student_patch_head.parameters())
+    optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    total_steps = len(dataloader) * args.epochs
+    if total_steps == 0:
+        raise RuntimeError("El dataset está vacío; no es posible entrenar")
+    warmup_steps = int(len(dataloader) * args.warmup_epochs)
+    lr_schedule = list(cosine_scheduler(args.learning_rate, warmup_steps, total_steps))
+    momentum_schedule = _momentum_schedule(
+        args.teacher_momentum_base,
+        args.teacher_momentum_final,
+        total_steps,
+    )
+
+    start_epoch, best_loss, global_step = _resume_if_needed(
+        args,
+        student_backbones,
+        teacher_backbones,
+        student_head,
+        teacher_head,
+        optimizer,
+        None,
+        student_patch_head,
+        teacher_patch_head,
+    )
+
+    dino_loss_fn = DINOLoss(
+        args.out_dim,
+        student_temp=args.student_temp,
+        teacher_temp=args.teacher_temp,
+        center_momentum=args.center_momentum,
+    ).to(device)
+    ibot_loss_fn = (
+        IBOTLoss(
+            args.patch_out_dim,
+            student_temp=args.student_temp,
+            teacher_temp=args.teacher_temp,
+            center_momentum=args.center_momentum,
+            global_weight=0.0,
+            patch_weight=args.patch_loss_weight,
+        ).to(device)
+        if args.algorithm == "ibot"
+        else None
+    )
+    koleo_loss_fn = (
+        KoLeoLoss(epsilon=args.koleo_epsilon).to(device)
+        if args.koleo_weight > 0
+        else None
+    )
+
+    best_checkpoint = output_dir / args.checkpoint_best_name
+    last_checkpoint = output_dir / args.checkpoint_last_name
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        for module in student_backbones.values():
+            module.train()
+        student_head.train()
+        if student_patch_head is not None:
+            student_patch_head.train()
+        epoch_loss = 0.0
+        epoch_koleo = 0.0
+        for step, batch in enumerate(dataloader, start=1):
+            optimizer.zero_grad(set_to_none=True)
+            for module in teacher_backbones.values():
+                module.eval()
+            teacher_head.eval()
+            if teacher_patch_head is not None:
+                teacher_patch_head.eval()
+
+            if not batch:
+                continue
+            batch_sizes = {stream: len(images) for stream, images in batch.items()}
+            if len(set(batch_sizes.values())) != 1:
+                raise RuntimeError("Todos los streams deben compartir el mismo tamaño de batch")
+
+            global_views_per_stream: dict[str, list[list[torch.Tensor]]] = {
+                stream: [] for stream in streams
+            }
+            local_views_per_stream: dict[str, list[list[torch.Tensor]]] = {
+                stream: [] for stream in streams
+            }
+            for stream in streams:
+                for image in batch[stream]:
+                    globals_, locals_ = augmenter(image)
+                    global_views_per_stream[stream].append(globals_)
+                    local_views_per_stream[stream].append(locals_)
+
+            global_stacked: dict[str, list[torch.Tensor]] = {}
+            local_stacked: dict[str, list[torch.Tensor]] = {}
+            for stream in streams:
+                per_image_globals = global_views_per_stream[stream]
+                if not per_image_globals:
+                    raise RuntimeError("El batch generó una lista vacía de crops globales")
+                global_stacked[stream] = [
+                    torch.stack(crop).to(device) for crop in zip(*per_image_globals)
+                ]
+                if local_views_per_stream[stream] and local_views_per_stream[stream][0]:
+                    stacked = [
+                        torch.stack(crop).to(device)
+                        for crop in zip(*local_views_per_stream[stream])
+                    ]
+                    local_stacked[stream] = stacked
+                else:
+                    local_stacked[stream] = []
+
+            global_counts = [len(views) for views in global_stacked.values()]
+            if len(set(global_counts)) != 1:
+                raise RuntimeError("Los streams no comparten la misma cantidad de crops globales")
+            num_global_views = global_counts[0]
+            global_views = [
+                {stream: global_stacked[stream][idx] for stream in streams}
+                for idx in range(num_global_views)
+            ]
+
+            local_counts = [len(views) for views in local_stacked.values()]
+            num_local_views = local_counts[0] if local_counts else 0
+            if any(count != num_local_views for count in local_counts):
+                raise RuntimeError("Los streams no comparten la misma cantidad de crops locales")
+            local_views = [
+                {stream: local_stacked[stream][idx] for stream in streams}
+                for idx in range(num_local_views)
+            ]
+
+            with torch.no_grad():
+                teacher_outputs: list[torch.Tensor] = []
+                teacher_patch_outputs: list[torch.Tensor] = []
+                for view in global_views:
+                    cls_tokens = []
+                    patch_tokens = []
+                    for stream in streams:
+                        cls, patches = teacher_backbones[stream].forward_with_patches(view[stream])
+                        cls_tokens.append(cls)
+                        if teacher_patch_head is not None:
+                            patch_tokens.append(patches)
+                    combined_cls = _combine_cls_tokens(cls_tokens)
+                    teacher_outputs.append(teacher_head(combined_cls))
+                    if teacher_patch_head is not None:
+                        combined_patch = _combine_patch_tokens(patch_tokens)
+                        teacher_patch_outputs.append(teacher_patch_head(combined_patch))
+
+            student_outputs: list[torch.Tensor] = []
+            student_patch_outputs: list[torch.Tensor] = []
+            student_global_embeddings: list[torch.Tensor] = []
+            all_views = global_views + local_views
+            for idx, view in enumerate(all_views):
+                cls_tokens = []
+                patch_tokens = []
+                for stream in streams:
+                    cls, patches = student_backbones[stream].forward_with_patches(view[stream])
+                    cls_tokens.append(cls)
+                    if student_patch_head is not None and idx < len(global_views):
+                        patch_tokens.append(patches)
+                combined_cls = _combine_cls_tokens(cls_tokens)
+                student_outputs.append(student_head(combined_cls))
+                if idx < len(global_views):
+                    student_global_embeddings.append(combined_cls)
+                    if student_patch_head is not None and patch_tokens:
+                        combined_patch = _combine_patch_tokens(patch_tokens)
+                        student_patch_outputs.append(student_patch_head(combined_patch))
+
+            loss = _compute_dino_loss(teacher_outputs, student_outputs, dino_loss_fn)
+
+            if (
+                ibot_loss_fn is not None
+                and student_patch_outputs
+                and teacher_patch_outputs
+            ):
+                student_patches = torch.cat(student_patch_outputs, dim=0)
+                teacher_patches = torch.cat(teacher_patch_outputs, dim=0)
+                mask = mask_patches(student_patches.shape, args.patch_mask_ratio, device)
+                loss = loss + ibot_loss_fn(
+                    student_patches.mean(dim=1),
+                    teacher_patches.mean(dim=1),
+                    student_patches,
+                    teacher_patches,
+                    mask,
+                )
+
+            koleo_loss_term: torch.Tensor | None = None
+            if koleo_loss_fn is not None and student_global_embeddings:
+                terms = [
+                    koleo_loss_fn(embeddings)
+                    for embeddings in student_global_embeddings
+                ]
+                if terms:
+                    koleo_loss_term = torch.stack(terms).sum()
+                    loss = loss + args.koleo_weight * koleo_loss_term
+                    epoch_koleo += float(koleo_loss_term.item())
+
+            loss.backward()
+            if args.clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(parameters, args.clip_grad_norm)
+
+            schedule_idx = min(global_step, len(lr_schedule) - 1)
+            lr = lr_schedule[schedule_idx]
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+            optimizer.step()
+
+            momentum = momentum_schedule[schedule_idx]
+            _update_teacher(
+                student_backbones,
+                teacher_backbones,
+                student_head,
+                teacher_head,
+                momentum,
+                student_patch_head=student_patch_head,
+                teacher_patch_head=teacher_patch_head,
+            )
+
+            epoch_loss += loss.item()
+            global_step += 1
+            if step % args.log_interval == 0:
+                LOGGER.info(
+                    "Época %d - iter %d/%d - pérdida %.4f",
+                    epoch,
+                    step,
+                    len(dataloader),
+                    loss.item(),
+                )
+                metrics = {
+                    "loss": float(loss.item()),
+                    "epoch": epoch,
+                    "step": step,
+                }
+                if koleo_loss_term is not None:
+                    metrics["koleo_loss"] = float(koleo_loss_term.item())
+                tracker.log_metrics(global_step, metrics, context="train_step")
+
+        num_batches = len(dataloader)
+        denominator = max(num_batches, 1)
+        avg_loss = epoch_loss / denominator
+        avg_koleo = epoch_koleo / denominator if num_batches else 0.0
+        LOGGER.info("Época %d completada - pérdida media %.4f", epoch, avg_loss)
+        epoch_metrics = {"loss": float(avg_loss), "epoch": epoch}
+        if koleo_loss_fn is not None:
+            epoch_metrics["koleo_loss"] = float(avg_koleo)
+        tracker.log_metrics(global_step, epoch_metrics, context="train_epoch")
+
+        new_best = avg_loss < best_loss
+        best_loss = min(best_loss, avg_loss)
+        metadata = {
+            "epoch": epoch,
+            "algorithm": args.algorithm,
+            "streams": list(streams),
+            "backbone": {
+                "image_size": args.image_size,
+                "patch_size": args.patch_size,
+                "embed_dim": args.vit_embed_dim,
+                "depth": args.vit_depth,
+                "num_heads": args.vit_num_heads,
+                "mlp_ratio": args.vit_mlp_ratio,
+            },
+            "best_loss": best_loss,
+            "global_step": global_step,
+            "regularization": {
+                "koleo_epsilon": args.koleo_epsilon,
+                "koleo_weight": args.koleo_weight,
+            },
+            "train_dirs": {
+                stream: [str(path) for path in directories]
+                for stream, directories in train_dirs.items()
+            },
+        }
+        if student_patch_head is not None and teacher_patch_head is not None:
+            metadata["student_patch"] = student_patch_head.state_dict()
+            metadata["teacher_patch"] = teacher_patch_head.state_dict()
+
+        state = CheckpointState(
+            epoch=epoch,
+            student={
+                stream: module.state_dict() for stream, module in student_backbones.items()
+            },
+            teacher={
+                stream: module.state_dict() for stream, module in teacher_backbones.items()
+            },
+            head=student_head.state_dict(),
+            teacher_head=teacher_head.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=None,
+            metadata=metadata,
+        )
+        save_checkpoint(last_checkpoint, state)
+        tracker.register_artifact(
+            last_checkpoint,
+            name="checkpoint_last",
+            metadata={"epoch": epoch, "loss": float(avg_loss)},
+        )
+        if new_best:
+            LOGGER.info("Nueva mejor pérdida %.4f en época %d", avg_loss, epoch)
+            save_checkpoint(best_checkpoint, state)
+            tracker.register_artifact(
+                best_checkpoint,
+                name="checkpoint_best",
+                metadata={"epoch": epoch, "loss": float(avg_loss)},
+            )
+            tracker.log_metrics(
+                global_step,
+                {"loss": float(avg_loss), "epoch": epoch},
+                context="train_best",
+            )
+
+    if args.export_backbone:
+        export_target = args.export_backbone
+        if export_target.suffix:
+            base_dir = export_target.parent
+            base_dir.mkdir(parents=True, exist_ok=True)
+            prefix = export_target.stem
+            extension = export_target.suffix
+        else:
+            base_dir = export_target
+            base_dir.mkdir(parents=True, exist_ok=True)
+            prefix = export_target.name or "backbone"
+            extension = ".pt"
+
+        manifest = {
+            "streams": {},
+            "algorithm": args.algorithm,
+            "best_loss": best_loss,
+            "epochs": args.epochs,
+            "global_step": global_step,
+            "backbone": {
+                "image_size": args.image_size,
+                "patch_size": args.patch_size,
+                "embed_dim": args.vit_embed_dim,
+                "depth": args.vit_depth,
+                "num_heads": args.vit_num_heads,
+                "mlp_ratio": args.vit_mlp_ratio,
+            },
+        }
+
+        for stream in streams:
+            stream_path = base_dir / f"{prefix}_{stream}{extension}"
+            stream_metadata = {
+                "stream": stream,
+                "algorithm": args.algorithm,
+                "best_loss": best_loss,
+                "epochs": args.epochs,
+                "global_step": global_step,
+                "backbone": {
+                    "image_size": args.image_size,
+                    "patch_size": args.patch_size,
+                    "embed_dim": args.vit_embed_dim,
+                    "depth": args.vit_depth,
+                    "num_heads": args.vit_num_heads,
+                    "mlp_ratio": args.vit_mlp_ratio,
+                },
+            }
+            export_for_dinov2(
+                stream_path,
+                backbone=teacher_backbones[stream],
+                metadata=stream_metadata,
+            )
+            LOGGER.info("Backbone del stream %s exportado a %s", stream, stream_path)
+            tracker.register_artifact(
+                stream_path,
+                name=f"exported_backbone_{stream}",
+                metadata=stream_metadata,
+            )
+            manifest["streams"][stream] = str(stream_path)
+
+        manifest_path = base_dir / f"{prefix}_manifest.json"
+        with manifest_path.open("w", encoding="utf8") as handle:
+            json.dump(manifest, handle, indent=2)
+        tracker.register_artifact(
+            manifest_path,
+            name="exported_backbone_manifest",
+            metadata={"streams": list(streams)},
         )

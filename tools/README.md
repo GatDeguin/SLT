@@ -159,6 +159,9 @@ optim:
 - `_pretrain_dino.py`, `pretrain_dino_face.py`, `pretrain_dino_hands.py`:
   scripts para entrenar backbones auto-supervisados DINO/iBOT. Revisa
   [docs/pretraining.md](../docs/pretraining.md) para flujos avanzados.
+- `pretrain_dinov2_multistream.py`: variante que consume simultáneamente los
+  recortes de rostro, mano izquierda y mano derecha, exportando pesos
+  sincronizados por stream.
 - `pretrain_utils.py`: helpers compartidos para manejo de configuraciones,
   logging y exportación de pesos.
 
