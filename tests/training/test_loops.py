@@ -326,6 +326,101 @@ def test_metric_aggregation():
     assert "mean_target" in result.metrics
     assert math.isfinite(result.metrics["mean_target"])
 
+
+def test_eval_epoch_weights_translation_tokens_with_mapping_targets():
+    device = torch.device("cpu")
+    model = nn.Identity().to(device)
+
+    batch_a = torch.tensor(
+        [[1, 2, -100], [3, -100, -100]],
+        dtype=torch.long,
+    )
+    batch_b = torch.tensor(
+        [[-100, 1, -100], [1, 1, -100]],
+        dtype=torch.long,
+    )
+    loader = [
+        {"inputs": torch.zeros(2, 1), "targets": {"translation": batch_a}},
+        {"inputs": torch.zeros(2, 1), "targets": {"translation": batch_b}},
+    ]
+
+    def loss_fn(outputs, targets, inputs=None):
+        return outputs.sum() * 0.0
+
+    def ratio_metric(outputs, targets):
+        labels = targets["translation"]
+        mask = labels.ne(-100)
+        positives = labels.eq(1) & mask
+        count = mask.sum().clamp_min(1)
+        return float(positives.sum().float() / count.float())
+
+    result = eval_epoch(
+        model,
+        loader,
+        loss_fn,
+        device=device,
+        metrics={"ratio": ratio_metric},
+    )
+
+    total_tokens = 0
+    total_positive = 0
+    for batch in (batch_a, batch_b):
+        mask = batch.ne(-100)
+        total_tokens += int(mask.sum().item())
+        total_positive += int((batch.eq(1) & mask).sum().item())
+
+    expected = total_positive / total_tokens
+    assert result.metrics["ratio"] == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+
+def test_eval_epoch_uses_attention_mask_for_mapping_targets():
+    device = torch.device("cpu")
+    model = nn.Identity().to(device)
+
+    scores_a = torch.tensor([[0.5, 1.0, 2.0], [0.0, 4.0, 0.0]])
+    mask_a = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.bool)
+    scores_b = torch.tensor([[3.0, 0.0, 1.0], [5.0, 6.0, 0.0]])
+    mask_b = torch.tensor([[1, 0, 1], [1, 1, 0]], dtype=torch.bool)
+    loader = [
+        {
+            "inputs": torch.zeros(2, 1),
+            "targets": {"scores": scores_a, "attention_mask": mask_a},
+        },
+        {
+            "inputs": torch.zeros(2, 1),
+            "targets": {"scores": scores_b, "attention_mask": mask_b},
+        },
+    ]
+
+    def loss_fn(outputs, targets, inputs=None):
+        return outputs.sum() * 0.0
+
+    def masked_mean(outputs, targets):
+        scores = targets["scores"]
+        mask = targets["attention_mask"]
+        valid = mask.bool()
+        total = scores[valid].sum()
+        count = valid.sum().clamp_min(1)
+        return float(total / count)
+
+    result = eval_epoch(
+        model,
+        loader,
+        loss_fn,
+        device=device,
+        metrics={"masked_mean": masked_mean},
+    )
+
+    total_sum = 0.0
+    total_count = 0
+    for scores, mask in ((scores_a, mask_a), (scores_b, mask_b)):
+        valid = mask.bool()
+        total_sum += float(scores[valid].sum().item())
+        total_count += int(valid.sum().item())
+
+    expected = total_sum / total_count
+    assert result.metrics["masked_mean"] == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
 def test_resume_from_checkpoint(tmp_path):
     device = torch.device("cpu")
     torch.manual_seed(0)

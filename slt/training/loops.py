@@ -88,16 +88,128 @@ def _execute_forward(callable_obj: Callable[..., torch.Tensor], inputs: Inputs) 
     return callable_obj(inputs)
 
 
+def _mask_compatible(mask: torch.Tensor, tensor: torch.Tensor) -> bool:
+    if mask.numel() == 0 or tensor.numel() == 0:
+        return True
+    if mask.shape == tensor.shape:
+        return True
+    if mask.dim() == 0 or tensor.dim() == 0:
+        return True
+    if mask.shape[0] == tensor.shape[0]:
+        return True
+    if mask.numel() == tensor.numel():
+        return True
+    return False
+
+
+def _count_from_mask(mask: torch.Tensor) -> int:
+    if mask.dtype == torch.bool:
+        valid = mask
+    else:
+        valid = mask.ne(0)
+    return int(valid.sum().item())
+
+
+def _count_tensor_items(tensor: torch.Tensor, mask: Optional[torch.Tensor] = None) -> int:
+    if mask is not None and _mask_compatible(mask, tensor):
+        return _count_from_mask(mask)
+    if tensor.dim() == 0:
+        return 1
+    if tensor.dtype in {torch.int64, torch.int32, torch.long} and tensor.dim() > 1:
+        valid = tensor.ne(-100)
+        count = int(valid.sum().item())
+        if count > 0:
+            return count
+    return tensor.shape[0]
+
+
+def _candidate_mask_keys(key: str) -> Tuple[str, ...]:
+    overrides: Dict[str, Tuple[str, ...]] = {
+        "translation": (
+            "translation_attention_mask",
+            "decoder_attention_mask",
+            "attention_mask",
+        ),
+        "labels": (
+            "labels_attention_mask",
+            "decoder_attention_mask",
+            "attention_mask",
+        ),
+        "ctc_labels": ("ctc_mask",),
+        "scores": ("attention_mask",),
+        "logits": ("attention_mask",),
+    }
+    base = list(overrides.get(key, ()))
+    if key.endswith("_labels"):
+        prefix = key[: -len("_labels")]
+        base.extend((f"{prefix}_mask", f"{prefix}_attention_mask"))
+    for suffix in ("_attention_mask", "_mask", "_masks"):
+        base.append(f"{key}{suffix}")
+    base.extend(("attention_mask", "mask"))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in base:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return tuple(ordered)
+
+
+def _find_mask_for_key(
+    mapping: Mapping[str, Any], key: str, tensor: torch.Tensor
+) -> Optional[torch.Tensor]:
+    for candidate in _candidate_mask_keys(key):
+        if candidate == key:
+            continue
+        mask = mapping.get(candidate)
+        if isinstance(mask, torch.Tensor) and _mask_compatible(mask, tensor):
+            return mask
+    return None
+
+
+def _iter_tensor_candidates(
+    mapping: Mapping[str, Any]
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    primary: list[Tuple[str, torch.Tensor]] = []
+    masks: list[Tuple[str, torch.Tensor]] = []
+    for key, value in mapping.items():
+        if not isinstance(value, torch.Tensor) or key == "translation":
+            continue
+        lower = key.lower()
+        if (
+            lower.endswith("mask")
+            or lower.endswith("masks")
+            or lower.endswith("attention_mask")
+        ):
+            masks.append((key, value))
+        else:
+            primary.append((key, value))
+    yield from primary
+    yield from masks
+
+
 def _count_items(targets: Any) -> int:
     if isinstance(targets, torch.Tensor):
-        if targets.dim() == 0:
-            return 1
-        if targets.dtype in {torch.int64, torch.int32, torch.long} and targets.dim() > 1:
-            valid = targets.ne(-100)
-            count = int(valid.sum().item())
-            if count > 0:
-                return count
-        return targets.shape[0]
+        return _count_tensor_items(targets)
+    if isinstance(targets, Mapping):
+        translation = targets.get("translation")
+        if isinstance(translation, torch.Tensor):
+            mask = _find_mask_for_key(targets, "translation", translation)
+            return _count_tensor_items(translation, mask=mask)
+        for key, tensor in _iter_tensor_candidates(targets):
+            mask = _find_mask_for_key(targets, key, tensor)
+            return _count_tensor_items(tensor, mask=mask)
+        for value in targets.values():
+            if isinstance(value, Mapping):
+                nested = _count_items(value)
+                if nested:
+                    return nested
+            elif isinstance(value, (list, tuple)):
+                for element in value:
+                    nested = _count_items(element)
+                    if nested:
+                        return nested
+        return 1
     if isinstance(targets, (list, tuple)):
         return len(targets)
     if hasattr(targets, "__len__"):
