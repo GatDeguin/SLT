@@ -70,3 +70,31 @@
   los hiperparámetros de DINOv2 e iBOT utilizados.
 - El artículo incluye enlaces a la web del proyecto y a correos de contacto en la
   primera página para consultas adicionales.
+
+## Cómo reproducir benchmarks
+- La CLI `tools/train_slt_multistream_v9.py` ahora informa la duración de cada
+  época, el pico de memoria CUDA y las métricas BLEU/ChrF al cierre de la
+  validación. Los valores quedan registrados en `metrics.jsonl` junto al resto
+  de indicadores.
+- Para comparar checkpoints propios con pipelines externos ejecuta el script
+  `tools/batch_eval_slt_models.py` reutilizando los mismos directorios de How2Sign.
+  El siguiente ejemplo evalúa un checkpoint interno y un comando externo que usa
+  plantillas de ruta:
+
+```
+python tools/batch_eval_slt_models.py \
+  --face-dir data/single_signer/face \
+  --hand-left-dir data/single_signer/hand_left \
+  --hand-right-dir data/single_signer/hand_right \
+  --pose-dir data/single_signer/pose \
+  --metadata-csv meta.csv \
+  --eval-index docs/how2sign_val_split.csv \
+  --tokenizer slt/tokenizers/signmusketeers \
+  --model musketeers=checkpoint:/models/signmusketeers/best.pt \
+  --model ssvp=command:"python eval_ssvp.py --face {face_dir} --index {eval_index}" \
+  --output-dir reports/how2sign_benchmark
+```
+
+- La carpeta de salida contiene `batch_eval_report.json`, `batch_eval_report.csv`
+  y un CSV de predicciones por modelo (`*_predictions.csv`) con columnas
+  `video_id`, `prediction` y `reference` para inspeccionar las hipótesis.

@@ -16,9 +16,10 @@ import argparse
 import json
 import logging
 import random
+import time
+from collections.abc import Mapping
 from dataclasses import asdict, fields
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import torch
@@ -95,6 +96,12 @@ try:  # pragma: no cover - TensorBoard is an optional dependency.
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:  # pragma: no cover - if TensorBoard is not installed we noop.
     SummaryWriter = None  # type: ignore
+
+try:  # pragma: no cover - sacrebleu is optional during training.
+    from sacrebleu.metrics import BLEU, CHRF
+except Exception:  # pragma: no cover - optional dependency may be missing.
+    BLEU = None  # type: ignore[assignment]
+    CHRF = None  # type: ignore[assignment]
 
 
 def _resolve_device(flag: str | torch.device) -> torch.device:
@@ -183,6 +190,91 @@ def _build_cer_metric(tokenizer: PreTrainedTokenizerBase) -> Callable[[Any, torc
         return total_distance / total_chars
 
     return _metric
+
+
+def _move_to_device(data: Any, device: torch.device) -> Any:
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    if isinstance(data, Mapping):
+        return type(data)({key: _move_to_device(value, device) for key, value in data.items()})
+    if isinstance(data, (list, tuple)):
+        return type(data)(_move_to_device(item, device) for item in data)
+    return data
+
+
+def _decode_label_texts(
+    labels: torch.Tensor, tokenizer: PreTrainedTokenizerBase
+) -> list[str]:
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    labels_cpu = labels.detach().to(device="cpu")
+    sanitised = labels_cpu.clone()
+    sanitised[sanitised < 0] = pad_id
+    return tokenizer.batch_decode(sanitised.tolist(), skip_special_tokens=True)
+
+
+def _compute_validation_text_metrics(
+    model: MultiStreamClassifier,
+    loader: torch.utils.data.DataLoader,
+    tokenizer: PreTrainedTokenizerBase,
+    device: torch.device,
+    *,
+    max_length: int,
+    num_beams: int = 1,
+) -> dict[str, float]:
+    if loader is None:
+        return {}
+    if BLEU is None or CHRF is None:
+        logging.debug(
+            "sacrebleu no está disponible; se omiten métricas BLEU/ChrF durante la validación."
+        )
+        return {}
+    bleu_metric = BLEU(tokenize="13a")
+    chrf_metric = CHRF()
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id
+    predictions: list[str] = []
+    references: list[str] = []
+    generation_kwargs = {
+        "max_length": int(max_length),
+        "num_beams": max(1, int(num_beams)),
+        "early_stopping": num_beams > 1,
+        "pad_token_id": pad_id,
+        "eos_token_id": eos_id,
+    }
+    model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            batch_inputs = batch.get("inputs")
+            if not isinstance(batch_inputs, Mapping):
+                continue
+            generation_inputs: dict[str, Any] = {}
+            for key, value in batch_inputs.items():
+                if key in {"labels", "decoder_attention_mask"}:
+                    continue
+                generation_inputs[key] = value
+            prepared = _move_to_device(generation_inputs, device)
+            sequences = model.generate(**prepared, **generation_kwargs)
+            if hasattr(sequences, "sequences"):
+                sequences_tensor = sequences.sequences  # type: ignore[attr-defined]
+            else:
+                sequences_tensor = sequences
+            decoded_batch = tokenizer.batch_decode(
+                sequences_tensor.detach().to(device="cpu").tolist(),
+                skip_special_tokens=True,
+            )
+            predictions.extend(decoded_batch)
+            label_tensor = batch.get("labels")
+            if isinstance(label_tensor, torch.Tensor):
+                references.extend(_decode_label_texts(label_tensor, tokenizer))
+            else:
+                references.extend([""] * len(decoded_batch))
+    if not predictions or not references:
+        return {}
+    bleu_score = bleu_metric.corpus_score(predictions, [references]).score
+    chrf_score = chrf_metric.corpus_score(predictions, [references]).score
+    return {"bleu": float(bleu_score), "chrf": float(chrf_score)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -1159,6 +1251,10 @@ def main() -> None:
 
     logging.info("Starting training for %d epochs", training_config.epochs)
     for epoch in range(start_epoch + 1, training_config.epochs + 1):
+        epoch_start = time.perf_counter()
+        peak_memory_bytes: Optional[int] = None
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
         train_result = train_epoch(
             model,
             train_loader,
@@ -1177,17 +1273,37 @@ def main() -> None:
             device=device,
             metrics=eval_metrics,
         )
+        text_metrics = _compute_validation_text_metrics(
+            model,
+            val_loader,
+            tokenizer,
+            device,
+            max_length=data_config.max_target_length,
+        )
+        if text_metrics:
+            val_result.metrics.update(text_metrics)
         train_loss = train_result.loss
         val_loss = val_result.loss
         train_ctc = train_result.metrics.get("loss_ctc_weighted")
         val_ctc = val_result.metrics.get("loss_ctc_weighted")
         train_dist = train_result.metrics.get("loss_distillation_weighted")
         val_dist = val_result.metrics.get("loss_distillation_weighted")
+        epoch_time = time.perf_counter() - epoch_start
+        if device.type == "cuda" and torch.cuda.is_available():
+            peak_memory_bytes = int(torch.cuda.max_memory_allocated(device))
+        bleu_val = val_result.metrics.get("bleu", float("nan"))
+        chrf_val = val_result.metrics.get("chrf", float("nan"))
+        peak_memory_gb = (
+            float(peak_memory_bytes) / (1024**3)
+            if peak_memory_bytes is not None
+            else float("nan")
+        )
 
         logging.info(
             "Epoch %d/%d - train_loss=%.4f - val_loss=%.4f - ppl_train=%.4f - "
-            "ppl_val=%.4f - cer_val=%.4f - ctc_train=%.4f - ctc_val=%.4f - "
-            "dist_train=%.4f - dist_val=%.4f",
+            "ppl_val=%.4f - cer_val=%.4f - bleu_val=%.2f - chrf_val=%.2f - "
+            "ctc_train=%.4f - ctc_val=%.4f - dist_train=%.4f - dist_val=%.4f - "
+            "epoch_time=%.2fs - peak_mem=%.2fGB",
             epoch,
             training_config.epochs,
             train_loss,
@@ -1195,10 +1311,14 @@ def main() -> None:
             train_result.metrics.get("perplexity", float("nan")),
             val_result.metrics.get("perplexity", float("nan")),
             val_result.metrics.get("cer", float("nan")),
+            bleu_val,
+            chrf_val,
             float("nan") if train_ctc is None else float(train_ctc),
             float("nan") if val_ctc is None else float(val_ctc),
             float("nan") if train_dist is None else float(train_dist),
             float("nan") if val_dist is None else float(val_dist),
+            epoch_time,
+            peak_memory_gb,
         )
 
         if writer is not None:
@@ -1210,6 +1330,13 @@ def main() -> None:
             if val_result.metrics:
                 for name, value in val_result.metrics.items():
                     writer.add_scalar(f"val/{name}", value, epoch)
+            writer.add_scalar("system/epoch_time_s", epoch_time, epoch)
+            if peak_memory_bytes is not None:
+                writer.add_scalar(
+                    "system/peak_memory_gb",
+                    peak_memory_gb,
+                    epoch,
+                )
 
         improved = val_loss < best_val
         _save_checkpoint(
@@ -1254,6 +1381,8 @@ def main() -> None:
             "learning_rate": _safe_float(current_lr),
             "best_val": _safe_float(best_val),
             "improved": improved,
+            "epoch_time_s": _safe_float(epoch_time),
+            "peak_memory_bytes": peak_memory_bytes,
         }
         _append_metrics(metrics_path, record)
 
