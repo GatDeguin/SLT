@@ -62,6 +62,42 @@ Artefactos generados en `--work-dir`:
 - `config.json`: configuración efectiva combinando defaults, archivo y CLI.
 - `metrics.jsonl`: historial con pérdidas y métricas por época.
 
+## Fine-tuning con T5 v1.1 Base (`--decoder-preset signmusketeers`)
+
+El preset `signmusketeers` replica la configuración descrita en
+`configs/presets/decoder_signmusketeers_t5.yaml`, ajustando el espacio latente a 768
+dimensiones y concatenando las corrientes de rostro, manos y pose antes de un decoder
+`google/t5-v1_1-base`. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L1-L31】
+
+Pasos recomendados:
+
+1. **Verifica dependencias**: instala `transformers>=4.40` y asegúrate de haber ejecutado
+   `huggingface-cli login` si el checkpoint requiere autenticación.
+2. **Lanza el entrenamiento** usando el preset. El tokenizador se resuelve automáticamente a
+   `google/t5-v1_1-base`, por lo que no es necesario especificar `--tokenizer`.
+   ```bash
+   python tools/train_slt_multistream_v9.py \
+     --decoder-preset signmusketeers \
+     --face-dir data/single_signer/processed/face \
+     --hand-left-dir data/single_signer/processed/hand_l \
+     --hand-right-dir data/single_signer/processed/hand_r \
+     --pose-dir data/single_signer/processed/pose \
+     --metadata-csv meta.csv \
+     --train-index data/single_signer/index/train.csv \
+     --val-index data/single_signer/index/val.csv \
+     --work-dir work_dirs/signmusketeers_t5 \
+     --batch-size 4 --sequence-length 128
+   ```
+3. **Monitorea recursos**: con `batch-size` 4 y `sequence-length` 128 el uso de memoria
+   ronda los 22 GB en GPUs tipo RTX 3090/4090. Reduce el lote o el tamaño de secuencia si
+   trabajas con 16 GB.
+4. **Evalúa la convergencia**: tras ~30 épocas deberías observar pérdidas de validación
+   entre 2.3 y 2.6 y CER en torno a 0.55 en `data/single_signer`. Ajusta `--lr` o aplica
+   acumulación de gradientes si no se estabiliza.
+
+El preset está inspirado en el paper SignMusketeers, que reporta ~14 BLEU en How2Sign con
+esta arquitectura multi-stream. 【F:docs/signmusketeers-paper-summary.md†L9-L33】
+
 ## Argumentos destacados
 
 ### Datos

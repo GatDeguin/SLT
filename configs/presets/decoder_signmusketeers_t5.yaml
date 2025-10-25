@@ -1,0 +1,30 @@
+# Preset SignMusketeers para entrenar con T5 v1.1 Base.
+preset:
+  name: signmusketeers
+  description: >-
+    Configuración inspirada en SignMusketeers que concatena las corrientes de rostro,
+    manos y pose antes de alimentar un decoder T5 v1.1 Base.
+  reference: docs/signmusketeers-paper-summary.md
+
+data:
+  tokenizer: google/t5-v1_1-base
+  max_target_length: 196
+
+model:
+  projector_dim: 192
+  d_model: 768
+  decoder_layers: 12
+  decoder_heads: 12
+  decoder_dropout: 0.1
+  fusion_dropout: 0.1
+  decoder_model: google/t5-v1_1-base
+  decoder_kwargs:
+    tie_embeddings: true
+  mska_gloss_fusion: concat
+
+training:
+  epochs: 30
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 0.01
