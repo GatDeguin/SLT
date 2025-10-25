@@ -11,7 +11,7 @@ experimentos o adaptar el flujo a nuevas variantes.
 1. [Resumen del pipeline](#resumen-del-pipeline)
 2. [Instalación](#instalación)
 3. [Flujo recomendado de extremo a extremo](#flujo-recomendado-de-extremo-a-extremo)
-4. [Preparación de datos](#preparación-de-datos-datasingle_signer)
+4. [Preparación de datos](#preparacion-de-datos-datasingle_signer)
 5. [Entrenamiento y evaluación](#entrenamiento-y-evaluación)
 6. [Exportación y demos](#exportación-y-demos-en-tiempo-real)
 7. [Preentrenamiento de backbones](#preentrenamiento-de-backbones)
