@@ -2,8 +2,8 @@
 
 Este script sirve como referencia rápida para analistas y equipos de producto
 que necesiten consumir los reportes generados por ``tools/eval_slt_multistream_v9.py``.
-Incluye helpers para cargar los archivos ``report.json``/``report.csv`` y
-producir payloads listos para ser enviados a los dashboards internos.
+Incluye helpers para cargar el archivo ``report.json`` y producir payloads
+listos para ser enviados a los dashboards internos.
 
 Uso rápido
 ---------
@@ -137,7 +137,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "report_dir",
         type=Path,
-        help="Directorio que contiene report.json/report.csv generados por la evaluación",
+        help="Directorio que contiene report.json generado por la evaluación",
     )
     parser.add_argument(
         "--dashboard-csv",
