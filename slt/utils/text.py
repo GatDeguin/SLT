@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import zip_longest
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import torch
@@ -207,16 +208,16 @@ def _error_rate(
     *,
     tokenizer: Callable[[str], Sequence[str]],
 ) -> float:
-    if not references or not predictions:
+    if not references and not predictions:
         return 0.0
 
     total_distance = 0
     total_length = 0
-    for ref, pred in zip(references, predictions):
+    for ref, pred in zip_longest(references, predictions, fillvalue=""):
         ref_seq = tokenizer(ref or "")
         pred_seq = tokenizer(pred or "")
         total_distance += levenshtein_distance(ref_seq, pred_seq)
-        total_length += max(len(ref_seq), 1)
+        total_length += max(len(ref_seq), len(pred_seq), 1)
 
     if total_length == 0:
         return 0.0
