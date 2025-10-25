@@ -39,6 +39,55 @@ experimentos. Complementa la referencia rápida incluida en `tools/README.md`.
    `tools/eval_slt_multistream_v9.py` y `tools/export_onnx_encoder_v9.py` para
    mantener consistencia entre entrenamiento, evaluación y despliegue.
 
+## Stream gating regularizer (SGR)
+
+El SGR añade a cada stream de keypoints una matriz de atención global que se
+combina con la auto-atención local tanh del encoder MSKA. La matriz se inicializa
+como identidad y se amplía de forma perezosa cuando aumenta la secuencia,
+manteniendo los pesos previos y adaptando automáticamente dispositivo y tipo de
+dato. 【F:slt/models/mska.py†L33-L62】 Durante el *forward* la matriz activada se
+normaliza, se filtra con las máscaras válidas y se interpola con la atención
+local mediante `global_mix` (0.0 usa solo la atención local, 1.0 emplea la matriz
+global normalizada). 【F:slt/models/mska.py†L193-L211】
+
+### Activaciones disponibles
+
+`--mska-sgr-activation` admite `softmax`, `sigmoid`, `tanh`, `relu` e
+`identity`/`linear`/`none`. Las funciones se aplican elemento a elemento sobre la
+matriz antes de normalizarla y descartan valores negativos tras la activación,
+lo que permite controlar si la matriz actúa como un kernel probabilístico o
+como un mapa de calor con soporte esparso. 【F:slt/models/mska.py†L121-L133】
+
+### Compartir o especializar la matriz
+
+Al activar `--mska-sgr-shared` se crea un único `_GlobalAttentionStore` que
+sirve a todos los streams MSKA, garantizando que la matriz aprendida sea común y
+se reutilice en cada paso. 【F:slt/models/mska.py†L806-L832】 Esta opción estabiliza
+experimentos con pocos ejemplos por stream (p. ej. rostro) y reduce el número de
+parámetros adicionales.
+
+Si usas `--mska-sgr-per-stream` cada `KeypointStreamEncoder` mantiene su propio
+almacén y los gradientes solo afectan a la matriz de dicho flujo, lo que resulta
+útil cuando los streams capturan dinámicas muy distintas (pose vs. manos) o
+cuando buscas interpretar qué articulaciones dominan en cada modalidad.
+
+### Seguimiento de métricas
+
+El impacto del SGR se refleja en las métricas que ya escribe `metrics.jsonl`:
+`loss_translation_weighted`, `loss_ctc_weighted`, `loss_distillation_weighted` y
+`perplexity` permiten comparar ejecuciones con y sin SGR. Tras cada época
+puedes inspeccionarlas con `jq` para revisar tendencias:
+
+```bash
+jq '{epoch, loss_translation_weighted, loss_ctc_weighted, loss_distillation_weighted, perplexity}' \
+  work_dirs/experimento_sgr/metrics.jsonl | tail
+```
+
+Una caída sostenida en las pérdidas auxiliares indica que la matriz global está
+favoreciendo un alineamiento más consistente entre streams; si las métricas se
+mueven en sentido contrario conviene probar otra activación o reducir
+`--mska-sgr-mix` para priorizar la atención local.
+
 ## Ejecución básica
 
 ```bash
@@ -219,9 +268,10 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--leaky-relu-negative-slope` | Coeficiente de fuga de LeakyReLU en MSKA (default: 0.01). |
 | `--mska-input-dim` | Dimensionalidad de los keypoints de entrada. |
 | `--mska-use-sgr` / `--mska-no-sgr` | Activa o desactiva la matriz global compartida (SGR). |
-| `--mska-sgr-activation` | Activación aplicada a la matriz SGR (`softmax`/`sigmoid`/`tanh`/`relu`/`identity`). |
+| `--mska-sgr-activation` | Activación SGR (`softmax`/`sigmoid`/`tanh`/`relu`/`identity`). |
 | `--mska-sgr-mix` | Mezcla entre la atención local y la matriz SGR (0.0 a 1.0). |
-| `--mska-sgr-shared` / `--mska-sgr-per-stream` | Controla si la matriz SGR se comparte entre streams o se aprende por separado. |
+| `--mska-sgr-shared` | Usa una matriz global compartida. |
+| `--mska-sgr-per-stream` | Aprende una matriz por stream. |
 | `--mska-ctc-vocab` | Tamaño del vocabulario para las cabezas CTC auxiliares. |
 | `--mska-detach-teacher` | Controla si los logits fusionados participan en la distilación. |
 | `--mska-stream-heads` | Número de cabezas en la atención por articulación. |

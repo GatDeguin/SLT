@@ -144,6 +144,27 @@ optim:
 
 ## Evaluación y exportación
 
+- `configs/signmusketeers_sgr.yml`: habilita SGR sobre el preset SignMusketeers
+  y fija `mska_sgr_mix=0.6`. Alterna entre matriz compartida y específica con
+  `--set model.mska_sgr_shared=false` al invocar la CLI. Por ejemplo:
+
+  ```bash
+  python tools/train_slt_multistream_v9.py \
+    --config configs/signmusketeers_sgr.yml \
+    --set model.mska_sgr_activation=tanh \
+    --set model.mska_sgr_mix=0.4
+  ```
+
+  El archivo `work_dirs/signmusketeers_sgr/metrics.jsonl` sintetiza el efecto del
+  SGR; inspecciona `loss_translation_weighted`, `loss_ctc_weighted`,
+  `loss_distillation_weighted` y `perplexity` para comparar ejecuciones:
+
+  ```bash
+  jq '{epoch, loss_translation_weighted, loss_ctc_weighted, '\
+    'loss_distillation_weighted, perplexity}' \
+    work_dirs/signmusketeers_sgr/metrics.jsonl | tail
+  ```
+
 - `eval_slt_multistream_v9.py`: valida tokenizadores, calcula métricas BLEU,
   ChrF, CER y WER, y genera `report.json`/`report.csv` para dashboards.
 - `export_onnx_encoder_v9.py`: produce artefactos ONNX y TorchScript y puede
