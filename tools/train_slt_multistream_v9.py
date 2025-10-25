@@ -32,6 +32,7 @@ from slt.training.configuration import (
     ModelConfig,
     OptimConfig,
     TrainingConfig,
+    load_config_template,
     resolve_configs,
 )
 from slt.training.data import create_dataloader, normalise_mix_spec
@@ -41,6 +42,49 @@ from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.general import set_seed
 from slt.utils.text import create_tokenizer
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DECODER_PRESET_DIR = _REPO_ROOT / "configs" / "presets"
+_DECODER_PRESETS: dict[str, dict[str, Any]] = {
+    "signmusketeers": {
+        "path": _DECODER_PRESET_DIR / "decoder_signmusketeers_t5.yaml",
+        "aliases": {"sign-musketeers", "sign_musketeers"},
+        "summary": (
+            "Preset inspirado en SignMusketeers que concatena rostro, manos y pose hacia"
+            " un decoder T5 v1.1 Base."
+        ),
+    }
+}
+
+
+def _decoder_preset_names() -> list[str]:
+    return sorted(_DECODER_PRESETS)
+
+
+def _normalise_preset_name(raw: str) -> str:
+    return raw.strip().lower().replace("-", "_")
+
+
+def _resolve_decoder_preset(raw: str) -> tuple[str, dict[str, Any]]:
+    normalised = _normalise_preset_name(raw)
+    for name, spec in _DECODER_PRESETS.items():
+        aliases = spec.get("aliases", set())
+        if normalised == name or normalised in aliases:
+            path = spec["path"]
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Decoder preset '{name}' not found at {path}."
+                )
+            payload = dict(load_config_template(path))
+            metadata = dict(payload.get("metadata", {}))
+            metadata.setdefault("decoder_preset", name)
+            payload["metadata"] = metadata
+            return name, payload
+    available = ", ".join(_decoder_preset_names())
+    raise ValueError(
+        f"Unknown decoder preset '{raw}'. Available presets: {available or 'none'}."
+    )
 
 try:  # pragma: no cover - numpy optional for RNG capture
     import numpy as np
@@ -145,6 +189,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
     parser.add_argument("--config", type=Path, help="YAML or JSON configuration template")
+    parser.add_argument(
+        "--decoder-preset",
+        type=str,
+        help=(
+            "Nombre del preset de decoder a aplicar. Disponibles: "
+            + ", ".join(_decoder_preset_names())
+        ),
+    )
     parser.add_argument(
         "--set",
         dest="overrides",
@@ -518,6 +570,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.decoder_preset:
+        try:
+            args.decoder_preset, _ = _resolve_decoder_preset(args.decoder_preset)
+        except (ValueError, FileNotFoundError) as exc:
+            parser.error(str(exc))
     if args.decoder_config and args.decoder_model:
         parser.error("--decoder-model and --decoder-config are mutually exclusive")
     if args.decoder_class and (args.decoder_model or args.decoder_config):
@@ -665,6 +722,10 @@ def build_configs(
 ) -> tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, dict[str, Any]]:
     cli_overrides = _collect_cli_overrides(args)
     base: dict[str, Any] = {}
+    decoder_preset = getattr(args, "decoder_preset", None)
+    if decoder_preset:
+        _, preset_payload = _resolve_decoder_preset(decoder_preset)
+        base = preset_payload
     return resolve_configs(
         config_path=args.config,
         cli_overrides=cli_overrides,

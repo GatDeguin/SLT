@@ -251,6 +251,31 @@ código base.
 `config.json` dentro de `work_dir` refleja la configuración efectiva combinando
 defaults, archivo y banderas.
 
+#### Preset SignMusketeers (T5 v1.1 Base)
+
+El archivo `configs/presets/decoder_signmusketeers_t5.yaml` habilita un flujo listo para
+fine-tuning con `google/t5-v1_1-base`, ajustando `projector_dim=192` y `d_model=768` para
+concatenar rostro, manos y pose antes del decoder. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L1-L31】
+Lánzalo directamente desde la CLI con:
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --decoder-preset signmusketeers \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --pose-dir data/single_signer/processed/pose \
+  --metadata-csv meta.csv \
+  --train-index data/single_signer/index/train.csv \
+  --val-index data/single_signer/index/val.csv \
+  --work-dir work_dirs/signmusketeers_t5 \
+  --batch-size 4 --sequence-length 128
+```
+
+El tokenizador se resuelve automáticamente al mismo checkpoint T5 y el preset aplica 30
+épocas, `lr=5e-4` y `weight_decay=0.01`. Ajusta el tamaño de lote si tu GPU dispone de menos
+de 22 GB para evitar *out-of-memory*. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L22-L31】
+
 ### Entrenamiento basado en keypoints
 
 Activa la rama MSKA con `tools/train_slt_multistream_v9.py --use-mska`,
