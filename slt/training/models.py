@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -180,6 +181,28 @@ class MultiStreamClassifier(nn.Module):
 
         decoder_model_name = None if decoder_config is not None else config.decoder_model
 
+        prompt_tokens = None
+        if config.decoder_prompt_tokens:
+            prompt_tokens = [int(token) for token in config.decoder_prompt_tokens]
+        elif config.decoder_prompt_text:
+            encoded = tokenizer.encode(
+                config.decoder_prompt_text,
+                add_special_tokens=False,
+            )
+            if isinstance(encoded, list) and encoded:
+                prompt_tokens = [int(token) for token in encoded]
+                config.decoder_prompt_tokens = list(prompt_tokens)
+            else:
+                logging.warning(
+                    "Decoder prompt text '%s' produced an empty token sequence.",
+                    config.decoder_prompt_text,
+                )
+
+        prompt_length = config.decoder_prompt_length
+        if prompt_length <= 0 and prompt_tokens:
+            prompt_length = len(prompt_tokens)
+            config.decoder_prompt_length = prompt_length
+
         base_kwargs = {
             "d_model": config.d_model,
             "vocab_size": int(vocab_size),
@@ -188,6 +211,11 @@ class MultiStreamClassifier(nn.Module):
             "dropout": config.decoder_dropout,
             "pad_token_id": pad_id,
             "eos_token_id": eos_id,
+            "prompt_length": prompt_length,
+            "prompt_init": config.decoder_prompt_init,
+            "prompt_init_std": config.decoder_prompt_std,
+            "prompt_init_range": config.decoder_prompt_range,
+            "prompt_init_tokens": prompt_tokens,
         }
 
         if config.decoder_class:
@@ -315,11 +343,14 @@ class MultiStreamClassifier(nn.Module):
         encoded, encoder_attention_mask = self._merge_gloss_sequence(
             encoded, encoder_attention_mask, gloss_sequence, gloss_mask
         )
+        decoder_input_ids = extra_inputs.pop("decoder_input_ids", None)
+
         decoder_output = self.decoder(
             encoded,
             encoder_attention_mask=encoder_attention_mask,
             labels=labels,
             decoder_attention_mask=decoder_attention_mask,
+            decoder_input_ids=decoder_input_ids,
         )
         auxiliary = None
         if self._mska_enabled and self.encoder.mska_encoder is not None:

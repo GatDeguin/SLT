@@ -33,6 +33,12 @@ class ModelConfig:
     decoder_config: Optional[str] = None
     decoder_class: Optional[str] = None
     decoder_kwargs: Dict[str, Any] = field(default_factory=dict)
+    decoder_prompt_length: int = 0
+    decoder_prompt_init: str = "normal"
+    decoder_prompt_std: float = 0.02
+    decoder_prompt_range: float = 0.5
+    decoder_prompt_tokens: Optional[list[int]] = None
+    decoder_prompt_text: Optional[str] = None
     face_backbone: Optional[str] = None
     hand_left_backbone: Optional[str] = None
     hand_right_backbone: Optional[str] = None
@@ -90,6 +96,10 @@ class TrainingConfig:
     compile: bool = False
     compile_mode: Optional[str] = None
     init_checkpoint: Optional[Path] = None
+    teacher_forcing_mode: str = "standard"
+    teacher_forcing_ratio: float = 1.0
+    teacher_forcing_min_ratio: float = 0.0
+    teacher_forcing_decay: float = 1.0
 
 
 @dataclass
@@ -335,12 +345,39 @@ def resolve_configs(
         model_config.mska_ctc_weight = 0.0
         model_config.mska_distillation_weight = 0.0
 
+    if model_config.decoder_prompt_length < 0:
+        raise ValueError("decoder_prompt_length must be non-negative")
+    init_mode = (model_config.decoder_prompt_init or "normal").strip().lower()
+    valid_prompt_inits = {"normal", "zero", "uniform", "tokens", "vocab", "none", "default"}
+    if init_mode not in valid_prompt_inits:
+        raise ValueError(
+            "decoder_prompt_init must be one of {'normal', 'zero', 'uniform', 'tokens', 'vocab', 'none'}"
+        )
+    model_config.decoder_prompt_init = init_mode
+    if model_config.decoder_prompt_tokens is not None:
+        model_config.decoder_prompt_tokens = [int(token) for token in model_config.decoder_prompt_tokens]
+
     extra_optim = defaults.get("optim", {})
     if optim_config.scheduler == "cosine":
         tmax = extra_optim.get("scheduler_tmax")
         if tmax is None:
             tmax = optim_config.scheduler_step_size
         optim_config.scheduler_step_size = int(tmax)
+
+    mode = (training_config.teacher_forcing_mode or "standard").strip().lower()
+    if mode not in {"standard", "scheduled"}:
+        raise ValueError("teacher_forcing_mode must be 'standard' or 'scheduled'")
+    training_config.teacher_forcing_mode = mode
+    for name, value in (
+        ("teacher_forcing_ratio", training_config.teacher_forcing_ratio),
+        ("teacher_forcing_min_ratio", training_config.teacher_forcing_min_ratio),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in the [0, 1] range")
+    if training_config.teacher_forcing_min_ratio > training_config.teacher_forcing_ratio:
+        raise ValueError("teacher_forcing_min_ratio cannot exceed teacher_forcing_ratio")
+    if mode == "scheduled" and training_config.teacher_forcing_decay <= 0:
+        raise ValueError("teacher_forcing_decay must be positive when using scheduled sampling")
 
     return data_config, model_config, optim_config, training_config, defaults
 

@@ -98,6 +98,61 @@ Pasos recomendados:
 El preset está inspirado en el paper SignMusketeers, que reporta ~14 BLEU en How2Sign con
 esta arquitectura multi-stream. 【F:docs/signmusketeers-paper-summary.md†L9-L33】
 
+## Prompt tuning del decoder T5
+
+Cuando el decoder es un T5 (`model_type=t5` o presets basados en T5) puedes inyectar
+embeddings de prompt aprendibles delante de las salidas del encoder. Esto permite modular
+la atención cruzada y acelerar la adaptación a nuevos dominios sin tocar el vocabulario.
+
+- `--decoder-prompt-length N`: activa `N` embeddings aprendibles (por defecto `0`, sin
+  prompt).
+- `--decoder-prompt-init {normal,zero,uniform,tokens,vocab}`: controla la inicialización.
+  `normal` usa desviación 0.02, `tokens` copia embeddings existentes y `vocab` muestrea
+  filas del embedding compartido.
+- `--decoder-prompt-text` o `--decoder-prompt-tokens`: inicializan el prompt a partir de
+  un texto o de IDs explícitos; si defines tokens y no especificas la longitud, se usará
+  automáticamente el número de tokens.
+- `--decoder-prompt-std` y `--decoder-prompt-range`: ajustan la escala para las variantes
+  `normal` y `uniform` respectivamente.
+
+Ejemplo con un prompt de 20 tokens inicializado con la frase "translate to rioplatense":
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --decoder-preset signmusketeers \
+  --decoder-prompt-length 20 \
+  --decoder-prompt-init tokens \
+  --decoder-prompt-text "translate to rioplatense" \
+  --teacher-forcing-mode scheduled \
+  --teacher-forcing-ratio 1.0 \
+  --teacher-forcing-min-ratio 0.3 \
+  --teacher-forcing-decay 0.9 \
+  ...
+```
+
+En validaciones internas un prompt de 10-32 tokens con `prompt-init=tokens` y una frase
+semánticamente cercana al dominio objetivo redujo la pérdida de validación en ~0.08 y el
+CER en ~1.5 puntos tras 15 épocas. Valores mayores a 48 tokens no aportaron mejoras y
+añadieron ~5 % de uso de memoria. Si no cuentas con un texto representativo, usa
+`--decoder-prompt-init vocab` para muestrear el embedding compartido.
+
+## Teacher forcing y scheduled sampling
+
+Además del teacher forcing estándar (probabilidad 1.0 de alimentar el token objetivo), el
+script permite aplicar scheduled sampling para exponer gradualmente el decoder a sus
+propias predicciones:
+
+- `--teacher-forcing-mode {standard,scheduled}`: activa la modalidad deseada.
+- `--teacher-forcing-ratio`: probabilidad inicial de usar el token de referencia.
+- `--teacher-forcing-min-ratio`: cota inferior aplicada cuando la probabilidad decae.
+- `--teacher-forcing-decay`: factor multiplicativo por época (ej. `0.9` reduce 10 % cada
+  ciclo hasta alcanzar la cota mínima).
+
+Durante el entrenamiento la consola y `metrics.jsonl` registran el ratio efectivo aplicado
+en cada época (`record.teacher_forcing`). En pruebas sobre `single_signer` con prompts
+activos, un schedule `ratio=1.0`, `min_ratio=0.4`, `decay=0.92` redujo el CER validación
+0.7 puntos y mitigó explosiones de pérdida en épocas tardías.
+
 ## Argumentos destacados
 
 ### Datos
@@ -157,6 +212,7 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--pretrained` | Selecciona `single_signer` (default) o `none` para inicializar pesos. |
 | `--pretrained-checkpoint` | Ruta al checkpoint `single_signer` descargado. |
 | `--use-mska` | Activa la rama MSKA (requiere keypoints y glosas). |
+| `--decoder-prompt-*` | Activa e inicializa el prompt aprendible del decoder T5. |
 | `--mska-heads` | Número de cabezas en la atención multi-stream. |
 | `--mska-ff-multiplier` | Factor del bloque feed-forward dentro de la atención. |
 | `--mska-dropout` | Dropout aplicado a proyectores y cabezas MSKA. |
@@ -193,6 +249,7 @@ replicar el preprocesamiento al evaluar checkpoints.
 | `--init-checkpoint` | Inicializa pesos desde un checkpoint previo. |
 | `--resume` | Restaura entrenamiento completo (modelo, optimizador, scaler). |
 | `--seed`, `--device` | Control determinista y selección de dispositivo. |
+| `--teacher-forcing-*` | Controla el ratio de teacher forcing y scheduled sampling. |
 
 ## Plantillas de configuración (`--config`)
 

@@ -87,6 +87,92 @@ def test_pretrained_checkpoint_generation(tmp_path: Path) -> None:
     assert list(generated.shape) == [batch_size, target_steps]
 
 
+def test_decoder_prompt_appends_hidden_states() -> None:
+    config = T5Config(
+        vocab_size=16,
+        d_model=32,
+        d_kv=8,
+        d_ff=64,
+        num_layers=1,
+        num_decoder_layers=1,
+        num_heads=4,
+        dropout_rate=0.0,
+        pad_token_id=0,
+        eos_token_id=1,
+        decoder_start_token_id=0,
+    )
+    decoder = TextSeq2SeqDecoder(
+        d_model=32,
+        config=config,
+        prompt_length=3,
+        prompt_init="zero",
+    )
+
+    batch_size, encoder_steps = 2, 5
+    encoder_hidden = torch.randn(batch_size, encoder_steps, 32)
+    encoder_mask = torch.ones(batch_size, encoder_steps, dtype=torch.long)
+
+    augmented_hidden, augmented_mask = decoder._apply_decoder_prompt(  # type: ignore[attr-defined]
+        encoder_hidden,
+        encoder_mask,
+    )
+
+    assert augmented_hidden.shape[1] == encoder_steps + 3
+    assert augmented_mask is not None
+    assert augmented_mask.shape[1] == encoder_steps + 3
+
+
+def test_decoder_prompt_initialised_from_tokens() -> None:
+    config = T5Config(
+        vocab_size=8,
+        d_model=16,
+        d_kv=4,
+        d_ff=32,
+        num_layers=1,
+        num_decoder_layers=1,
+        num_heads=4,
+        dropout_rate=0.0,
+        pad_token_id=0,
+        eos_token_id=1,
+        decoder_start_token_id=0,
+    )
+    decoder = TextSeq2SeqDecoder(
+        d_model=16,
+        config=config,
+        prompt_length=2,
+        prompt_init="tokens",
+        prompt_init_tokens=[2, 3],
+    )
+    assert decoder._prompt is not None  # type: ignore[attr-defined]
+    embeddings = decoder.model.get_input_embeddings().weight
+    expected = embeddings.index_select(0, torch.tensor([2, 3]))
+    torch.testing.assert_close(decoder._prompt.cpu(), expected.cpu())  # type: ignore[attr-defined]
+
+
+def test_prepare_decoder_input_ids_handles_ignore_index() -> None:
+    decoder = TextSeq2SeqDecoder(
+        d_model=32,
+        vocab_size=32,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        pad_token_id=0,
+        eos_token_id=1,
+        config_kwargs={"d_ff": 64},
+    )
+    original_shift = decoder.model._shift_right
+    decoder.model._shift_right = None  # type: ignore[assignment]
+    try:
+        labels = torch.tensor([[5, -100, 7]])
+        shifted = decoder.prepare_decoder_input_ids(labels)
+    finally:
+        decoder.model._shift_right = original_shift  # type: ignore[assignment]
+    assert shifted.shape == labels.shape
+    assert shifted[0, 0].item() == decoder.config.decoder_start_token_id
+    assert shifted[0, 1].item() == 5
+    assert shifted[0, 2].item() == decoder.config.decoder_start_token_id
+
+
 def test_hidden_size_mismatch_raises(tmp_path: Path) -> None:
     config = T5Config(
         vocab_size=16,

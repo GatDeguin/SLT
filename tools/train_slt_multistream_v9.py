@@ -192,6 +192,92 @@ def _build_cer_metric(tokenizer: PreTrainedTokenizerBase) -> Callable[[Any, torc
     return _metric
 
 
+class _TeacherForcingController:
+    """Utility to manage teacher forcing and scheduled sampling."""
+
+    def __init__(
+        self,
+        mode: str,
+        ratio: float,
+        min_ratio: float,
+        decay: float,
+    ) -> None:
+        self.mode = mode
+        self.initial_ratio = float(ratio)
+        self.min_ratio = float(min_ratio)
+        self.decay = float(decay)
+
+    def ratio_for_epoch(self, epoch: int) -> float:
+        if self.mode != "scheduled":
+            return float(self.initial_ratio)
+        steps = max(epoch - 1, 0)
+        ratio = self.initial_ratio * (self.decay ** steps)
+        ratio = max(self.min_ratio, ratio)
+        return float(min(1.0, max(0.0, ratio)))
+
+    def make_forward_fn(
+        self, model: nn.Module, ratio: float
+    ) -> Optional[Callable[..., Any]]:
+        if self.mode != "scheduled" or ratio >= 1.0 - 1e-6:
+            return None
+
+        def _forward(**inputs: Any) -> Any:
+            return self._scheduled_sampling_forward(model, inputs, ratio)
+
+        return _forward
+
+    def _scheduled_sampling_forward(
+        self,
+        model: nn.Module,
+        inputs: Mapping[str, Any],
+        ratio: float,
+    ) -> Any:
+        labels = inputs.get("labels")
+        if not isinstance(labels, torch.Tensor):
+            return model(**inputs)
+        decoder = getattr(model, "decoder", None)
+        if decoder is None or not hasattr(decoder, "prepare_decoder_input_ids"):
+            return model(**inputs)
+
+        # Avoid mutating the caller inputs
+        scheduled_inputs = dict(inputs)
+
+        with torch.no_grad():
+            preview = model(**scheduled_inputs)
+            logits = getattr(preview, "logits", None)
+            if logits is None and hasattr(preview, "decoder"):
+                logits = getattr(preview.decoder, "logits", None)
+            if logits is None:
+                return model(**inputs)
+            predictions = logits.argmax(dim=-1)
+
+        decoder_input_ids = decoder.prepare_decoder_input_ids(labels).clone()
+        if decoder_input_ids.size(1) <= 1:
+            scheduled_inputs["decoder_input_ids"] = decoder_input_ids
+            return model(**scheduled_inputs)
+
+        if not isinstance(predictions, torch.Tensor) or predictions.size() != labels.size():
+            scheduled_inputs["decoder_input_ids"] = decoder_input_ids
+            return model(**scheduled_inputs)
+
+        teacher_tokens = labels[:, :-1]
+        valid_mask = teacher_tokens.ne(-100)
+        decoder_mask = scheduled_inputs.get("decoder_attention_mask")
+        if isinstance(decoder_mask, torch.Tensor) and decoder_mask.size(1) > 1:
+            valid_mask = valid_mask & decoder_mask[:, :-1].to(dtype=torch.bool)
+
+        if valid_mask.any():
+            bernoulli = torch.rand_like(valid_mask, dtype=torch.float, device=labels.device)
+            use_teacher = bernoulli < ratio
+            replacement_mask = valid_mask & ~use_teacher
+            if replacement_mask.any():
+                replacements = predictions[:, :-1].to(dtype=decoder_input_ids.dtype)
+                decoder_input_ids[:, 1:][replacement_mask] = replacements[replacement_mask]
+
+        scheduled_inputs["decoder_input_ids"] = decoder_input_ids
+        return model(**scheduled_inputs)
+
+
 def _move_to_device(data: Any, device: torch.device) -> Any:
     if isinstance(data, torch.Tensor):
         return data.to(device)
@@ -450,6 +536,37 @@ def parse_args() -> argparse.Namespace:
         help="JSON object with keyword arguments forwarded to the decoder constructor",
     )
     parser.add_argument(
+        "--decoder-prompt-length",
+        type=int,
+        help="Número de embeddings de prompt aprendibles concatenados al codificador",
+    )
+    parser.add_argument(
+        "--decoder-prompt-init",
+        type=str,
+        choices=["normal", "zero", "uniform", "tokens", "vocab"],
+        help="Inicialización de las embeddings de prompt (normal, zero, uniform, tokens, vocab)",
+    )
+    parser.add_argument(
+        "--decoder-prompt-std",
+        type=float,
+        help="Desviación estándar utilizada cuando prompt-init=normal",
+    )
+    parser.add_argument(
+        "--decoder-prompt-range",
+        type=float,
+        help="Amplitud del intervalo uniforme cuando prompt-init=uniform",
+    )
+    parser.add_argument(
+        "--decoder-prompt-text",
+        type=str,
+        help="Texto usado para inicializar las embeddings de prompt mediante el tokenizador",
+    )
+    parser.add_argument(
+        "--decoder-prompt-tokens",
+        type=str,
+        help="Lista de IDs de tokens separados por comas para inicializar las embeddings de prompt",
+    )
+    parser.add_argument(
         "--use-mska",
         dest="use_mska",
         action="store_true",
@@ -660,6 +777,26 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Initial checkpoint to warm-start the model weights before training",
     )
+    parser.add_argument(
+        "--teacher-forcing-mode",
+        choices=["standard", "scheduled"],
+        help="Estrategia de teacher forcing a emplear durante el entrenamiento",
+    )
+    parser.add_argument(
+        "--teacher-forcing-ratio",
+        type=float,
+        help="Probabilidad inicial de usar el token objetivo (0-1)",
+    )
+    parser.add_argument(
+        "--teacher-forcing-min-ratio",
+        type=float,
+        help="Cota inferior de la probabilidad cuando se usa scheduled sampling",
+    )
+    parser.add_argument(
+        "--teacher-forcing-decay",
+        type=float,
+        help="Factor multiplicativo aplicado cada época en scheduled sampling",
+    )
 
     args = parser.parse_args()
     if args.decoder_preset:
@@ -681,6 +818,33 @@ def parse_args() -> argparse.Namespace:
         args.decoder_kwargs = parsed_kwargs
     else:
         args.decoder_kwargs = None
+    if args.decoder_prompt_tokens:
+        raw_tokens = [item.strip() for item in args.decoder_prompt_tokens.split(",") if item.strip()]
+        if not raw_tokens:
+            args.decoder_prompt_tokens = None
+        else:
+            try:
+                args.decoder_prompt_tokens = [int(value) for value in raw_tokens]
+            except ValueError as exc:
+                parser.error(f"--decoder-prompt-tokens must contain integers: {exc}")
+    if args.teacher_forcing_mode:
+        args.teacher_forcing_mode = args.teacher_forcing_mode.strip().lower()
+    for name in ("teacher_forcing_ratio", "teacher_forcing_min_ratio"):
+        value = getattr(args, name, None)
+        if value is not None and not 0.0 <= value <= 1.0:
+            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
+    if (
+        args.teacher_forcing_ratio is not None
+        and args.teacher_forcing_min_ratio is not None
+        and args.teacher_forcing_min_ratio > args.teacher_forcing_ratio
+    ):
+        parser.error("--teacher-forcing-min-ratio cannot be greater than --teacher-forcing-ratio")
+    if (
+        args.teacher_forcing_mode == "scheduled"
+        and args.teacher_forcing_decay is not None
+        and args.teacher_forcing_decay <= 0
+    ):
+        parser.error("--teacher-forcing-decay must be positive when using scheduled sampling")
     if args.resume and args.init_checkpoint:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     if args.mix_streams:
@@ -1165,6 +1329,13 @@ def main() -> None:
                 },
             )
 
+    teacher_controller = _TeacherForcingController(
+        training_config.teacher_forcing_mode,
+        training_config.teacher_forcing_ratio,
+        training_config.teacher_forcing_min_ratio,
+        training_config.teacher_forcing_decay,
+    )
+
     def _loss_fn(
         outputs: Any,
         targets: Mapping[str, Any],
@@ -1250,11 +1421,22 @@ def main() -> None:
         return
 
     logging.info("Starting training for %d epochs", training_config.epochs)
+    last_logged_ratio: Optional[float] = None
     for epoch in range(start_epoch + 1, training_config.epochs + 1):
         epoch_start = time.perf_counter()
         peak_memory_bytes: Optional[int] = None
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(device)
+        current_ratio = teacher_controller.ratio_for_epoch(epoch)
+        forward_fn = teacher_controller.make_forward_fn(model, current_ratio)
+        if last_logged_ratio is None or abs(current_ratio - last_logged_ratio) > 1e-6:
+            logging.info(
+                "Epoch %d - teacher forcing ratio (mode=%s): %.4f",
+                epoch,
+                training_config.teacher_forcing_mode,
+                current_ratio,
+            )
+            last_logged_ratio = current_ratio
         train_result = train_epoch(
             model,
             train_loader,
@@ -1265,6 +1447,7 @@ def main() -> None:
             grad_clip_norm=optim_config.grad_clip_norm,
             grad_accum_steps=training_config.grad_accum_steps,
             metrics=train_metrics,
+            forward_fn=forward_fn,
         )
         val_result = eval_epoch(
             model,
@@ -1337,6 +1520,11 @@ def main() -> None:
                     peak_memory_gb,
                     epoch,
                 )
+            writer.add_scalar(
+                "train/teacher_forcing_ratio",
+                current_ratio,
+                epoch,
+            )
 
         improved = val_loss < best_val
         _save_checkpoint(
@@ -1383,6 +1571,10 @@ def main() -> None:
             "improved": improved,
             "epoch_time_s": _safe_float(epoch_time),
             "peak_memory_bytes": peak_memory_bytes,
+            "teacher_forcing": {
+                "mode": training_config.teacher_forcing_mode,
+                "ratio": _safe_float(current_ratio),
+            },
         }
         _append_metrics(metrics_path, record)
 

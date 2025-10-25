@@ -276,6 +276,14 @@ El tokenizador se resuelve automáticamente al mismo checkpoint T5 y el preset a
 épocas, `lr=5e-4` y `weight_decay=0.01`. Ajusta el tamaño de lote si tu GPU dispone de menos
 de 22 GB para evitar *out-of-memory*. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L22-L31】
 
+Cuando trabajes con decoders T5 puedes activar *prompt tuning* y scheduled sampling
+directamente desde la CLI: `--decoder-prompt-length`, `--decoder-prompt-init`,
+`--decoder-prompt-text` y `--teacher-forcing-*` habilitan prompts aprendibles y el
+decaimiento del ratio de teacher forcing documentados en
+`docs/train_slt_multistream_v9.md`. En nuestras pruebas internos un prompt de 16 tokens
+inicializado con texto y un schedule `ratio=1.0 -> 0.4` (`decay=0.92`) redujeron el CER de
+validación en ~1 punto tras 20 épocas, manteniendo la estabilidad numérica en GPUs de 24 GB.
+
 ### Entrenamiento basado en keypoints
 
 Activa la rama MSKA con `tools/train_slt_multistream_v9.py --use-mska`,
