@@ -27,7 +27,8 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Optional, Sequence, Tuple
+from collections import defaultdict
+from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -110,6 +111,113 @@ def pil_collate(batch: Sequence[Image.Image]) -> list[Image.Image]:
     """Default collation function that keeps PIL images as Python objects."""
 
     return list(batch)
+
+
+class MultiStreamImageFolderDataset(Dataset[Mapping[str, Image.Image]]):
+    """Dataset que alinea múltiples streams de recortes 2D."""
+
+    def __init__(self, stream_roots: Mapping[str, Sequence[Path | str]]) -> None:
+        if not stream_roots:
+            raise ValueError("Debe especificarse al menos un stream para construir el dataset")
+
+        self._stream_names = tuple(stream_roots.keys())
+        self._paths: Dict[str, list[Path]] = {}
+        indexed_paths: Dict[str, dict[str, Path]] = {}
+
+        for stream, roots in stream_roots.items():
+            paths = self._collect_files(roots)
+            if not paths:
+                raise FileNotFoundError(
+                    f"No se encontraron archivos soportados para el stream '{stream}'"
+                )
+            mapping: dict[str, Path] = {}
+            for path in paths:
+                key = self._make_alignment_key(path)
+                if key in mapping:
+                    raise ValueError(
+                        "Se encontraron nombres duplicados en el stream "
+                        f"'{stream}' para la clave '{key}'"
+                    )
+                mapping[key] = path
+            indexed_paths[stream] = mapping
+
+        key_sets = [set(mapping.keys()) for mapping in indexed_paths.values()]
+        common_keys = set.intersection(*key_sets)
+        if not common_keys:
+            raise ValueError(
+                "Los streams proporcionados no comparten archivos con el mismo nombre base"
+            )
+
+        mismatch: Dict[str, list[str]] = defaultdict(list)
+        for stream, mapping in indexed_paths.items():
+            keys = set(mapping.keys())
+            if keys != common_keys:
+                missing = sorted(common_keys - keys)
+                extra = sorted(keys - common_keys)
+                if missing:
+                    mismatch[stream].append(f"faltantes={len(missing)}")
+                if extra:
+                    mismatch[stream].append(f"extras={len(extra)}")
+
+        if mismatch:
+            details = ", ".join(
+                f"{stream} ({'; '.join(parts)})" for stream, parts in mismatch.items()
+            )
+            raise ValueError(
+                "Los streams no están alineados; revise las claves faltantes o adicionales: "
+                f"{details}"
+            )
+
+        ordered_keys = sorted(common_keys)
+        for stream in self._stream_names:
+            mapping = indexed_paths[stream]
+            self._paths[stream] = [mapping[key] for key in ordered_keys]
+
+        self._keys = ordered_keys
+
+    def _collect_files(self, roots: Sequence[Path | str]) -> list[Path]:
+        files: list[Path] = []
+        for root in roots:
+            path = Path(root).expanduser().resolve()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+                files.append(path)
+                continue
+            if not path.exists():
+                raise FileNotFoundError(f"Dataset path does not exist: {path}")
+            for candidate in path.rglob("*"):
+                if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+                    files.append(candidate)
+        files.sort()
+        return files
+
+    def _make_alignment_key(self, path: Path) -> str:
+        return path.name
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return len(self._keys)
+
+    def __getitem__(self, index: int) -> Mapping[str, Image.Image]:
+        sample: dict[str, Image.Image] = {}
+        for stream in self._stream_names:
+            path = self._paths[stream][index]
+            with Image.open(path) as image:
+                sample[stream] = image.convert("RGB")
+        return sample
+
+
+def multistream_collate(batch: Sequence[Mapping[str, Image.Image]]) -> dict[str, list[Image.Image]]:
+    """Colate que conserva la correspondencia por stream."""
+
+    if not batch:
+        return {}
+
+    collated: dict[str, list[Image.Image]] = {
+        stream: [] for stream in batch[0]
+    }
+    for item in batch:
+        for stream, image in item.items():
+            collated[stream].append(image)
+    return collated
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +621,27 @@ def build_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn or pil_collate,
+        pin_memory=pin_memory,
+        persistent_workers=bool(persistent_workers and num_workers > 0),
+    )
+
+
+def build_multistream_dataloader(
+    stream_roots: Mapping[str, Sequence[Path | str]],
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool = True,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+) -> DataLoader:
+    dataset = MultiStreamImageFolderDataset(stream_roots)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=multistream_collate,
         pin_memory=pin_memory,
         persistent_workers=bool(persistent_workers and num_workers > 0),
     )

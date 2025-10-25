@@ -1,9 +1,10 @@
 # Preentrenamiento de backbones con DINO/iBOT
 
-Los scripts `tools/pretrain_dino_face.py` y `tools/pretrain_dino_hands.py`
-permiten entrenar pesos auto-supervisados sobre los recortes generados en
-`data/single_signer/processed/`. Ambos comparten la misma interfaz y producen
-backbones compatibles con `load_dinov2_backbone`.
+Los scripts `tools/pretrain_dino_face.py`, `tools/pretrain_dino_hands.py` y
+`tools/pretrain_dinov2_multistream.py` permiten entrenar pesos auto-supervisados
+sobre los recortes generados en `data/single_signer/processed/`. Todos comparten
+la misma interfaz básica y producen backbones compatibles con
+`load_dinov2_backbone`.
 
 ## Flujo recomendado
 
@@ -34,15 +35,38 @@ backbones compatibles con `load_dinov2_backbone`.
    ```
 5. Repite el proceso para manos con `tools/pretrain_dino_hands.py` ajustando
    `--train-dir` a `hand_l` o `hand_r`.
-6. Carga los backbones exportados desde `tools/train_slt_multistream_v9.py`
+6. Para un entrenamiento conjunto de rostro y manos, utiliza
+   `tools/pretrain_dinov2_multistream.py` con las carpetas correspondientes a
+   cada stream.
+7. Carga los backbones exportados desde `tools/train_slt_multistream_v9.py`
    mediante `--face-backbone`, `--hand-left-backbone` o `--hand-right-backbone`.
+
+### Ejemplo multi-stream
+
+```bash
+python tools/pretrain_dinov2_multistream.py \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --output-dir work_dirs/dino_multistream \
+  --epochs 80 \
+  --batch-size 48 \
+  --learning-rate 1e-3 \
+  --export-backbone work_dirs/dino_multistream/backbone
+```
+
+El parámetro `--export-backbone` actúa como prefijo y genera un archivo por
+stream (`*_face.pt`, `*_hand_left.pt`, `*_hand_right.pt`) junto con un manifiesto
+JSON (`*_manifest.json`) que detalla la configuración y rutas resultantes. Cada
+archivo `.pt` es compatible con `load_dinov2_backbone` usando el prefijo
+`file::`.
 
 Para sesiones distribuidas, lanza el script con `torchrun --nproc_per_node=N` y
 las banderas `--distributed` disponibles en el módulo `_pretrain_dino.py`.
 
 ## Configuración declarativa
 
-Ambos scripts aceptan archivos TOML/JSON vía `--config`. Ejemplo en TOML:
+Los scripts aceptan archivos TOML/JSON vía `--config`. Ejemplo en TOML:
 
 ```toml
 train_dir = ["data/single_signer/processed/face"]
@@ -75,6 +99,18 @@ notes = "Primer experimento con augmentations agresivos."
 
 Los parámetros definidos en el archivo actúan como defaults y pueden
 sobrescribirse desde la CLI.
+
+Para multi-stream puedes declarar rutas específicas por stream:
+
+```toml
+face_train_dir = ["data/single_signer/processed/face"]
+hand_left_train_dir = ["data/single_signer/processed/hand_l"]
+hand_right_train_dir = ["data/single_signer/processed/hand_r"]
+output_dir = "work_dirs/dino_multistream"
+epochs = 60
+batch_size = 48
+export_backbone = "work_dirs/dino_multistream/backbone"
+```
 
 ### Regularización KoLeo
 
