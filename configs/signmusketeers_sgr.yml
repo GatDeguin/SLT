@@ -1,0 +1,34 @@
+# Configuración de ejemplo para SignMusketeers con SGR activo.
+data:
+  face_dir: data/single_signer/processed/face
+  hand_left_dir: data/single_signer/processed/hand_l
+  hand_right_dir: data/single_signer/processed/hand_r
+  pose_dir: data/single_signer/processed/pose
+  keypoints_dir: data/single_signer/processed/keypoints
+  metadata_csv: meta.csv
+  train_index: data/single_signer/index/train.csv
+  val_index: data/single_signer/index/val.csv
+  gloss_csv: data/single_signer/annotations/gloss.csv
+  work_dir: work_dirs/signmusketeers_sgr
+  tokenizer: google/t5-v1_1-base
+  max_target_length: 128
+model:
+  decoder_preset: signmusketeers
+  use_mska: true
+  mska_ctc_vocab: 128
+  mska_translation_weight: 0.7
+  mska_ctc_weight: 0.2
+  mska_distillation_weight: 0.1
+  mska_distillation_temperature: 2.0
+  mska_gloss_hidden_dim: 192
+  mska_gloss_second_hidden_dim: 128
+  mska_gloss_dropout: 0.1
+  mska_use_sgr: true
+  mska_sgr_shared: true
+  mska_sgr_activation: relu
+  mska_sgr_mix: 0.6
+training:
+  epochs: 40
+optim:
+  lr: 0.0005
+  weight_decay: 0.01

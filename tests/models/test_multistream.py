@@ -11,6 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from slt.models.backbones import load_dinov2_backbone
+from slt.models.mska import MSKAEncoder
 from slt.models.multistream import MultiStreamEncoder
 from slt.models.single_signer import (
     CHECKPOINT_ENV_VAR,
@@ -89,6 +90,26 @@ def _make_encoder(**kwargs) -> MultiStreamEncoder:
         "hand_right": ConstantBackbone(),
     }
     return MultiStreamEncoder(backbones=backbones, **kwargs)
+
+
+def _make_mska(*, shared: bool) -> MSKAEncoder:
+    return MSKAEncoder(
+        input_dim=3,
+        embed_dim=8,
+        stream_names=("face", "hand_left", "hand_right", "pose"),
+        num_heads=1,
+        ff_multiplier=1,
+        dropout=0.0,
+        ctc_vocab_size=8,
+        stream_attention_heads=1,
+        stream_temporal_blocks=0,
+        stream_temporal_kernel=3,
+        stream_temporal_dilation=1,
+        use_global_attention=True,
+        global_attention_activation="identity",
+        global_attention_mix=0.5,
+        global_attention_shared=shared,
+    )
 
 
 def test_forward_pass_returns_temporal_sequence() -> None:
@@ -599,4 +620,102 @@ def test_gloss_mlp_two_hidden_layers_produce_expected_sequence() -> None:
     assert mlp[0].out_features == first_hidden
     assert mlp[3].out_features == second_hidden
     assert mlp[-1].in_features == second_hidden
+
+
+def test_mska_encoder_sgr_shared_matrix_reused() -> None:
+    torch.manual_seed(0)
+    mska = _make_mska(shared=True)
+    encoder = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=8,
+        temporal_kwargs={"nhead": 2, "nlayers": 1, "dim_feedforward": 32},
+        mska=mska,
+    )
+
+    batch, time, joints = 2, 3, 4
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+    keypoint_streams = {
+        name: {"points": torch.randn(batch, time, joints, 3)}
+        for name in encoder.mska_encoder.stream_names
+    }
+
+    output = encoder(
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        keypoint_streams=keypoint_streams,
+    )
+
+    store = encoder.mska_encoder._shared_global_store
+    assert store is not None
+    per_stream_stores = [
+        stream_encoder.self_attention._global_store()
+        for stream_encoder in encoder.mska_encoder.encoders.values()
+    ]
+    assert per_stream_stores
+    assert all(candidate is store for candidate in per_stream_stores)
+
+    encoder.zero_grad()
+    loss = output.sum()
+    loss.backward()
+
+    matrix = store.matrix
+    assert matrix is not None
+    assert matrix.grad is not None
+    assert matrix.grad.abs().sum() > 0
+
+
+def test_mska_encoder_sgr_per_stream_independent_matrices() -> None:
+    torch.manual_seed(0)
+    mska = _make_mska(shared=False)
+    encoder = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=39,
+        positional_num_positions=8,
+        temporal_kwargs={"nhead": 2, "nlayers": 1, "dim_feedforward": 32},
+        mska=mska,
+    )
+
+    batch, time, joints = 2, 3, 4
+    face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
+    hand_l = torch.randn_like(face)
+    hand_r = torch.randn_like(face)
+    pose = torch.randn(batch, time, 39)
+    keypoint_streams = {
+        name: {"points": torch.randn(batch, time, joints, 3)}
+        for name in encoder.mska_encoder.stream_names
+    }
+
+    output = encoder(
+        face,
+        hand_l,
+        hand_r,
+        pose,
+        keypoint_streams=keypoint_streams,
+    )
+
+    stores = []
+    for stream_encoder in encoder.mska_encoder.encoders.values():
+        store = stream_encoder.self_attention._global_store()
+        assert store is not None
+        stores.append(store)
+
+    assert len({id(store) for store in stores}) == len(stores)
+
+    encoder.zero_grad()
+    loss = output.sum()
+    loss.backward()
+
+    for store in stores:
+        matrix = store.matrix
+        assert matrix is not None
+        assert matrix.grad is not None
+        assert matrix.grad.abs().sum() > 0
 
