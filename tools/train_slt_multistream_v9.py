@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import Subset
 from transformers import PreTrainedTokenizerBase
 
 from slt.data import LsaTMultiStream
@@ -762,6 +763,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, help="Number of training epochs")
     parser.add_argument("--optimizer", type=str, help="Optimizer type (adamw, adam, sgd)")
     parser.add_argument("--lr", type=float, help="Learning rate")
+    parser.add_argument(
+        "--lr-encoder",
+        type=float,
+        help="Learning rate for the encoder parameter group",
+    )
+    parser.add_argument(
+        "--lr-decoder",
+        type=float,
+        help="Learning rate for the decoder parameter group",
+    )
+    parser.add_argument(
+        "--lr-mska",
+        type=float,
+        help="Learning rate for MSKA-specific branches",
+    )
     parser.add_argument("--weight-decay", type=float, help="L2 weight decay")
     parser.add_argument(
         "--scheduler",
@@ -781,6 +797,16 @@ def parse_args() -> argparse.Namespace:
         "--grad-accum-steps",
         type=int,
         help="Number of gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--max-train-steps",
+        type=int,
+        help="Maximum number of training iterations across all epochs",
+    )
+    parser.add_argument(
+        "--subset-size",
+        type=int,
+        help="Limit the training dataset to the first N samples",
     )
     parser.add_argument(
         "--compile-mode",
@@ -890,6 +916,14 @@ def parse_args() -> argparse.Namespace:
         and args.teacher_forcing_decay <= 0
     ):
         parser.error("--teacher-forcing-decay must be positive when using scheduled sampling")
+    for attr in ("lr_encoder", "lr_decoder", "lr_mska"):
+        value = getattr(args, attr, None)
+        if value is not None and value <= 0:
+            parser.error(f"--{attr.replace('_', '-')} must be positive")
+    for attr in ("max_train_steps", "subset_size"):
+        value = getattr(args, attr, None)
+        if value is not None and value <= 0:
+            parser.error(f"--{attr.replace('_', '-')} must be greater than zero")
     if args.resume and args.init_checkpoint:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     if args.mix_streams:
@@ -1446,6 +1480,24 @@ def main() -> None:
         raise ValueError(f"Invalid mix_streams configuration: {exc}") from exc
     data_config.mix_streams = train_mix
 
+    subset_size = training_config.subset_size
+    if subset_size is not None:
+        try:
+            dataset_length = len(train_dataset)
+        except TypeError:
+            dataset_length = None
+        if dataset_length is None or subset_size < dataset_length:
+            capped = subset_size if dataset_length is None else min(subset_size, dataset_length)
+            indices = range(capped)
+            train_dataset = Subset(train_dataset, indices)
+            logging.info("Limiting training dataset to %d samples", capped)
+        else:
+            logging.info(
+                "Subset size %d exceeds dataset length %d; training on full dataset.",
+                subset_size,
+                dataset_length,
+            )
+
     train_loader = create_dataloader(
         train_dataset,
         batch_size=data_config.batch_size,
@@ -1473,8 +1525,52 @@ def main() -> None:
     if training_config.init_checkpoint is not None:
         _load_initial_checkpoint(model, training_config.init_checkpoint, device=device)
     model = _maybe_compile_model(model, training_config)
+    encoder_params: list[nn.Parameter] = []
+    decoder_params: list[nn.Parameter] = []
+    mska_params: list[nn.Parameter] = []
+    mska_param_ids: set[int] = set()
+
+    if hasattr(model, "encoder"):
+        encoder_module = model.encoder
+        mska_encoder = getattr(encoder_module, "mska_encoder", None)
+        if isinstance(mska_encoder, nn.Module):
+            for param in mska_encoder.parameters():
+                if param.requires_grad:
+                    mska_params.append(param)
+                    mska_param_ids.add(id(param))
+        gloss_mlp = getattr(encoder_module, "_mska_gloss_mlp", None)
+        if isinstance(gloss_mlp, nn.Module):
+            for param in gloss_mlp.parameters():
+                if param.requires_grad:
+                    mska_params.append(param)
+                    mska_param_ids.add(id(param))
+        for param in encoder_module.parameters():
+            if not param.requires_grad or id(param) in mska_param_ids:
+                continue
+            encoder_params.append(param)
+
+    if hasattr(model, "decoder"):
+        for param in model.decoder.parameters():
+            if param.requires_grad:
+                decoder_params.append(param)
+
+    encoder_lr = optim_config.lr_encoder or optim_config.lr
+    decoder_lr = optim_config.lr_decoder or optim_config.lr
+    mska_lr = optim_config.lr_mska or encoder_lr
+
+    param_groups: list[dict[str, Any]] = []
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": float(encoder_lr)})
+    if mska_params:
+        param_groups.append({"params": mska_params, "lr": float(mska_lr)})
+    if decoder_params:
+        param_groups.append({"params": decoder_params, "lr": float(decoder_lr)})
+
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found for optimiser setup")
+
     optimizer = create_optimizer(
-        model.parameters(),
+        param_groups,
         {
             "type": optim_config.optimizer,
             "lr": optim_config.lr,
@@ -1485,20 +1581,26 @@ def main() -> None:
     scheduler = None
     if optim_config.scheduler:
         if optim_config.scheduler == "steplr":
+            step_size = optim_config.scheduler_step_size
+            if training_config.max_train_steps is not None:
+                step_size = max(1, min(step_size, training_config.max_train_steps))
             scheduler = create_scheduler(
                 optimizer,
                 {
                     "type": "steplr",
-                    "step_size": optim_config.scheduler_step_size,
+                    "step_size": step_size,
                     "gamma": optim_config.scheduler_gamma,
                 },
             )
         elif optim_config.scheduler == "cosine":
+            t_max = optim_config.scheduler_step_size
+            if training_config.max_train_steps is not None:
+                t_max = max(1, min(t_max, training_config.max_train_steps))
             scheduler = create_scheduler(
                 optimizer,
                 {
                     "type": "cosine",
-                    "t_max": optim_config.scheduler_step_size,
+                    "t_max": t_max,
                 },
             )
 
@@ -1593,6 +1695,11 @@ def main() -> None:
             writer.close()
         return
 
+    max_train_steps = training_config.max_train_steps
+    steps_completed = 0
+    if max_train_steps is not None:
+        logging.info("Limiting total training steps to %d", max_train_steps)
+
     logging.info("Starting training for %d epochs", training_config.epochs)
     last_logged_ratio: Optional[float] = None
     for epoch in range(start_epoch + 1, training_config.epochs + 1):
@@ -1600,6 +1707,16 @@ def main() -> None:
         peak_memory_bytes: Optional[int] = None
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(device)
+        remaining_steps: Optional[int] = None
+        if max_train_steps is not None:
+            remaining_steps = max_train_steps - steps_completed
+            if remaining_steps <= 0:
+                logging.info(
+                    "Reached max_train_steps=%d before epoch %d; stopping training.",
+                    max_train_steps,
+                    epoch,
+                )
+                break
         current_ratio = teacher_controller.ratio_for_epoch(epoch)
         forward_fn = teacher_controller.make_forward_fn(model, current_ratio)
         if last_logged_ratio is None or abs(current_ratio - last_logged_ratio) > 1e-6:
@@ -1619,9 +1736,11 @@ def main() -> None:
             scaler=scaler,
             grad_clip_norm=optim_config.grad_clip_norm,
             grad_accum_steps=training_config.grad_accum_steps,
+            max_steps=remaining_steps,
             metrics=train_metrics,
             forward_fn=forward_fn,
         )
+        steps_completed += train_result.steps
         val_result = eval_epoch(
             model,
             val_loader,
@@ -1733,6 +1852,7 @@ def main() -> None:
             "epoch": epoch,
             "train": {
                 "loss": _safe_float(train_loss),
+                "steps": int(train_result.steps),
                 **_convert_metrics(train_result.metrics),
             },
             "val": {
@@ -1751,8 +1871,16 @@ def main() -> None:
         }
         _append_metrics(metrics_path, record)
 
-        if scheduler is not None:
+        if scheduler is not None and train_result.steps > 0:
             scheduler.step()
+
+        if max_train_steps is not None and steps_completed >= max_train_steps:
+            logging.info(
+                "Reached max_train_steps=%d after epoch %d; stopping training loop.",
+                max_train_steps,
+                epoch,
+            )
+            break
 
     if writer is not None:
         writer.close()

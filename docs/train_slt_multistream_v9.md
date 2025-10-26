@@ -111,6 +111,43 @@ Artefactos generados en `--work-dir`:
 - `config.json`: configuración efectiva combinando defaults, archivo y CLI.
 - `metrics.jsonl`: historial con pérdidas y métricas por época.
 
+## Fine-tuning controlado por pasos
+
+La CLI soporta tres grupos de parámetros diferenciados al instanciar el optimizador:
+
+- **Encoder** (`--lr-encoder`): todos los pesos del encoder multistream excepto las ramas MSKA.
+- **MSKA** (`--lr-mska`): el encoder de keypoints y el MLP de glosas; si no se define, hereda
+  la tasa del encoder.
+- **Decoder** (`--lr-decoder`): capas del decoder seq2seq de HuggingFace.
+
+Al activar `--max-train-steps` el bucle de entrenamiento se detiene tras el número indicado de
+iteraciones (micro-lotes) aunque `--epochs` sea mayor. `--subset-size` limita el dataset de
+entrenamiento a los primeros *N* elementos antes de crear el `DataLoader`, ideal para pruebas
+rápidas y escenarios de 5 000 iteraciones. Los planificadores `steplr` y `cosine` ajustan
+automáticamente `step_size`/`t_max` a este límite para evitar ciclos más largos de lo necesario.
+
+El helper `tools/fine_tune_phoenix_lsat.py` encapsula el flujo: carga `work_dirs/phoenix/best.pth`,
+aplica los límites de pasos y reenvía cualquier override adicional a la CLI principal.
+
+```bash
+python tools/fine_tune_phoenix_lsat.py \
+  --config configs/phoenix_lsat.yaml \
+  --work-dir work_dirs/phoenix_lsat_ft \
+  --lr-encoder 5e-5 --lr-decoder 1e-4 --subset-size 5000 \
+  --max-train-steps 5000 \
+  -- --set data.face_dir=data/phoenix_2014/processed/face \
+     --set data.hand_left_dir=data/phoenix_2014/processed/hand_l \
+     --set data.hand_right_dir=data/phoenix_2014/processed/hand_r \
+     --set data.pose_dir=data/phoenix_2014/processed/pose \
+     --set data.metadata_csv=data/phoenix_2014/meta.csv \
+     --set data.train_index=data/phoenix_2014/index/train.csv \
+     --set data.val_index=data/phoenix_2014/index/val.csv
+```
+
+El comando anterior crea `config.json` con los valores efectivos y registra en `metrics.jsonl` el
+número de pasos consumidos (`train.steps`) por época, además de detener el entrenamiento cuando se
+alcanzan las 5 000 iteraciones.
+
 ## Fine-tuning con T5 v1.1 Base (`--decoder-preset signmusketeers`)
 
 El preset `signmusketeers` replica la configuración descrita en

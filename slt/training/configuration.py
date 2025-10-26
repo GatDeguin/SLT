@@ -79,6 +79,9 @@ class OptimConfig:
 
     optimizer: str = "adamw"
     lr: float = 1e-3
+    lr_encoder: Optional[float] = None
+    lr_decoder: Optional[float] = None
+    lr_mska: Optional[float] = None
     weight_decay: float = 0.0
     scheduler: Optional[str] = None
     scheduler_step_size: int = 5
@@ -93,6 +96,8 @@ class TrainingConfig:
 
     epochs: int = 40
     grad_accum_steps: int = 1
+    max_train_steps: Optional[int] = None
+    subset_size: Optional[int] = None
     compile: bool = False
     compile_mode: Optional[str] = None
     init_checkpoint: Optional[Path] = None

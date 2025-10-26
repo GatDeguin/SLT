@@ -79,8 +79,11 @@ encoder = MultiStreamEncoder.from_pretrained(
 
 Acordamos utilizar el checkpoint MSKA entrenado sobre Phoenix 2014 distribuido
 como `best.pth`. Coloca el archivo en `data/phoenix_2014/best.pth` o define la
-variable `SLT_PHOENIX_CHECKPOINT` apuntando a su ubicación. Las herramientas en
-`tools/` permiten cargarlo pasando `--pretrained phoenix_2014` junto a
+variable `SLT_PHOENIX_CHECKPOINT` apuntando a su ubicación. El helper
+`tools/fine_tune_phoenix_lsat.py` asume que `work_dirs/phoenix/best.pth` está
+disponible y lanza un ajuste fino de 5 000 pasos con tasas diferenciadas, mientras
+que las CLI en `tools/` siguen permitiendo cargarlo pasando
+`--pretrained phoenix_2014` junto a
 `--pretrained-checkpoint data/phoenix_2014/best.pth`.
 
 ## Instalación
@@ -250,6 +253,38 @@ código base.
 
 `config.json` dentro de `work_dir` refleja la configuración efectiva combinando
 defaults, archivo y banderas.
+
+#### Ajuste fino Phoenix→LSA-T limitado a 5 000 pasos
+
+`tools/train_slt_multistream_v9.py` expone los argumentos
+`--lr-encoder`, `--lr-decoder`, `--lr-mska`, `--max-train-steps` y
+`--subset-size` para controlar tasas diferenciadas y truncar el ciclo de
+entrenamiento tras un número fijo de iteraciones. El helper
+`tools/fine_tune_phoenix_lsat.py` simplifica el flujo cargando `best.pth` de
+Phoenix, aplicando el régimen de 5 000 pasos y reenviando cualquier override
+adicional al script principal:
+
+```bash
+python tools/fine_tune_phoenix_lsat.py \
+  --config configs/phoenix_lsat.yaml \
+  --work-dir work_dirs/phoenix_lsat_ft \
+  --phoenix-checkpoint work_dirs/phoenix/best.pth \
+  --lr-encoder 5e-5 --lr-decoder 1e-4 \
+  --subset-size 5000 --max-train-steps 5000 \
+  -- --set data.face_dir=data/phoenix_2014/processed/face \
+     --set data.hand_left_dir=data/phoenix_2014/processed/hand_l \
+     --set data.hand_right_dir=data/phoenix_2014/processed/hand_r \
+     --set data.pose_dir=data/phoenix_2014/processed/pose \
+     --set data.metadata_csv=data/phoenix_2014/meta.csv \
+     --set data.train_index=data/phoenix_2014/index/train.csv \
+     --set data.val_index=data/phoenix_2014/index/val.csv
+```
+
+El comando crea tres grupos de parámetros: encoder (usa `--lr-encoder`), ramas
+MSKA (heredan `--lr-mska` o, si no se define, la tasa del encoder) y decoder
+(`--lr-decoder`). Con `--max-train-steps 5000` el bucle de entrenamiento se
+detiene tras 5 000 iteraciones aunque `--epochs` sea mayor, y el planificador de
+*learning rate* se ajusta automáticamente al límite efectivo.
 
 #### Preset SignMusketeers (T5 v1.1 Base)
 
