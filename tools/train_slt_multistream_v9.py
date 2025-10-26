@@ -449,6 +449,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pinned memory in the data loaders")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer identifier or local path")
+    parser.add_argument(
+        "--tokenizer-local-files-only",
+        action="store_true",
+        help="Avoid network requests when loading the tokenizer.",
+    )
+    parser.add_argument(
+        "--tokenizer-search-path",
+        dest="tokenizer_search_paths",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Additional directories checked before downloading the tokenizer.",
+    )
+    parser.add_argument(
+        "--tokenizer-path-env",
+        dest="tokenizer_path_env_vars",
+        action="append",
+        default=None,
+        metavar="ENV",
+        help="Environment variables with tokenizer paths (os.pathsep separated).",
+    )
     parser.add_argument("--max-target-length", type=int, help="Maximum length of the tokenised target sequences")
     parser.add_argument(
         "--mix-stream",
@@ -516,6 +537,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-layers", type=int, help="Number of layers in the seq2seq decoder")
     parser.add_argument("--decoder-heads", type=int, help="Number of attention heads in the seq2seq decoder")
     parser.add_argument("--decoder-dropout", type=float, help="Dropout probability inside the seq2seq decoder")
+    parser.add_argument(
+        "--decoder-local-files-only",
+        action="store_true",
+        help="Avoid network requests when loading decoder weights.",
+    )
+    parser.add_argument(
+        "--decoder-search-path",
+        dest="decoder_search_paths",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Additional directories or files searched for decoder checkpoints.",
+    )
+    parser.add_argument(
+        "--decoder-path-env",
+        dest="decoder_path_env_vars",
+        action="append",
+        default=None,
+        metavar="ENV",
+        help="Environment variables pointing to decoder weight paths.",
+    )
+    parser.add_argument(
+        "--decoder-hf-repo",
+        dest="decoder_hf_repo",
+        type=str,
+        help="Hugging Face repository used to prefetch decoder weights offline.",
+    )
+    parser.add_argument(
+        "--decoder-hf-filename",
+        dest="decoder_hf_filename",
+        type=str,
+        help="Filename within the Hugging Face repo to download (defaults to weights).",
+    )
+    parser.add_argument(
+        "--decoder-hf-revision",
+        dest="decoder_hf_revision",
+        type=str,
+        help="Revision (branch, tag or commit) to use when downloading decoder weights.",
+    )
     parser.add_argument("--face-backbone", type=str, help="Backbone specification for the face stream")
     parser.add_argument(
         "--hand-left-backbone",
@@ -997,6 +1057,20 @@ def parse_args() -> argparse.Namespace:
     if args.clip_grad_norm is not None and args.clip_grad_norm <= 0:
         logging.warning("Ignoring non-positive --clip-grad-norm value: %s", args.clip_grad_norm)
         args.clip_grad_norm = None
+    if args.tokenizer_search_paths is not None:
+        args.tokenizer_search_paths = [
+            str(Path(path).expanduser()) for path in args.tokenizer_search_paths
+        ]
+    if args.tokenizer_path_env_vars is not None:
+        cleaned = [str(var).strip() for var in args.tokenizer_path_env_vars if var]
+        args.tokenizer_path_env_vars = cleaned or None
+    if args.decoder_search_paths is not None:
+        args.decoder_search_paths = [
+            str(Path(path).expanduser()) for path in args.decoder_search_paths
+        ]
+    if args.decoder_path_env_vars is not None:
+        cleaned = [str(var).strip() for var in args.decoder_path_env_vars if var]
+        args.decoder_path_env_vars = cleaned or None
     explicit_bool_flags = set()
     for name in (
         "use_mska",
@@ -1004,6 +1078,8 @@ def parse_args() -> argparse.Namespace:
         "keypoint_normalize_center",
         "mska_use_sgr",
         "mska_sgr_shared",
+        "tokenizer_local_files_only",
+        "decoder_local_files_only",
     ):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
@@ -1430,7 +1506,12 @@ def main() -> None:
     tokenizer_source = data_config.tokenizer or model_config.decoder_model
     if tokenizer_source is None:
         raise ValueError("Tokenizer source could not be resolved.")
-    tokenizer = create_tokenizer(tokenizer_source)
+    tokenizer = create_tokenizer(
+        tokenizer_source,
+        local_files_only=data_config.tokenizer_local_files_only,
+        local_paths=(data_config.tokenizer_search_paths or None),
+        env_var_paths=(data_config.tokenizer_path_env_vars or None),
+    )
 
     train_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),

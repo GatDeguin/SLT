@@ -203,6 +203,16 @@ class MultiStreamClassifier(nn.Module):
             prompt_length = len(prompt_tokens)
             config.decoder_prompt_length = prompt_length
 
+        decoder_local_paths = list(config.decoder_search_paths or [])
+        decoder_env_vars = list(config.decoder_path_env_vars or [])
+        hf_hub_kwargs = None
+        if config.decoder_hf_repo:
+            hf_hub_kwargs = {"repo_id": config.decoder_hf_repo}
+            if config.decoder_hf_filename:
+                hf_hub_kwargs["filename"] = config.decoder_hf_filename
+            if config.decoder_hf_revision:
+                hf_hub_kwargs["revision"] = config.decoder_hf_revision
+
         base_kwargs = {
             "d_model": config.d_model,
             "vocab_size": int(vocab_size),
@@ -235,6 +245,10 @@ class MultiStreamClassifier(nn.Module):
                 pretrained_model_name_or_path=decoder_model_name,
                 config=decoder_config,
                 config_kwargs=config.decoder_kwargs,
+                local_files_only=config.decoder_local_files_only,
+                local_paths=decoder_local_paths or None,
+                env_var_paths=decoder_env_vars or None,
+                hf_hub_download_kwargs=hf_hub_kwargs,
             )
 
         if use_phoenix:

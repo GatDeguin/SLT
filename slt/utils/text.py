@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import os
 from itertools import zip_longest
-from typing import Callable, Iterable, List, Optional, Sequence, Union
+from pathlib import Path
+from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Union
 
+import requests
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+try:  # pragma: no cover - optional dependency in transformers
+    from huggingface_hub.utils import OfflineModeIsEnabled
+except Exception:  # pragma: no cover - fallback when the helper is missing
+    OfflineModeIsEnabled = type("OfflineModeIsEnabled", (), {})  # type: ignore
 
 __all__ = [
     "TokenizerValidationError",
@@ -30,6 +38,9 @@ def create_tokenizer(
     *,
     use_fast: bool = True,
     revision: Optional[str] = None,
+    local_files_only: bool = False,
+    local_paths: Optional[Sequence[str]] = None,
+    env_var_paths: Optional[Sequence[str]] = None,
     **kwargs,
 ) -> PreTrainedTokenizerBase:
     """Instantiate a :class:`~transformers.PreTrainedTokenizerBase`.
@@ -46,12 +57,114 @@ def create_tokenizer(
         Additional keyword arguments forwarded to ``from_pretrained``.
     """
 
-    return AutoTokenizer.from_pretrained(
-        name_or_path,
-        use_fast=use_fast,
-        revision=revision,
-        **kwargs,
-    )
+    search_paths = list(_iter_local_paths(name_or_path, local_paths, env_var_paths))
+    last_error: Optional[Exception] = None
+
+    if search_paths:
+        for candidate in search_paths:
+            try:
+                resolved_kwargs = dict(kwargs)
+                resolved_kwargs.setdefault("local_files_only", True)
+                return AutoTokenizer.from_pretrained(
+                    candidate,
+                    use_fast=use_fast,
+                    revision=revision,
+                    **resolved_kwargs,
+                )
+            except Exception as exc:  # pragma: no cover - exercised indirectly
+                last_error = exc
+
+        if local_files_only:
+            raise OSError(
+                "Unable to load tokenizer from the provided local paths."
+            ) from last_error
+
+    resolved_kwargs = dict(kwargs)
+    if local_files_only:
+        resolved_kwargs.setdefault("local_files_only", True)
+
+    try:
+        return AutoTokenizer.from_pretrained(
+            name_or_path,
+            use_fast=use_fast,
+            revision=revision,
+            **resolved_kwargs,
+        )
+    except Exception as exc:
+        if not _is_connectivity_error(exc):
+            raise
+
+        fallback_paths = [
+            path for path in search_paths if os.path.exists(path)
+        ]
+        if fallback_paths:
+            for candidate in fallback_paths:
+                try:
+                    return AutoTokenizer.from_pretrained(
+                        candidate,
+                        use_fast=use_fast,
+                        revision=revision,
+                        local_files_only=True,
+                        **kwargs,
+                    )
+                except Exception as inner_exc:  # pragma: no cover - defensive
+                    last_error = inner_exc
+        message = (
+            "Tokenizer download failed due to connectivity issues. "
+            "Provide a local path via --tokenizer or set SLT_TOKENIZER_PATH."
+        )
+        raise OSError(message) from exc
+
+
+def _iter_local_paths(
+    name_or_path: str,
+    extra_paths: Optional[Sequence[str]],
+    env_var_paths: Optional[Sequence[str]],
+) -> Iterator[str]:
+    candidates: List[str] = []
+    potential = Path(name_or_path)
+    if _path_exists(potential):
+        candidates.append(str(potential))
+
+    if extra_paths:
+        for path in extra_paths:
+            if path:
+                candidates.append(path)
+
+    env_sources = env_var_paths or ("SLT_TOKENIZER_PATH", "SLT_TOKENIZER_DIR")
+    for var in env_sources:
+        if not var:
+            continue
+        value = os.environ.get(var)
+        if not value:
+            continue
+        segments = [segment for segment in value.split(os.pathsep) if segment]
+        candidates.extend(segments or [value])
+
+    seen: set[str] = set()
+    for raw in candidates:
+        expanded = str(Path(raw).expanduser())
+        if expanded in seen:
+            continue
+        seen.add(expanded)
+        if _path_exists(Path(expanded)):
+            yield expanded
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.expanduser().exists()
+    except OSError:  # pragma: no cover - defensive guard
+        return False
+
+
+def _is_connectivity_error(exc: Exception) -> bool:
+    if isinstance(exc, OfflineModeIsEnabled):  # pragma: no cover - depends on hub
+        return True
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    text = str(exc).lower()
+    return any(keyword in text for keyword in {"offline", "connection", "network"})
 
 
 def validate_tokenizer(

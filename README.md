@@ -34,6 +34,8 @@ experimentos o adaptar el flujo a nuevas variantes.
   preentrenamiento y resúmenes de papers que motivan el enfoque multi-stream.
 - **Tests `tests/`**: suites de humo que cubren datos sintéticos,
   exportaciones y ejecuciones rápidas del pipeline.
+- **Modo offline**: guía paso a paso en `docs/offline_cache.md` para preparar caches
+  de tokenizer y decoder cuando la máquina no tiene acceso a Hugging Face.
 
 Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
 `docs/pretraining.md` para ampliar cada etapa. `tools/README.md` describe cada
@@ -343,6 +345,11 @@ distilación (`mska_distillation_weight=1.0`) y CTC (`mska_ctc_weight=1.0`). Las
 incluso cuando el preset está activo, por lo que puedes escalar la atención sin editar el YAML.
 Al combinarlo con `--decoder-model t5` la CLI aplica automáticamente la arquitectura de T5 Base y
 sincroniza el tokenizer, manteniendo el resto de hiperparámetros MSKA intactos.
+
+Para trabajar offline utiliza `--tokenizer-search-path` y `--decoder-search-path` para apuntar a
+las carpetas cacheadas, y añade `--tokenizer-local-files-only --decoder-local-files-only` para
+evitar solicitudes al Hub. El documento `docs/offline_cache.md` recopila ejemplos completos y el
+flujo recomendado para preparar los artefactos con `huggingface-cli`.
 
 Cuando trabajes con decoders T5 puedes activar *prompt tuning* y scheduled sampling
 directamente desde la CLI: `--decoder-prompt-length`, `--decoder-prompt-init`,
