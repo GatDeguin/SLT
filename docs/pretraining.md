@@ -68,6 +68,8 @@ la misma interfaz básica y producen backbones compatibles con
      --algorithm dino \
      --export-backbone work_dirs/dino_face/backbone.pt
    ```
+   Añade `--export-checkpoint` junto a `--output-path` para generar un
+   `state_dict` del encoder listo para inicializar MSKA.
    Activa el regularizador KoLeo cuando busques diversificar los embeddings del
    estudiante:
    ```bash

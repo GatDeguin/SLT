@@ -32,14 +32,16 @@ experimentos o adaptar el flujo a nuevas variantes.
   real (`docs/operational_checklist.md` lista los pasos sugeridos para releases).
 - **Documentación `docs/`**: contratos de datos, guías operativas, manuales de
   preentrenamiento y resúmenes de papers que motivan el enfoque multi-stream.
+- **Fine-tuning guiado**: `docs/finetuning.md` explica cómo reaprovechar los
+  encoders de rostro/manos exportados y cargarlos dentro de MSKA.
 - **Tests `tests/`**: suites de humo que cubren datos sintéticos,
   exportaciones y ejecuciones rápidas del pipeline.
 - **Modo offline**: guía paso a paso en `docs/offline_cache.md` para preparar caches
   de tokenizer y decoder cuando la máquina no tiene acceso a Hugging Face.
 
-Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md` y
-`docs/pretraining.md` para ampliar cada etapa. `tools/README.md` describe cada
-script CLI disponible.
+Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md`,
+`docs/pretraining.md` y `docs/finetuning.md` para ampliar cada etapa.
+`tools/README.md` describe cada script CLI disponible.
 
 ### Pipeline unificado ROI + keypoints
 

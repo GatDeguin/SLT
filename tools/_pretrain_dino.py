@@ -341,6 +341,18 @@ def _parse_args(
         help="Directorio donde escribir checkpoints y logs",
     )
     parser.add_argument(
+        "--export-checkpoint",
+        action="store_true",
+        help="Guardar un state_dict del encoder entrenado al finalizar",
+    )
+    parser.add_argument(
+        "--output-path",
+        dest="encoder_export_path",
+        type=Path,
+        default=None,
+        help="Ruta del archivo donde almacenar el state_dict exportado",
+    )
+    parser.add_argument(
         "--algorithm",
         choices=["dino", "ibot"],
         default="dino",
@@ -832,11 +844,17 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
     export_path = (
         _resolve_path(args.export_backbone, config_dir) if args.export_backbone else None
     )
+    encoder_export = (
+        _resolve_path(args.encoder_export_path, config_dir)
+        if args.encoder_export_path
+        else None
+    )
 
     args.train_dir = train_dirs
     args.output_dir = output_dir
     args.resume = resume_path
     args.export_backbone = export_path
+    args.encoder_export_path = encoder_export
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     LOGGER.info("Usando dispositivo %s", device)
@@ -1243,6 +1261,41 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             metadata=export_metadata,
         )
 
+    if args.export_checkpoint:
+        if args.encoder_export_path is None:
+            export_file = output_dir / f"{args.stream}_encoder_state.pt"
+        else:
+            export_file = args.encoder_export_path
+        export_file.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_payload = {
+            "stream": args.stream,
+            "algorithm": args.algorithm,
+            "best_loss": best_loss,
+            "epochs": args.epochs,
+            "pseudo_epochs": args.pseudo_epochs,
+            "global_step": global_step,
+            "state_dict": teacher_backbone.state_dict(),
+            "metadata": {
+                "image_size": args.image_size,
+                "patch_size": args.patch_size,
+                "embed_dim": args.vit_embed_dim,
+                "depth": args.vit_depth,
+                "num_heads": args.vit_num_heads,
+                "mlp_ratio": args.vit_mlp_ratio,
+            },
+        }
+        torch.save(checkpoint_payload, export_file)
+        LOGGER.info("Encoder exportado a %s", export_file)
+        tracker.register_artifact(
+            export_file,
+            name="encoder_state_dict",
+            metadata={
+                "stream": args.stream,
+                "best_loss": best_loss,
+                "epochs": args.epochs,
+            },
+        )
+
 
 def run_multistream(
     argv: Iterable[str] | None = None,
@@ -1270,11 +1323,17 @@ def run_multistream(
     export_path = (
         _resolve_path(args.export_backbone, config_dir) if args.export_backbone else None
     )
+    encoder_export = (
+        _resolve_path(args.encoder_export_path, config_dir)
+        if args.encoder_export_path
+        else None
+    )
 
     args.train_dir = train_dirs
     args.output_dir = output_dir
     args.resume = resume_path
     args.export_backbone = export_path
+    args.encoder_export_path = encoder_export
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     LOGGER.info("Usando dispositivo %s", device)

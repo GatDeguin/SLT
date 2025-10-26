@@ -17,6 +17,7 @@ from slt.models import (
     ViTConfig,
     apply_phoenix_weights,
     load_dinov2_backbone,
+    load_mska_encoder_state,
 )
 from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import load_single_signer_components
@@ -144,6 +145,12 @@ class MultiStreamClassifier(nn.Module):
                 global_attention_shared=config.mska_sgr_shared,
                 leaky_relu_negative_slope=config.leaky_relu_negative_slope,
             )
+            if config.mska_face_state or config.mska_hand_state:
+                load_mska_encoder_state(
+                    mska_encoder,
+                    face_checkpoint=config.mska_face_state,
+                    hand_checkpoint=config.mska_hand_state,
+                )
 
         self.encoder = MultiStreamEncoder(
             backbone_config=vit_config,
