@@ -21,6 +21,9 @@ cuando necesites procesar videos o ejecutar demos.
 - `extract_rois_v2.py`: genera los recortes de rostro/manos/pose en
   `data/single_signer/processed/` siguiendo el [contrato de datos](../docs/data_contract.md).
   Soporta reanudación con `--resume` y produce `metadata.jsonl` con métricas por video.
+- `prepare_lsat_crops.py`: recorre LSA-T (y globs externos) aplicando las mismas ROI para
+  muestrear millones de crops en `data/single_signer/processed_lsat/`, valida `meta.csv` y
+  permite cortar al alcanzar `--target-crops`.
 - `ci_validate_data_contract.py`: construye un dataset sintético que replica la
   estructura esperada y ejecuta verificaciones básicas.
 - `ci_validate_metrics.py`: compara pérdidas y métricas contra valores de

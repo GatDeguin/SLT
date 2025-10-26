@@ -6,6 +6,50 @@ sobre los recortes generados en `data/single_signer/processed/`. Todos comparten
 la misma interfaz básica y producen backbones compatibles con
 `load_dinov2_backbone`.
 
+## Preparar crops masivos para preentrenamiento
+
+1. LSA-T utiliza la metadata global `meta.csv` (del repositorio) con columnas
+   `video` y rangos temporales (`start`, `end`). Verifica que cualquier fuente
+   externa incluya sus videos en dicho CSV antes de lanzar el muestreo.
+2. Ejecuta un sondeo inicial para estimar recursos y descubrir rutas con
+   `python tools/prepare_lsat_crops.py --lsa-root data/lsa_t/videos --dry-run`.
+   El resumen lista hasta 10 videos, su cantidad de clips anotados y la duración
+   total cubierta por `meta.csv`.
+3. Genera los crops con:
+   ```bash
+   python tools/prepare_lsat_crops.py \
+     --lsa-root data/lsa_t/videos \
+     --output-root data/single_signer/processed_lsat \
+     --metadata data/single_signer/processed_lsat/lsat_metadata.jsonl \
+     --fps 25 --shuffle --target-crops 3_000_000
+   ```
+   El script aplica las mismas ROI que `extract_rois_v2.py`, respeta `--resume`
+   si el archivo JSONL ya contiene entradas exitosas y detiene el recorrido una
+   vez alcanzado el número de frames solicitado.
+4. Mezcla rutas externas con globs adicionales. Por ejemplo, para integrar clips
+   curados en `data/signoteca/*.mp4` y `gs://bucket/proyectos/extra/*.mp4`:
+   ```bash
+   python tools/prepare_lsat_crops.py \
+     --lsa-root data/lsa_t/videos \
+     --extra-datasets "data/signoteca/*.mp4" "gs://bucket/proyectos/extra/*.mp4" \
+     --output-root data/single_signer/processed_lsat --shuffle
+   ```
+   Todas las rutas detectadas deben compartir IDs con `meta.csv`; el helper
+   aborta si encuentra archivos sin fila asociada para evitar inconsistencias.
+
+### Estimar recursos
+
+- **CPU**: MediaPipe corre en CPU. Un servidor de 16 núcleos logra entre 140 y
+  180 FPS agregados (≈6–8 FPS por núcleo) con los tres detectores activos.
+- **GPU**: no es obligatoria; sólo se emplea la CPU.
+- **Almacenamiento**: cada frame produce tres JPEG de 224×224 (rostro y dos
+  manos). Con una compresión media de 28 KB por imagen, 1 millón de frames
+  equivale a ~84 GB (`3 × 28 KB × 10^6`). Añade ~1.2 GB por cada millón de
+  poses (`.npz`). Reserva al menos un 15 % adicional para márgenes y metadatos.
+- **Tiempo**: para 1 millón de frames a 150 FPS efectivos el proceso demora
+  ≈1.85 horas (`1e6 / 150 / 3600`). Ajusta `--target-crops` y `--shuffle` para
+  escalonar ejecuciones largas en bloques reproducibles.
+
 ## Flujo recomendado
 
 1. Ejecuta `tools/extract_rois_v2.py` y verifica la estructura documentada en el

@@ -173,6 +173,11 @@ para conocer las verificaciones recomendadas tras la instalación.
    clave `pose_norm="signing_space_v1"`. Cuando MediaPipe no reporta landmarks
    se replica la pose previa o se rellena con `-1` y visibilidad `0` como
    sentinel.
+   Para LSA-T y corpus externos con millones de crops combina fuentes mediante
+   `python tools/prepare_lsat_crops.py --lsa-root data/lsa_t/videos --output-root \
+   data/single_signer/processed_lsat --extra-datasets "data/externo/**/*.mp4"`.
+   El helper aplica las mismas ROI, valida los IDs contra `meta.csv` y permite
+   detenerse al alcanzar un número objetivo de frames con `--target-crops`.
 4. Genera o copia los keypoints multistream en
    `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
    `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en
