@@ -369,6 +369,11 @@ python tools/eval_slt_multistream_v9.py \
   --output-csv work_dirs/single_signer_demo/predictions/preds.csv
 ```
 
+Cuando el checkpoint activa MSKA puedes ajustar `--ctc-num-beams` (ancho del beam
+CTC) y añadir `--report-gloss-wer` para incluir CER/WER de glosas en los reportes.
+Los CSV incorporan columnas `gloss_prediction` y `gloss_reference` y las
+secciones de métricas agregadas añaden `gloss_cer` y `gloss_wer`.
+
 El script valida el tokenizador con `slt.utils.validate_tokenizer` antes de
 procesar los videos, evitando ejecuciones largas con configuraciones inválidas.
 Los reportes incluyen métricas BLEU, ChrF, CER y WER; estas últimas se calculan
