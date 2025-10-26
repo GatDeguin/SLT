@@ -88,6 +88,9 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
         "student_temp",
         "teacher_temp",
         "center_momentum",
+        "use_sinkhorn",
+        "sinkhorn_eps",
+        "sinkhorn_iters",
         "koleo_epsilon",
         "koleo_weight",
         "seed",
@@ -95,12 +98,14 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
         "resume",
         "export_backbone",
         "log_interval",
+        "pseudo_epochs",
         "image_size",
         "patch_size",
         "vit_embed_dim",
         "vit_depth",
         "vit_num_heads",
         "vit_mlp_ratio",
+        "global_crops",
         "num_local_crops",
         "local_crop_size",
         "global_crop_scale",
@@ -149,11 +154,16 @@ def _load_cli_config(path: Path) -> dict[str, Any]:
         "local_crop_scale": "local_crop_scale",
         "image_size": "image_size",
         "local_crop_size": "local_crop_size",
+        "num_global_crops": "global_crops",
+        "global_crops": "global_crops",
         "num_local_crops": "num_local_crops",
     }
     for key, target in aug_map.items():
         if key in augmentation_section and target not in normalized:
             normalized[target] = augmentation_section[key]
+
+    if "num_global_crops" in normalized and "global_crops" not in normalized:
+        normalized["global_crops"] = normalized.pop("num_global_crops")
 
     checkpoint_section = _ensure_mapping(
         data.get("checkpoint") or data.get("checkpoints") or data.get("checkpointing")
@@ -244,6 +254,14 @@ def _compute_dino_loss(
     return loss
 
 
+def _iterate_pseudo_epochs(dataloader: Iterable, repeats: int):
+    if repeats < 1:
+        raise ValueError("Pseudo-epochs must be >= 1")
+    for _ in range(repeats):
+        for batch in dataloader:
+            yield batch
+
+
 def _combine_cls_tokens(tokens: Sequence[torch.Tensor]) -> torch.Tensor:
     if not tokens:
         raise ValueError("No se recibieron embeddings CLS para combinar")
@@ -329,6 +347,12 @@ def _parse_args(
         help="Algoritmo de entrenamiento a utilizar",
     )
     parser.add_argument("--epochs", type=int, default=10, help="Número de épocas")
+    parser.add_argument(
+        "--pseudo-epochs",
+        type=int,
+        default=1,
+        help="Repeticiones del DataLoader dentro de cada época lógica",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Tamaño del batch")
     parser.add_argument("--num-workers", type=int, default=0, help="Workers del DataLoader")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Tasa de aprendizaje inicial")
@@ -381,6 +405,23 @@ def _parse_args(
     parser.add_argument("--teacher-temp", type=float, default=0.04, help="Temperatura del maestro")
     parser.add_argument("--center-momentum", type=float, default=0.9, help="Momentum del centro para DINO")
     parser.add_argument(
+        "--use-sinkhorn",
+        action="store_true",
+        help="Activa normalización Sinkhorn previa al cálculo de la pérdida",
+    )
+    parser.add_argument(
+        "--sinkhorn-eps",
+        type=float,
+        default=0.05,
+        help="Parámetro epsilon para la rutina de Sinkhorn",
+    )
+    parser.add_argument(
+        "--sinkhorn-iters",
+        type=int,
+        default=3,
+        help="Número de iteraciones de Sinkhorn a aplicar",
+    )
+    parser.add_argument(
         "--koleo-epsilon",
         type=float,
         default=1e-4,
@@ -429,8 +470,6 @@ def _parse_args(
         default=4.0,
         help="Factor de expansión MLP del ViT",
     )
-    parser.add_argument("--num-local-crops", type=int, default=4, help="Número de crops locales")
-    parser.add_argument("--local-crop-size", type=int, default=96, help="Tamaño de crops locales")
     parser.add_argument(
         "--global-crop-scale",
         type=float,
@@ -471,6 +510,24 @@ def _parse_args(
     )
 
     default_aug = AugmentationConfig()
+    parser.add_argument(
+        "--num-local-crops",
+        type=int,
+        default=default_aug.num_local_crops,
+        help="Número de crops locales",
+    )
+    parser.add_argument(
+        "--global-crops",
+        type=int,
+        default=default_aug.num_global_crops,
+        help="Número de crops globales por imagen",
+    )
+    parser.add_argument(
+        "--local-crop-size",
+        type=int,
+        default=default_aug.local_crop_size,
+        help="Tamaño de crops locales",
+    )
     parser.add_argument(
         "--aug-brightness",
         type=float,
@@ -579,6 +636,15 @@ def _parse_args(
     )
 
     args = parser.parse_args(remaining)
+
+    if args.pseudo_epochs < 1:
+        parser.error("--pseudo-epochs debe ser un entero positivo")
+    if args.global_crops < 1:
+        parser.error("--global-crops debe ser un entero positivo")
+    if args.sinkhorn_iters < 1:
+        parser.error("--sinkhorn-iters debe ser un entero positivo")
+    if args.sinkhorn_eps <= 0:
+        parser.error("--sinkhorn-eps debe ser mayor que cero")
 
     if multi_streams:
         train_dir_map: dict[str, list[Path]] = {}
@@ -791,6 +857,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
         global_crop_scale=tuple(float(x) for x in args.global_crop_scale),
         local_crop_size=args.local_crop_size,
         local_crop_scale=tuple(float(x) for x in args.local_crop_scale),
+        num_global_crops=args.global_crops,
         num_local_crops=args.num_local_crops,
         brightness=args.aug_brightness,
         contrast=args.aug_contrast,
@@ -835,11 +902,20 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
         "train_dirs": [str(path) for path in train_dirs],
         "output_dir": str(output_dir),
         "epochs": args.epochs,
+        "pseudo_epochs": args.pseudo_epochs,
         "seed": args.seed,
         "optimizer": {
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "warmup_epochs": args.warmup_epochs,
+        },
+        "loss": {
+            "student_temp": args.student_temp,
+            "teacher_temp": args.teacher_temp,
+            "center_momentum": args.center_momentum,
+            "use_sinkhorn": bool(args.use_sinkhorn),
+            "sinkhorn_eps": args.sinkhorn_eps,
+            "sinkhorn_iters": args.sinkhorn_iters,
         },
         "regularization": {
             "koleo_epsilon": args.koleo_epsilon,
@@ -889,10 +965,11 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     scheduler = None
-    total_steps = len(dataloader) * args.epochs
-    if total_steps == 0:
+    steps_per_epoch = len(dataloader) * args.pseudo_epochs
+    if steps_per_epoch == 0:
         raise RuntimeError("El dataset está vacío; no es posible entrenar")
-    warmup_steps = int(len(dataloader) * args.warmup_epochs)
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = int(steps_per_epoch * args.warmup_epochs)
     lr_schedule = list(cosine_scheduler(args.learning_rate, warmup_steps, total_steps))
     momentum_schedule = _momentum_schedule(
         args.teacher_momentum_base,
@@ -917,6 +994,9 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
         student_temp=args.student_temp,
         teacher_temp=args.teacher_temp,
         center_momentum=args.center_momentum,
+        use_sinkhorn=args.use_sinkhorn,
+        sinkhorn_eps=args.sinkhorn_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
     ibot_loss_fn = (
         IBOTLoss(
@@ -926,6 +1006,9 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             center_momentum=args.center_momentum,
             global_weight=0.0,
             patch_weight=args.patch_loss_weight,
+            use_sinkhorn=args.use_sinkhorn,
+            sinkhorn_eps=args.sinkhorn_eps,
+            sinkhorn_iters=args.sinkhorn_iters,
         ).to(device)
         if args.algorithm == "ibot"
         else None
@@ -946,7 +1029,9 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             student_patch_head.train()
         epoch_loss = 0.0
         epoch_koleo = 0.0
-        for step, images in enumerate(dataloader, start=1):
+        for step, images in enumerate(
+            _iterate_pseudo_epochs(dataloader, args.pseudo_epochs), start=1
+        ):
             optimizer.zero_grad(set_to_none=True)
             teacher_backbone.eval()
             teacher_head.eval()
@@ -1043,7 +1128,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
                     "Época %d - iter %d/%d - pérdida %.4f",
                     epoch,
                     step,
-                    len(dataloader),
+                    steps_per_epoch,
                     loss.item(),
                 )
                 metrics = {"loss": float(loss.item()), "epoch": epoch, "step": step}
@@ -1051,7 +1136,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
                     metrics["koleo_loss"] = float(koleo_loss_term.item())
                 tracker.log_metrics(global_step, metrics, context="train_step")
 
-        num_batches = len(dataloader)
+        num_batches = steps_per_epoch
         denominator = max(num_batches, 1)
         avg_loss = epoch_loss / denominator
         avg_koleo = epoch_koleo / denominator if num_batches else 0.0
@@ -1067,6 +1152,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             "epoch": epoch,
             "algorithm": args.algorithm,
             "stream": args.stream,
+            "pseudo_epochs": args.pseudo_epochs,
             "backbone": {
                 "image_size": args.image_size,
                 "patch_size": args.patch_size,
@@ -1077,6 +1163,14 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             },
             "best_loss": best_loss,
             "global_step": global_step,
+            "loss": {
+                "student_temp": args.student_temp,
+                "teacher_temp": args.teacher_temp,
+                "center_momentum": args.center_momentum,
+                "use_sinkhorn": bool(args.use_sinkhorn),
+                "sinkhorn_eps": args.sinkhorn_eps,
+                "sinkhorn_iters": args.sinkhorn_iters,
+            },
             "regularization": {
                 "koleo_epsilon": args.koleo_epsilon,
                 "koleo_weight": args.koleo_weight,
@@ -1122,6 +1216,7 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
             "algorithm": args.algorithm,
             "best_loss": best_loss,
             "epochs": args.epochs,
+            "pseudo_epochs": args.pseudo_epochs,
             "global_step": global_step,
             "backbone": {
                 "image_size": args.image_size,
@@ -1130,6 +1225,14 @@ def run(argv: Iterable[str] | None = None, *, default_stream: str) -> None:
                 "depth": args.vit_depth,
                 "num_heads": args.vit_num_heads,
                 "mlp_ratio": args.vit_mlp_ratio,
+            },
+            "loss": {
+                "student_temp": args.student_temp,
+                "teacher_temp": args.teacher_temp,
+                "center_momentum": args.center_momentum,
+                "use_sinkhorn": bool(args.use_sinkhorn),
+                "sinkhorn_eps": args.sinkhorn_eps,
+                "sinkhorn_iters": args.sinkhorn_iters,
             },
         }
         export_for_dinov2(args.export_backbone, backbone=teacher_backbone, metadata=export_metadata)
@@ -1193,6 +1296,7 @@ def run_multistream(
         global_crop_scale=tuple(float(x) for x in args.global_crop_scale),
         local_crop_size=args.local_crop_size,
         local_crop_scale=tuple(float(x) for x in args.local_crop_scale),
+        num_global_crops=args.global_crops,
         num_local_crops=args.num_local_crops,
         brightness=args.aug_brightness,
         contrast=args.aug_contrast,
@@ -1240,11 +1344,20 @@ def run_multistream(
         },
         "output_dir": str(output_dir),
         "epochs": args.epochs,
+        "pseudo_epochs": args.pseudo_epochs,
         "seed": args.seed,
         "optimizer": {
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "warmup_epochs": args.warmup_epochs,
+        },
+        "loss": {
+            "student_temp": args.student_temp,
+            "teacher_temp": args.teacher_temp,
+            "center_momentum": args.center_momentum,
+            "use_sinkhorn": bool(args.use_sinkhorn),
+            "sinkhorn_eps": args.sinkhorn_eps,
+            "sinkhorn_iters": args.sinkhorn_iters,
         },
         "regularization": {
             "koleo_epsilon": args.koleo_epsilon,
@@ -1296,10 +1409,11 @@ def run_multistream(
         parameters.extend(student_patch_head.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    total_steps = len(dataloader) * args.epochs
-    if total_steps == 0:
+    steps_per_epoch = len(dataloader) * args.pseudo_epochs
+    if steps_per_epoch == 0:
         raise RuntimeError("El dataset está vacío; no es posible entrenar")
-    warmup_steps = int(len(dataloader) * args.warmup_epochs)
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = int(steps_per_epoch * args.warmup_epochs)
     lr_schedule = list(cosine_scheduler(args.learning_rate, warmup_steps, total_steps))
     momentum_schedule = _momentum_schedule(
         args.teacher_momentum_base,
@@ -1324,6 +1438,9 @@ def run_multistream(
         student_temp=args.student_temp,
         teacher_temp=args.teacher_temp,
         center_momentum=args.center_momentum,
+        use_sinkhorn=args.use_sinkhorn,
+        sinkhorn_eps=args.sinkhorn_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
     ibot_loss_fn = (
         IBOTLoss(
@@ -1333,6 +1450,9 @@ def run_multistream(
             center_momentum=args.center_momentum,
             global_weight=0.0,
             patch_weight=args.patch_loss_weight,
+            use_sinkhorn=args.use_sinkhorn,
+            sinkhorn_eps=args.sinkhorn_eps,
+            sinkhorn_iters=args.sinkhorn_iters,
         ).to(device)
         if args.algorithm == "ibot"
         else None
@@ -1354,7 +1474,9 @@ def run_multistream(
             student_patch_head.train()
         epoch_loss = 0.0
         epoch_koleo = 0.0
-        for step, batch in enumerate(dataloader, start=1):
+        for step, batch in enumerate(
+            _iterate_pseudo_epochs(dataloader, args.pseudo_epochs), start=1
+        ):
             optimizer.zero_grad(set_to_none=True)
             for module in teacher_backbones.values():
                 module.eval()
@@ -1511,7 +1633,7 @@ def run_multistream(
                     "Época %d - iter %d/%d - pérdida %.4f",
                     epoch,
                     step,
-                    len(dataloader),
+                    steps_per_epoch,
                     loss.item(),
                 )
                 metrics = {
@@ -1523,7 +1645,7 @@ def run_multistream(
                     metrics["koleo_loss"] = float(koleo_loss_term.item())
                 tracker.log_metrics(global_step, metrics, context="train_step")
 
-        num_batches = len(dataloader)
+        num_batches = steps_per_epoch
         denominator = max(num_batches, 1)
         avg_loss = epoch_loss / denominator
         avg_koleo = epoch_koleo / denominator if num_batches else 0.0
@@ -1539,6 +1661,7 @@ def run_multistream(
             "epoch": epoch,
             "algorithm": args.algorithm,
             "streams": list(streams),
+            "pseudo_epochs": args.pseudo_epochs,
             "backbone": {
                 "image_size": args.image_size,
                 "patch_size": args.patch_size,
@@ -1549,6 +1672,14 @@ def run_multistream(
             },
             "best_loss": best_loss,
             "global_step": global_step,
+            "loss": {
+                "student_temp": args.student_temp,
+                "teacher_temp": args.teacher_temp,
+                "center_momentum": args.center_momentum,
+                "use_sinkhorn": bool(args.use_sinkhorn),
+                "sinkhorn_eps": args.sinkhorn_eps,
+                "sinkhorn_iters": args.sinkhorn_iters,
+            },
             "regularization": {
                 "koleo_epsilon": args.koleo_epsilon,
                 "koleo_weight": args.koleo_weight,
@@ -1614,6 +1745,7 @@ def run_multistream(
             "algorithm": args.algorithm,
             "best_loss": best_loss,
             "epochs": args.epochs,
+            "pseudo_epochs": args.pseudo_epochs,
             "global_step": global_step,
             "backbone": {
                 "image_size": args.image_size,
@@ -1622,6 +1754,14 @@ def run_multistream(
                 "depth": args.vit_depth,
                 "num_heads": args.vit_num_heads,
                 "mlp_ratio": args.vit_mlp_ratio,
+            },
+            "loss": {
+                "student_temp": args.student_temp,
+                "teacher_temp": args.teacher_temp,
+                "center_momentum": args.center_momentum,
+                "use_sinkhorn": bool(args.use_sinkhorn),
+                "sinkhorn_eps": args.sinkhorn_eps,
+                "sinkhorn_iters": args.sinkhorn_iters,
             },
         }
 
@@ -1632,6 +1772,7 @@ def run_multistream(
                 "algorithm": args.algorithm,
                 "best_loss": best_loss,
                 "epochs": args.epochs,
+                "pseudo_epochs": args.pseudo_epochs,
                 "global_step": global_step,
                 "backbone": {
                     "image_size": args.image_size,
@@ -1640,6 +1781,14 @@ def run_multistream(
                     "depth": args.vit_depth,
                     "num_heads": args.vit_num_heads,
                     "mlp_ratio": args.vit_mlp_ratio,
+                },
+                "loss": {
+                    "student_temp": args.student_temp,
+                    "teacher_temp": args.teacher_temp,
+                    "center_momentum": args.center_momentum,
+                    "use_sinkhorn": bool(args.use_sinkhorn),
+                    "sinkhorn_eps": args.sinkhorn_eps,
+                    "sinkhorn_iters": args.sinkhorn_iters,
                 },
             }
             export_for_dinov2(

@@ -376,6 +376,13 @@ resultantes con `tools/train_slt_multistream_v9.py`. La misma guía detalla cóm
 activar el regularizador KoLeo mediante `--koleo-weight` y ajustar la estabilidad
 numérica con `--koleo-epsilon`.
 
+La configuración por defecto genera dos crops globales y ocho locales por imagen.
+Modifícalos con `--global-crops` y `--num-local-crops` según la resolución
+disponible. Usa `--pseudo-epochs` para repetir el DataLoader dentro de cada época
+—el planificador de *learning rate* se estira automáticamente— y activa la
+normalización Sinkhorn de estilo DINOv2 con `--use-sinkhorn`. Ajusta los
+parámetros `--sinkhorn-eps` y `--sinkhorn-iters` si necesitas mayor estabilidad.
+
 ## Control de calidad y pruebas
 
 Los tests automatizados validan piezas clave del pipeline:

@@ -119,6 +119,22 @@ export_backbone = "work_dirs/dino_multistream/backbone"
 - `--koleo-epsilon`: margen numérico para evitar distancias nulas al estimar la entropía.
   Mantiene un valor base de `1e-4`, alineado con la implementación empleada por DINOv2.
 
+### Controlar vistas y pseudo-épocas
+
+- `--global-crops`: cantidad de crops globales por imagen. El valor por defecto es 2 y se
+  combina con 8 crops locales (`--num-local-crops`) para seguir la receta de DINOv2.
+- `--pseudo-epochs`: repite el DataLoader dentro de cada época lógica. El scheduler de *learning
+  rate* y el momentum del maestro multiplican automáticamente sus pasos por este valor, útil para
+  datasets pequeños o experimentos de *fine-tuning*.
+
+### Normalización Sinkhorn
+
+- `--use-sinkhorn`: activa la proyección Sinkhorn antes de comparar las distribuciones del maestro
+  y el estudiante, replicando la estrategia de DINOv2.
+- `--sinkhorn-eps`: valor de epsilon (por defecto `0.05`) utilizado para suavizar la matriz antes de
+  iterar.
+- `--sinkhorn-iters`: número de iteraciones aplicadas sobre la rutina Sinkhorn (3 por defecto).
+
 ## Artefactos generados
 
 - `params.json`: resumen de hiperparámetros y rutas utilizadas.
