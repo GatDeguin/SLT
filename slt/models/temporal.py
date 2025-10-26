@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Sequence, Tuple, Type
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import torch
 from torch import Tensor, nn
@@ -14,6 +16,37 @@ from transformers import (
     T5ForConditionalGeneration,
 )
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
+
+try:  # pragma: no cover - optional dependency in transformers
+    from huggingface_hub import hf_hub_download
+except Exception:  # pragma: no cover - used only when available
+    hf_hub_download = None  # type: ignore
+
+try:  # pragma: no cover - optional helper
+    from huggingface_hub.utils import OfflineModeIsEnabled
+except Exception:  # pragma: no cover - fallback when helper missing
+    OfflineModeIsEnabled = type("OfflineModeIsEnabled", (), {})  # type: ignore
+
+try:  # pragma: no cover - optional dependency for error detection
+    import requests
+except Exception:  # pragma: no cover - requests may be absent in some envs
+    requests = None  # type: ignore
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.expanduser().exists()
+    except OSError:  # pragma: no cover - defensive guard
+        return False
+
+
+def _is_connectivity_error(exc: Exception) -> bool:
+    if isinstance(exc, OfflineModeIsEnabled):  # pragma: no cover - depends on hub
+        return True
+    if requests is not None and isinstance(exc, requests.exceptions.RequestException):
+        return True
+    text = str(exc).lower()
+    return any(keyword in text for keyword in {"offline", "connection", "network"})
 
 
 class TemporalEncoder(nn.Module):
@@ -72,6 +105,10 @@ class TextSeq2SeqDecoder(nn.Module):
         prompt_init_std: float = 0.02,
         prompt_init_range: float = 0.5,
         prompt_init_tokens: Optional[Sequence[int]] = None,
+        local_files_only: bool = False,
+        local_paths: Optional[Sequence[str]] = None,
+        env_var_paths: Optional[Sequence[str]] = None,
+        hf_hub_download_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -94,6 +131,10 @@ class TextSeq2SeqDecoder(nn.Module):
             config=config,
             config_kwargs=config_kwargs,
             auto_model_cls=auto_model_cls,
+            local_files_only=local_files_only,
+            local_paths=local_paths,
+            env_var_paths=env_var_paths,
+            hf_hub_download_kwargs=hf_hub_download_kwargs,
         )
 
         if tie_embeddings:
@@ -145,15 +186,25 @@ class TextSeq2SeqDecoder(nn.Module):
         config: Optional[PretrainedConfig],
         config_kwargs: Dict[str, Any],
         auto_model_cls: Type[AutoModelForSeq2SeqLM],
+        local_files_only: bool,
+        local_paths: Optional[Sequence[str]],
+        env_var_paths: Optional[Sequence[str]],
+        hf_hub_download_kwargs: Optional[Dict[str, Any]],
     ) -> nn.Module:
         if config is not None:
             TextSeq2SeqDecoder._validate_hidden_size(config, d_model)
             return auto_model_cls.from_config(config)
 
         if pretrained_model_name_or_path is not None:
-            model = auto_model_cls.from_pretrained(pretrained_model_name_or_path)
-            TextSeq2SeqDecoder._validate_hidden_size(model.config, d_model)
-            return model
+            return TextSeq2SeqDecoder._load_pretrained_model(
+                pretrained_model_name_or_path,
+                auto_model_cls=auto_model_cls,
+                d_model=d_model,
+                local_files_only=local_files_only,
+                local_paths=local_paths,
+                env_var_paths=env_var_paths,
+                hf_hub_download_kwargs=hf_hub_download_kwargs,
+            )
 
         model_type = config_kwargs.pop("model_type", "t5").lower()
         default_kwargs = TextSeq2SeqDecoder._build_default_config_kwargs(
@@ -180,6 +231,149 @@ class TextSeq2SeqDecoder(nn.Module):
         ):
             return auto_model_cls(auto_config)
         return auto_model_cls.from_config(auto_config)
+
+    @staticmethod
+    def _load_pretrained_model(
+        identifier: str,
+        *,
+        auto_model_cls: Type[AutoModelForSeq2SeqLM],
+        d_model: int,
+        local_files_only: bool,
+        local_paths: Optional[Sequence[str]],
+        env_var_paths: Optional[Sequence[str]],
+        hf_hub_download_kwargs: Optional[Dict[str, Any]],
+    ) -> nn.Module:
+        candidates = TextSeq2SeqDecoder._collect_candidate_paths(
+            identifier,
+            extra_paths=local_paths,
+            env_var_paths=env_var_paths,
+        )
+
+        if hf_hub_download_kwargs and hf_hub_download:
+            download_kwargs = dict(hf_hub_download_kwargs)
+            download_kwargs.setdefault("local_files_only", local_files_only)
+            if "repo_id" in download_kwargs and "filename" in download_kwargs:
+                try:
+                    hf_hub_download(**download_kwargs)
+                except Exception as exc:  # pragma: no cover - depends on hub
+                    if _is_connectivity_error(exc):
+                        logging.warning(
+                            "hf_hub_download could not reach the Hub (%s)."
+                            " Falling back to local files.",
+                            exc,
+                        )
+                    else:
+                        raise
+            else:
+                logging.warning(
+                    "hf_hub_download_kwargs require 'repo_id' and 'filename'. Skipping."
+                )
+
+        for path in candidates:
+            try:
+                model = TextSeq2SeqDecoder._from_local_path(
+                    path,
+                    auto_model_cls=auto_model_cls,
+                    local_files_only=True,
+                )
+                TextSeq2SeqDecoder._validate_hidden_size(model.config, d_model)
+                return model
+            except Exception:  # pragma: no cover - defensive guard
+                continue
+
+        try:
+            model = auto_model_cls.from_pretrained(
+                identifier,
+                local_files_only=local_files_only,
+            )
+            TextSeq2SeqDecoder._validate_hidden_size(model.config, d_model)
+            return model
+        except Exception as exc:
+            if not _is_connectivity_error(exc):
+                raise
+
+            for path in candidates:
+                try:
+                    model = TextSeq2SeqDecoder._from_local_path(
+                        path,
+                        auto_model_cls=auto_model_cls,
+                        local_files_only=True,
+                    )
+                    TextSeq2SeqDecoder._validate_hidden_size(model.config, d_model)
+                    return model
+                except Exception:  # pragma: no cover - defensive guard
+                    continue
+            message = (
+                "Decoder weights could not be downloaded due to connectivity issues. "
+                "Provide a local checkpoint with --decoder-model or "
+                "set SLT_DECODER_PATH."
+            )
+            raise OSError(message) from exc
+
+        raise RuntimeError("Unable to load decoder model.")  # pragma: no cover
+
+    @staticmethod
+    def _collect_candidate_paths(
+        identifier: str,
+        *,
+        extra_paths: Optional[Sequence[str]],
+        env_var_paths: Optional[Sequence[str]],
+    ) -> List[str]:
+        candidates: List[str] = []
+        potential = Path(identifier)
+        if _path_exists(potential):
+            candidates.append(str(potential))
+
+        if extra_paths:
+            for path in extra_paths:
+                if path:
+                    candidates.append(path)
+
+        env_sources = env_var_paths or ("SLT_DECODER_PATH", "SLT_DECODER_DIR")
+        for var in env_sources:
+            if not var:
+                continue
+            value = os.environ.get(var)
+            if not value:
+                continue
+            segments = [segment for segment in value.split(os.pathsep) if segment]
+            candidates.extend(segments or [value])
+
+        seen: set[str] = set()
+        resolved: List[str] = []
+        for raw in candidates:
+            expanded = str(Path(raw).expanduser())
+            if expanded in seen:
+                continue
+            seen.add(expanded)
+            if _path_exists(Path(expanded)):
+                resolved.append(expanded)
+        return resolved
+
+    @staticmethod
+    def _from_local_path(
+        path: str,
+        *,
+        auto_model_cls: Type[AutoModelForSeq2SeqLM],
+        local_files_only: bool,
+    ) -> nn.Module:
+        resolved = Path(path)
+        if resolved.is_file():
+            state_dict = torch.load(resolved, map_location="cpu")
+            if not isinstance(state_dict, dict):
+                raise TypeError(
+                    f"Local decoder weights at {path} do not contain a state_dict."
+                )
+            parent = resolved.parent
+            return auto_model_cls.from_pretrained(
+                str(parent),
+                local_files_only=local_files_only,
+                state_dict=state_dict,
+            )
+        return auto_model_cls.from_pretrained(
+            str(resolved),
+            local_files_only=local_files_only,
+        )
 
     @staticmethod
     def _build_default_config_kwargs(

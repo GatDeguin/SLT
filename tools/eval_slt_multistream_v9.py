@@ -310,6 +310,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Identificador o ruta de un tokenizer de HuggingFace",
     )
     parser.add_argument(
+        "--tokenizer-local-files-only",
+        action="store_true",
+        help="Evita solicitudes de red al cargar el tokenizer.",
+    )
+    parser.add_argument(
+        "--tokenizer-search-path",
+        dest="tokenizer_search_paths",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Directorios adicionales que se revisan antes de descargar el tokenizer.",
+    )
+    parser.add_argument(
+        "--tokenizer-path-env",
+        dest="tokenizer_path_env_vars",
+        action="append",
+        default=None,
+        metavar="ENV",
+        help="Variables de entorno con rutas de tokenizers (separadas por os.pathsep).",
+    )
+    parser.add_argument(
         "--max-target-length",
         type=int,
         default=128,
@@ -408,6 +429,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                 )
             except ValueError as exc:
                 parser.error(f"--keypoint-resample-range: {exc}")
+    if args.tokenizer_search_paths is not None:
+        args.tokenizer_search_paths = [
+            str(Path(path).expanduser()) for path in args.tokenizer_search_paths
+        ]
+    if args.tokenizer_path_env_vars is not None:
+        cleaned = [str(var).strip() for var in args.tokenizer_path_env_vars if var]
+        args.tokenizer_path_env_vars = cleaned or None
     explicit_bool_flags = set()
     for name in (
         "use_mska",
@@ -415,6 +443,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "keypoint_normalize_center",
         "mska_use_sgr",
         "mska_sgr_shared",
+        "tokenizer_local_files_only",
     ):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
@@ -1010,7 +1039,12 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     _validate_inputs(args)
     device = _select_device(args.device)
 
-    tokenizer = create_tokenizer(args.tokenizer)
+    tokenizer = create_tokenizer(
+        args.tokenizer,
+        local_files_only=args.tokenizer_local_files_only,
+        local_paths=args.tokenizer_search_paths,
+        env_var_paths=args.tokenizer_path_env_vars,
+    )
     if hasattr(tokenizer, "encode"):
         try:
             validate_tokenizer(tokenizer, allow_empty_decode=True)

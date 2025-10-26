@@ -33,6 +33,12 @@ class ModelConfig:
     decoder_config: Optional[str] = None
     decoder_class: Optional[str] = None
     decoder_kwargs: Dict[str, Any] = field(default_factory=dict)
+    decoder_local_files_only: bool = False
+    decoder_search_paths: list[str] = field(default_factory=list)
+    decoder_path_env_vars: list[str] = field(default_factory=list)
+    decoder_hf_repo: Optional[str] = None
+    decoder_hf_filename: Optional[str] = None
+    decoder_hf_revision: Optional[str] = None
     decoder_prompt_length: int = 0
     decoder_prompt_init: str = "normal"
     decoder_prompt_std: float = 0.02
@@ -130,6 +136,9 @@ class DataConfig:
     tensorboard: Optional[Path] = None
     pin_memory: bool = True
     tokenizer: Optional[str] = None
+    tokenizer_local_files_only: bool = False
+    tokenizer_search_paths: list[str] = field(default_factory=list)
+    tokenizer_path_env_vars: list[str] = field(default_factory=list)
     max_target_length: int = 128
     mix_streams: Dict[str, float] = field(default_factory=dict)
     keypoint_normalize_center: bool = True

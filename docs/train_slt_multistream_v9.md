@@ -216,6 +216,13 @@ tras cargar el preset; la combinación con `--decoder-model t5` rehace también 
 `decoder_heads`, `decoder_dropout`, `decoder_kwargs` y el tokenizer sin perder el resto de valores
 MSKA.
 
+Para evitar dependencias de red añade `--tokenizer-search-path` y `--decoder-search-path` con las
+rutas cacheadas, junto a `--tokenizer-local-files-only --decoder-local-files-only`. Si necesitas
+prefetchear artefactos antes de quedar offline puedes incluir `--decoder-hf-repo` y
+`--decoder-hf-filename pytorch_model.bin`; el helper almacenará los pesos usando
+`hf_hub_download`. La guía `docs/offline_cache.md` resume el flujo completo con ejemplos de
+`huggingface-cli download`.
+
 ## Prompt tuning del decoder T5
 
 Cuando el decoder es un T5 (`model_type=t5` o presets basados en T5) puedes inyectar
