@@ -1,8 +1,9 @@
 # Checklist operativo para liberaciones
 
 Esta guía resume los pasos necesarios para validar el pipeline multi-stream
-antes de publicar un release. Úsala como complemento del README y las guías
-técnicas; cada ítem enlaza con la documentación correspondiente.
+antes de publicar un release. Úsala como complemento del README, la visión de
+arquitectura (`docs/architecture_overview.md`) y las guías técnicas; cada ítem
+enlaza con la documentación correspondiente.
 
 ## Reproducir errores y validar fixes
 
