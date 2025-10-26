@@ -603,6 +603,16 @@ def parse_args() -> argparse.Namespace:
         help="Freeze the right hand backbone",
     )
     parser.add_argument(
+        "--mska-face-state",
+        type=Path,
+        help="Checkpoint con el state_dict preentrenado para el stream de rostro en MSKA",
+    )
+    parser.add_argument(
+        "--mska-hand-state",
+        type=Path,
+        help="Checkpoint con el state_dict preentrenado para las manos en MSKA",
+    )
+    parser.add_argument(
         "--pretrained",
         type=str,
         help="Pretrained encoder/decoder weights to load (single_signer or none)",

@@ -53,6 +53,8 @@ class ModelConfig:
     freeze_hand_right_backbone: bool = False
     pretrained: Optional[str] = "single_signer"
     pretrained_checkpoint: Optional[Path] = None
+    mska_face_state: Optional[Path] = None
+    mska_hand_state: Optional[Path] = None
     use_mska: bool = False
     mska_heads: int = 4
     mska_ff_multiplier: int = 4

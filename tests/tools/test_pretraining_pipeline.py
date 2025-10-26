@@ -25,6 +25,7 @@ def test_dino_pretraining_and_multistream_integration(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     output_dir = tmp_path / "out"
     export_path = tmp_path / "export.pt"
+    encoder_export = tmp_path / "encoder_state.pt"
     _create_dummy_dataset(data_dir, num_images=4, size=64)
 
     argv = [
@@ -58,6 +59,9 @@ def test_dino_pretraining_and_multistream_integration(tmp_path: Path) -> None:
         "1",
         "--export-backbone",
         str(export_path),
+        "--export-checkpoint",
+        "--output-path",
+        str(encoder_export),
     ]
     class DummyBackbone(torch.nn.Module):
         def __init__(self, embed_dim: int) -> None:
@@ -91,6 +95,13 @@ def test_dino_pretraining_and_multistream_integration(tmp_path: Path) -> None:
     patches.undo()
 
     assert export_path.exists()
+    assert encoder_export.exists()
+
+    payload = torch.load(encoder_export, map_location="cpu")
+    assert isinstance(payload, dict)
+    assert payload.get("stream") == "face"
+    assert "state_dict" in payload
+    assert isinstance(payload["state_dict"], dict)
 
     spec = f"file::{export_path}:dinov2_vits14"
     reload_patch = pytest.MonkeyPatch()
