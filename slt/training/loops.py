@@ -36,6 +36,7 @@ class LoopResult:
 
     loss: float
     metrics: Dict[str, float]
+    steps: int = 0
 
 
 def _move_to_device(data: Any, device: Union[str, torch.device]) -> Any:
@@ -315,6 +316,7 @@ def train_epoch(
     grad_clip_norm: GradClipValue = None,
     grad_clip_norm_type: Union[float, int] = 2.0,
     grad_accum_steps: GradAccumulation = 1,
+    max_steps: Optional[int] = None,
     metrics: Optional[Dict[str, MetricFn]] = None,
     forward_fn: Optional[Callable[..., torch.Tensor]] = None,
     amp_failure_handler: Optional[AmpFailureHandler] = None,
@@ -325,6 +327,10 @@ def train_epoch(
     total_loss = 0.0
     total_items = 0
     metric_sums: Dict[str, float] = {}
+    steps_processed = 0
+
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be a positive integer when provided")
 
     if isinstance(grad_accum_steps, int):
         if grad_accum_steps <= 0:
@@ -431,7 +437,13 @@ def train_epoch(
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+    stop_requested = False
+
     for step_index, batch in enumerate(loader, start=1):
+        if stop_requested:
+            break
+        if max_steps is not None and steps_processed >= max_steps:
+            break
         inputs, targets = _split_batch(batch)
         inputs = _move_to_device(inputs, device)
         targets = _move_to_device(targets, device)
@@ -477,6 +489,7 @@ def train_epoch(
 
         pending_backward = pending_after
         last_raw_loss = raw_loss
+        steps_processed += 1
 
         if not should_step:
             should_step = pending_backward >= current_target
@@ -490,6 +503,9 @@ def train_epoch(
         _accumulate_named_values(metric_sums, loss_components, batch_items)
         _update_metric_sums(metric_sums, outputs, targets, metrics, batch_items)
 
+        if max_steps is not None and steps_processed >= max_steps:
+            stop_requested = True
+
     if pending_backward > 0 and last_raw_loss is not None:
         _perform_step(last_raw_loss)
 
@@ -498,7 +514,7 @@ def train_epoch(
 
     averaged_metrics = {name: value / total_items for name, value in metric_sums.items()}
 
-    return LoopResult(total_loss / total_items, averaged_metrics)
+    return LoopResult(total_loss / total_items, averaged_metrics, steps=steps_processed)
 
 
 def eval_epoch(
@@ -516,6 +532,7 @@ def eval_epoch(
     total_loss = 0.0
     total_items = 0
     metric_sums: Dict[str, float] = {}
+    steps_processed = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -537,6 +554,7 @@ def eval_epoch(
             batch_items = _count_items(targets)
             total_loss += loss.detach().item() * batch_items
             total_items += batch_items
+            steps_processed += 1
             _accumulate_named_values(metric_sums, loss_components, batch_items)
             _update_metric_sums(metric_sums, outputs, targets, metrics, batch_items)
 
@@ -545,7 +563,7 @@ def eval_epoch(
 
     averaged_metrics = {name: value / total_items for name, value in metric_sums.items()}
 
-    return LoopResult(total_loss / total_items, averaged_metrics)
+    return LoopResult(total_loss / total_items, averaged_metrics, steps=steps_processed)
 
 
 def _sequence_cross_entropy(
