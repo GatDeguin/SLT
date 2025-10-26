@@ -10,7 +10,7 @@ import torch.nn.functional as F
 torch = pytest.importorskip("torch")
 
 from slt.models.mska import FusedCTCHead, StreamCTCHead
-from slt.training.loops import multistream_loss
+from slt.training.loops import ctc_beam_search, multistream_loss
 
 
 def test_multistream_loss_translation_only() -> None:
@@ -99,6 +99,7 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
         },
     )
 
+    beam_width = 3
     loss, components = multistream_loss(
         outputs,
         {
@@ -111,6 +112,7 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
         ctc_weight=0.25,
         distillation_weight=0.5,
         distillation_temperature=2.0,
+        ctc_decode_beams=beam_width,
     )
 
     assert "loss_ctc" in components
@@ -164,14 +166,7 @@ def test_multistream_loss_with_ctc_and_distillation() -> None:
         components["ctc_ensemble_logits"], combined_logits.detach(), atol=1e-6
     )
     assert "ctc_ensemble_sequence" in components
-    expected_path = combined_probs.argmax(dim=-1)[0, : ctc_mask.sum().item()].tolist()
-    collapsed: list[int] = []
-    previous = None
-    for token in expected_path:
-        if token == 0:
-            previous = None
-            continue
-        if token != previous:
-            collapsed.append(token)
-        previous = token
-    assert components["ctc_ensemble_sequence"] == [collapsed]
+    expected_sequence = ctc_beam_search(
+        combined_logits, fused_mask, beam_width=beam_width
+    )
+    assert components["ctc_ensemble_sequence"] == expected_sequence

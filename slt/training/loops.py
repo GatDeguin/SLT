@@ -1,6 +1,7 @@
 """Training and evaluation loops for SLT models."""
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
@@ -625,13 +626,125 @@ def _ctc_loss_from_logits(
     )
 
 
+def _log_sum_exp(values: Iterable[float]) -> float:
+    filtered = [value for value in values if value != -math.inf]
+    if not filtered:
+        return -math.inf
+    maximum = max(filtered)
+    if maximum == -math.inf:
+        return -math.inf
+    total = math.fsum(math.exp(value - maximum) for value in filtered)
+    return maximum + math.log(total)
+
+
+def _update_beam_entry(
+    store: dict[tuple[int, ...], tuple[float, float]],
+    key: tuple[int, ...],
+    *,
+    blank_log_prob: float | None = None,
+    non_blank_log_prob: float | None = None,
+) -> None:
+    previous_blank, previous_non_blank = store.get(key, (-math.inf, -math.inf))
+    if blank_log_prob is not None:
+        previous_blank = _log_sum_exp((previous_blank, blank_log_prob))
+    if non_blank_log_prob is not None:
+        previous_non_blank = _log_sum_exp((previous_non_blank, non_blank_log_prob))
+    store[key] = (previous_blank, previous_non_blank)
+
+
+def _prune_beam(
+    beam: dict[tuple[int, ...], tuple[float, float]], width: int
+) -> dict[tuple[int, ...], tuple[float, float]]:
+    if len(beam) <= width:
+        return beam
+    ranked = sorted(
+        beam.items(),
+        key=lambda item: _log_sum_exp(item[1]),
+        reverse=True,
+    )
+    return dict(ranked[:width])
+
+
+def ctc_beam_search(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    beam_width: int = 5,
+    blank: int = 0,
+) -> list[list[int]]:
+    """Decode CTC logits using a configurable beam search."""
+
+    if beam_width <= 0:
+        raise ValueError("beam_width must be a positive integer")
+    if beam_width == 1:
+        return _ctc_greedy_decode(logits, mask, blank=blank)
+
+    log_probs = logits.detach().log_softmax(dim=-1).cpu()
+    batch, time, vocab = log_probs.shape
+    mask_cpu: Optional[torch.Tensor] = None
+    if mask is not None and mask.numel() != 0:
+        mask_cpu = mask.to(device=log_probs.device, dtype=torch.bool).cpu()
+
+    results: list[list[int]] = []
+    for batch_index in range(batch):
+        length = (
+            int(mask_cpu[batch_index].sum().item())
+            if mask_cpu is not None
+            else time
+        )
+        if length <= 0:
+            results.append([])
+            continue
+        beam: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, -math.inf)}
+        for step_index in range(length):
+            step_log_probs = log_probs[batch_index, step_index]
+            next_beam: dict[tuple[int, ...], tuple[float, float]] = {}
+            blank_log_prob = float(step_log_probs[blank].item())
+            for prefix, (blank_score, non_blank_score) in beam.items():
+                blank_update = _log_sum_exp(
+                    (blank_score + blank_log_prob, non_blank_score + blank_log_prob)
+                )
+                _update_beam_entry(
+                    next_beam,
+                    prefix,
+                    blank_log_prob=blank_update,
+                )
+                total_prefix_score = _log_sum_exp((blank_score, non_blank_score))
+                for symbol in range(vocab):
+                    if symbol == blank:
+                        continue
+                    symbol_log_prob = float(step_log_probs[symbol].item())
+                    if prefix and prefix[-1] == symbol:
+                        non_blank_update = blank_score + symbol_log_prob
+                        _update_beam_entry(
+                            next_beam,
+                            prefix,
+                            non_blank_log_prob=non_blank_update,
+                        )
+                    else:
+                        extension = prefix + (symbol,)
+                        non_blank_update = total_prefix_score + symbol_log_prob
+                        _update_beam_entry(
+                            next_beam,
+                            extension,
+                            non_blank_log_prob=non_blank_update,
+                        )
+            beam = _prune_beam(next_beam, beam_width)
+        ordered = sorted(
+            beam.items(), key=lambda item: _log_sum_exp(item[1]), reverse=True
+        )
+        best_sequence = list(ordered[0][0]) if ordered else []
+        results.append(best_sequence)
+    return results
+
+
 def _ctc_greedy_decode(
     logits: torch.Tensor, mask: Optional[torch.Tensor], blank: int = 0
 ) -> list[list[int]]:
     predictions = logits.detach().softmax(dim=-1).argmax(dim=-1)
     predictions_cpu = predictions.cpu()
     mask_cpu = None
-    if mask is not None:
+    if mask is not None and mask.numel() != 0:
         mask_cpu = mask.to(device=predictions.device, dtype=torch.bool).cpu()
     batch, time = predictions_cpu.shape
     sequences: list[list[int]] = []
@@ -688,6 +801,7 @@ def multistream_loss(
     distillation_weight: float = 0.0,
     distillation_temperature: float = 1.0,
     translation_key: str = "translation",
+    ctc_decode_beams: int = 5,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     labels = targets.get(translation_key)
     if labels is None:
@@ -774,8 +888,9 @@ def multistream_loss(
         if combined_logits is not None:
             components["ctc_ensemble_logits"] = combined_logits.detach()
             combined_mask = combined_entry.get("mask")
-            components["ctc_ensemble_sequence"] = _ctc_greedy_decode(
-                combined_logits, combined_mask
+            beam_width = max(1, int(ctc_decode_beams))
+            components["ctc_ensemble_sequence"] = ctc_beam_search(
+                combined_logits, combined_mask, beam_width=beam_width
             )
 
     return total_loss, components

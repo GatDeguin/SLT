@@ -279,6 +279,12 @@ python tools/train_slt_multistream_v9.py \
 Los mismos flags están disponibles en `tools/eval_slt_multistream_v9.py` para
 replicar el preprocesamiento al evaluar checkpoints.
 
+Cuando utilices MSKA en evaluación, `tools/eval_slt_multistream_v9.py` expone
+`--ctc-num-beams` para ajustar el beam search CTC (default: 5) y
+`--report-gloss-wer` para calcular CER/WER de glosas. Los reportes generados
+añaden `gloss_cer` y `gloss_wer`, y las predicciones en CSV incluyen las nuevas
+columnas `gloss_prediction` y `gloss_reference`.
+
 ### Modelo
 
 | Bandera | Descripción |

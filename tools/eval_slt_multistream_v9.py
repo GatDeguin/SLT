@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from slt.data import LsaTMultiStream, collate_fn
 from slt.models import MultiStreamEncoder
 from slt.training.configuration import ModelConfig
+from slt.training.loops import ctc_beam_search
 from slt.training.models import MultiStreamClassifier as _TrainingMultiStreamClassifier
 from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.text import (
@@ -62,6 +63,8 @@ class PredictionItem:
     prediction: str
     reference: str
     latency_ms: Optional[float] = None
+    gloss_prediction: Optional[str] = None
+    gloss_reference: Optional[str] = None
 
 
 @dataclass
@@ -330,6 +333,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--num-beams", type=int, default=1, help="Cantidad de beams para la decodificación")
     parser.add_argument(
+        "--ctc-num-beams",
+        type=int,
+        default=5,
+        help="Cantidad de beams para decodificar glosas con CTC",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=None,
@@ -344,6 +353,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Omite el cálculo de métricas de calidad de texto",
     )
     parser.set_defaults(compute_metrics=True)
+    parser.add_argument(
+        "--report-gloss-wer",
+        action="store_true",
+        help="Calcula CER/WER de glosas cuando MSKA está activo",
+    )
 
     args = parser.parse_args(argv)
     if getattr(args, "keypoint_scale_range", None) is not None:
@@ -404,6 +418,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ):
         if getattr(args, name, None) is not None:
             explicit_bool_flags.add(name)
+    if args.ctc_num_beams <= 0:
+        parser.error("--ctc-num-beams debe ser un entero positivo")
     args._explicit_bool_flags = explicit_bool_flags
     return args
 
@@ -569,6 +585,99 @@ def _prepare_inputs(batch: dict, device: torch.device) -> dict:
     return inputs
 
 
+def _extract_mska_auxiliary(
+    model: MultiStreamClassifier,
+) -> Optional[Dict[str, Any]]:
+    encoder = getattr(model, "encoder", None)
+    mska_encoder = getattr(encoder, "mska_encoder", None)
+    if mska_encoder is None:
+        return None
+    mska_output = getattr(encoder, "last_mska_output", None)
+    if mska_output is None:
+        return None
+    try:
+        return mska_encoder.auxiliary_logits(mska_output)
+    except RuntimeError:
+        logging.debug("No se pudo recuperar logits auxiliares de MSKA", exc_info=True)
+        return None
+
+
+def _update_gloss_vocabulary(
+    vocab: Dict[int, str],
+    labels: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+    sequences: Sequence[Sequence[str]],
+) -> None:
+    if labels is None or labels.numel() == 0:
+        return
+    if not sequences:
+        return
+    label_rows = labels.cpu()
+    mask_rows = None
+    if mask is not None and mask.numel() != 0:
+        mask_rows = mask.to(dtype=torch.bool).cpu()
+    batch_size = min(len(sequences), label_rows.shape[0])
+    for index in range(batch_size):
+        tokens = [token for token in sequences[index] if token]
+        if not tokens:
+            continue
+        label_row = label_rows[index]
+        if mask_rows is not None:
+            valid_ids = label_row[mask_rows[index]].tolist()
+        else:
+            valid_ids = [int(value) for value in label_row.tolist() if value >= 0]
+        if len(valid_ids) != len(tokens):
+            logging.debug(
+                "Secuencia CTC inconsistente: %s ids para %s tokens",
+                len(valid_ids),
+                len(tokens),
+            )
+            continue
+        for label_id, token in zip(valid_ids, tokens):
+            if int(label_id) == 0:
+                continue
+            existing = vocab.get(int(label_id))
+            if existing is None:
+                vocab[int(label_id)] = token
+            elif existing != token:
+                logging.debug(
+                    "Inconsistencia en vocabulario CTC: id %s -> '%s' (existente '%s')",
+                    int(label_id),
+                    token,
+                    existing,
+                )
+
+
+def _decode_gloss_predictions(
+    auxiliary: Optional[Mapping[str, Any]],
+    *,
+    beam_width: int,
+    vocab: Mapping[int, str],
+) -> List[Optional[str]]:
+    if not auxiliary:
+        return []
+    combined = auxiliary.get("combined")
+    if combined is None:
+        return []
+    logits = combined.get("logits")
+    if logits is None:
+        return []
+    mask = combined.get("mask")
+    sequences = ctc_beam_search(logits, mask, beam_width=max(1, beam_width))
+    decoded: List[Optional[str]] = []
+    for sequence in sequences:
+        tokens: List[str] = []
+        for label_id in sequence:
+            if int(label_id) == 0:
+                continue
+            token = vocab.get(int(label_id))
+            if token is None:
+                token = f"[UNK_{int(label_id)}]"
+            tokens.append(token)
+        decoded.append(" ".join(tokens).strip() or None)
+    return decoded
+
+
 def _clean_token_sequences(
     sequences: Iterable[Sequence[int]],
     *,
@@ -597,10 +706,13 @@ def _predict(
     max_length: int,
     num_beams: int,
     max_new_tokens: Optional[int],
+    ctc_beam_width: int,
+    decode_gloss: bool,
 ) -> Tuple[List[PredictionItem], List[float]]:
     results: List[PredictionItem] = []
     latencies: List[float] = []
     model.eval()
+    gloss_vocab: Dict[int, str] = {}
     with torch.inference_mode():
         for batch in loader:
             inputs = _prepare_inputs(batch, device)
@@ -626,16 +738,51 @@ def _predict(
                 sequences_tensor = sequences
             decoded = decode(tokenizer, sequences_tensor)
             references = batch.get("texts") or [""] * len(decoded)
+            gloss_sequences = batch.get("gloss_sequences", [])
+            gloss_texts = batch.get("gloss_texts", [])
+            if decode_gloss:
+                _update_gloss_vocabulary(
+                    gloss_vocab,
+                    batch.get("ctc_labels"),
+                    batch.get("ctc_mask"),
+                    gloss_sequences,
+                )
+                auxiliary = _extract_mska_auxiliary(model)
+                predicted_gloss = _decode_gloss_predictions(
+                    auxiliary,
+                    beam_width=ctc_beam_width,
+                    vocab=gloss_vocab,
+                )
+            else:
+                predicted_gloss = []
             batch_size = len(decoded) if decoded else 1
             sample_latency = elapsed_ms / max(batch_size, 1)
             latencies.extend([sample_latency] * len(decoded))
-            for video_id, text, ref in zip(batch["video_ids"], decoded, references):
+            gloss_predictions: List[Optional[str]] = [None] * len(decoded)
+            for idx, text in enumerate(predicted_gloss):
+                if idx < len(gloss_predictions):
+                    gloss_predictions[idx] = text
+            for index, (video_id, text, ref) in enumerate(
+                zip(batch["video_ids"], decoded, references)
+            ):
+                gloss_ref: Optional[str] = None
+                if index < len(gloss_texts):
+                    candidate = gloss_texts[index]
+                    if isinstance(candidate, str):
+                        gloss_ref = candidate.strip() or None
+                gloss_pred = None
+                if index < len(gloss_predictions):
+                    candidate_pred = gloss_predictions[index]
+                    if isinstance(candidate_pred, str):
+                        gloss_pred = candidate_pred.strip() or None
                 results.append(
                     PredictionItem(
                         video_id=video_id,
                         prediction=text,
                         reference=ref,
                         latency_ms=sample_latency,
+                        gloss_prediction=gloss_pred,
+                        gloss_reference=gloss_ref,
                     )
                 )
     return results, latencies
@@ -645,10 +792,28 @@ def _write_csv(path: Path, rows: Iterable[PredictionItem]) -> None:
     temp_file = None
     with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)) as tmp:
         writer = csv.writer(tmp)
-        writer.writerow(["video_id", "prediction", "reference", "latency_ms"])
+        writer.writerow(
+            [
+                "video_id",
+                "prediction",
+                "reference",
+                "latency_ms",
+                "gloss_prediction",
+                "gloss_reference",
+            ]
+        )
         for row in rows:
             latency = "" if row.latency_ms is None else f"{row.latency_ms:.6f}"
-            writer.writerow([row.video_id, row.prediction, row.reference, latency])
+            writer.writerow(
+                [
+                    row.video_id,
+                    row.prediction,
+                    row.reference,
+                    latency,
+                    row.gloss_prediction or "",
+                    row.gloss_reference or "",
+                ]
+            )
         temp_file = Path(tmp.name)
     if temp_file is None:
         raise RuntimeError("No se pudo escribir el archivo temporal de predicciones")
@@ -776,6 +941,8 @@ def _write_reports(
                         "prediction": item.prediction,
                         "reference": item.reference,
                         "latency_ms": item.latency_ms,
+                        "gloss_prediction": item.gloss_prediction,
+                        "gloss_reference": item.gloss_reference,
                     }
                     for item in result.examples
                 ],
@@ -785,7 +952,12 @@ def _write_reports(
     }
 
     json_tmp: Optional[Path] = None
-    with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(output_dir)) as tmp:
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        delete=False,
+        dir=str(output_dir),
+    ) as tmp:
         json.dump(report, tmp, ensure_ascii=False, indent=2)
         json_tmp = Path(tmp.name)
     if json_tmp is None:
@@ -793,7 +965,13 @@ def _write_reports(
     json_tmp.replace(output_dir / "report.json")
 
     csv_tmp: Optional[Path] = None
-    with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(output_dir)) as tmp:
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=str(output_dir),
+    ) as tmp:
         writer = csv.writer(tmp)
         writer.writerow(["type", "checkpoint", "name", "value", "reference"])
         for metric_name, stats in aggregate.items():
@@ -810,6 +988,16 @@ def _write_reports(
                     item.prediction,
                     item.reference,
                 ])
+                if item.gloss_prediction or item.gloss_reference:
+                    writer.writerow(
+                        [
+                            "example_gloss",
+                            result.checkpoint.name,
+                            item.video_id,
+                            item.gloss_prediction or "",
+                            item.gloss_reference or "",
+                        ]
+                    )
         csv_tmp = Path(tmp.name)
     if csv_tmp is None:
         raise RuntimeError("No se pudo escribir el archivo CSV de métricas")
@@ -837,6 +1025,12 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
         logging.info("Evaluando checkpoint %s", checkpoint_path)
         model = _build_model(args, tokenizer).to(device)
         _load_checkpoint(model, checkpoint_path, device)
+        mska_available = getattr(model.encoder, "mska_encoder", None) is not None
+        if args.report_gloss_wer and not mska_available:
+            logging.warning(
+                "MSKA está deshabilitado en el checkpoint %s, se omiten métricas de glosa",
+                checkpoint_path.name,
+            )
         predictions, latencies = _predict(
             model,
             loader,
@@ -845,6 +1039,8 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
             max_length=args.max_target_length,
             num_beams=args.num_beams,
             max_new_tokens=args.max_new_tokens,
+            ctc_beam_width=args.ctc_num_beams,
+            decode_gloss=mska_available,
         )
 
         output_csv = _resolve_output_path(args.output_csv, checkpoint_path, multiple_checkpoints)
@@ -863,6 +1059,22 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
             })
         else:
             bleu = chrf = cer = wer = float("nan")
+        gloss_scores: Optional[Tuple[float, float]] = None
+        if args.compute_metrics and args.report_gloss_wer and mska_available:
+            gloss_pairs = [
+                (item.gloss_reference, item.gloss_prediction)
+                for item in predictions
+                if item.gloss_reference and item.gloss_prediction
+            ]
+            if gloss_pairs:
+                gloss_refs, gloss_preds = zip(*gloss_pairs)
+                gloss_cer = float(character_error_rate(gloss_refs, gloss_preds))
+                gloss_wer = float(word_error_rate(gloss_refs, gloss_preds))
+            else:
+                gloss_cer = gloss_wer = 0.0
+            metrics["gloss_cer"] = gloss_cer
+            metrics["gloss_wer"] = gloss_wer
+            gloss_scores = (gloss_cer, gloss_wer)
         examples = _select_examples(predictions)
         evaluation_results.append(
             EvaluationResult(
@@ -873,15 +1085,34 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
             )
         )
         if args.compute_metrics:
-            logging.info(
-                "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, Latencia media: %.2f ms",
-                checkpoint_path.name,
-                bleu,
-                chrf,
-                cer,
-                wer,
-                metrics["avg_latency_ms"],
-            )
+            if gloss_scores is not None:
+                logging.info(
+                    (
+                        "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, "
+                        "Gloss CER: %.2f, Gloss WER: %.2f, Latencia media: %.2f ms"
+                    ),
+                    checkpoint_path.name,
+                    bleu,
+                    chrf,
+                    cer,
+                    wer,
+                    gloss_scores[0],
+                    gloss_scores[1],
+                    metrics["avg_latency_ms"],
+                )
+            else:
+                logging.info(
+                    (
+                        "Métricas %s - BLEU: %.2f, ChrF: %.2f, CER: %.2f, WER: %.2f, "
+                        "Latencia media: %.2f ms"
+                    ),
+                    checkpoint_path.name,
+                    bleu,
+                    chrf,
+                    cer,
+                    wer,
+                    metrics["avg_latency_ms"],
+                )
         else:
             logging.info(
                 "Métricas %s - métricas de texto omitidas, latencia media: %.2f ms",
