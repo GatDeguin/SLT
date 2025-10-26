@@ -147,6 +147,37 @@ Pasos recomendados:
 El preset está inspirado en el paper SignMusketeers, que reporta ~14 BLEU en How2Sign con
 esta arquitectura multi-stream. 【F:docs/signmusketeers-paper-summary.md†L9-L33】
 
+## Traducción offline con mBART (`--decoder-preset mska_paper_mbart`)
+
+La configuración `mska_paper_mbart` replica los 8 bloques atencionales con 6 cabezas descritos en el
+paper MSKA-SLT y selecciona el decoder `facebook/mbart-large-cc25` para ejecutar inferencia sin
+dependencia de servicios externos. 【F:configs/presets/mska_paper_mbart.yaml†L1-L47】
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --decoder-preset mska_paper_mbart \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --pose-dir data/single_signer/processed/pose \
+  --keypoints-dir data/single_signer/processed/keypoints \
+  --gloss-csv data/single_signer/gloss.csv \
+  --metadata-csv meta.csv \
+  --train-index data/single_signer/index/train.csv \
+  --val-index data/single_signer/index/val.csv \
+  --work-dir work_dirs/mska_mbart_offline \
+  --batch-size 4 --sequence-length 128
+```
+
+El preset fija `lr=1e-5`, `weight_decay=1e-3`, `epochs=40` y preserva los pesos MSKA
+(`mska_ctc_weight` e `mska_distillation_weight`) en 1.0 conforme al paper original.
+【F:configs/presets/mska_paper_mbart.yaml†L24-L47】【F:docs/mska-paper-config.md†L1-L17】
+Los flags `--mska-heads`, `--mska-stream-heads` y `--mska-temporal-blocks` pueden ajustar la
+configuración sin editar el YAML; el parser reescribe el campo correspondiente de `ModelConfig` tras
+cargar el preset. Si necesitas intercambiar el decoder sin abandonar los valores MSKA, usa
+`--decoder-model mbart` (o `mbart-large`) para normalizar automáticamente la ruta a
+`facebook/mbart-large-cc25`.
+
 ## Prompt tuning del decoder T5
 
 Cuando el decoder es un T5 (`model_type=t5` o presets basados en T5) puedes inyectar

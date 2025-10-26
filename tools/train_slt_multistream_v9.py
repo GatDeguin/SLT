@@ -55,7 +55,22 @@ _DECODER_PRESETS: dict[str, dict[str, Any]] = {
             "Preset inspirado en SignMusketeers que concatena rostro, manos y pose hacia"
             " un decoder T5 v1.1 Base."
         ),
-    }
+    },
+    "mska_paper_mbart": {
+        "path": _DECODER_PRESET_DIR / "mska_paper_mbart.yaml",
+        "aliases": {"mska-paper-mbart", "mska_slt_mbart", "mska_slt"},
+        "summary": (
+            "Replica los hiperparámetros MSKA-SLT (8 bloques, 6 cabezas) con decoder"
+            " mBART-large CC25 para traducción offline."
+        ),
+    },
+}
+
+_DECODER_MODEL_ALIASES: dict[str, str] = {
+    "mbart": "facebook/mbart-large-cc25",
+    "mbart-large": "facebook/mbart-large-cc25",
+    "mbart-large-cc25": "facebook/mbart-large-cc25",
+    "facebook/mbart-large-cc25": "facebook/mbart-large-cc25",
 }
 
 
@@ -363,6 +378,21 @@ def _compute_validation_text_metrics(
     return {"bleu": float(bleu_score), "chrf": float(chrf_score)}
 
 
+def _decoder_preset_help() -> str:
+    if not _DECODER_PRESETS:
+        return "Nombre del preset de decoder a aplicar."
+    lines = [
+        "Nombre del preset de decoder a aplicar. Disponibles:",
+    ]
+    for name in _decoder_preset_names():
+        summary = _DECODER_PRESETS[name].get("summary")
+        if summary:
+            lines.append(f"  - {name}: {summary}")
+        else:
+            lines.append(f"  - {name}")
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -370,10 +400,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-preset",
         type=str,
-        help=(
-            "Nombre del preset de decoder a aplicar. Disponibles: "
-            + ", ".join(_decoder_preset_names())
-        ),
+        help=_decoder_preset_help(),
     )
     parser.add_argument(
         "--set",
@@ -523,7 +550,14 @@ def parse_args() -> argparse.Namespace:
             " is enabled"
         ),
     )
-    parser.add_argument("--decoder-model", type=str, help="Pretrained decoder model name or path")
+    parser.add_argument(
+        "--decoder-model",
+        type=str,
+        help=(
+            "Pretrained decoder model name or path (alias mbart, mbart-large,"
+            " mbart-large-cc25 → facebook/mbart-large-cc25)"
+        ),
+    )
     parser.add_argument("--decoder-config", type=str, help="Decoder configuration name or path")
     parser.add_argument(
         "--decoder-class",
@@ -808,6 +842,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decoder-model and --decoder-config are mutually exclusive")
     if args.decoder_class and (args.decoder_model or args.decoder_config):
         parser.error("--decoder-class cannot be combined with --decoder-model/--decoder-config")
+    if args.decoder_model:
+        canonical = _DECODER_MODEL_ALIASES.get(args.decoder_model.strip().lower())
+        if canonical:
+            args.decoder_model = canonical
     if args.decoder_kwargs:
         try:
             parsed_kwargs = json.loads(args.decoder_kwargs)

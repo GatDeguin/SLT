@@ -254,8 +254,9 @@ defaults, archivo y banderas.
 #### Preset SignMusketeers (T5 v1.1 Base)
 
 El archivo `configs/presets/decoder_signmusketeers_t5.yaml` habilita un flujo listo para
-fine-tuning con `google/t5-v1_1-base`, ajustando `projector_dim=192` y `d_model=768` para
-concatenar rostro, manos y pose antes del decoder. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L1-L31】
+fine-tuning con `google/t5-v1_1-base`, ajustando `projector_dim=192` y `d_model=768`.
+La representación concatenada de rostro, manos y pose se envía directamente al decoder.
+【F:configs/presets/decoder_signmusketeers_t5.yaml†L1-L31】
 Lánzalo directamente desde la CLI con:
 
 ```bash
@@ -275,6 +276,35 @@ python tools/train_slt_multistream_v9.py \
 El tokenizador se resuelve automáticamente al mismo checkpoint T5 y el preset aplica 30
 épocas, `lr=5e-4` y `weight_decay=0.01`. Ajusta el tamaño de lote si tu GPU dispone de menos
 de 22 GB para evitar *out-of-memory*. 【F:configs/presets/decoder_signmusketeers_t5.yaml†L22-L31】
+
+### Traducción offline con mBART (`--decoder-preset mska_paper_mbart`)
+
+El preset `mska_paper_mbart` replica los 8 bloques atencionales con 6 cabezas descritos en el paper
+MSKA-SLT y habilita un decoder `facebook/mbart-large-cc25` listo para uso sin conexión.
+【F:configs/presets/mska_paper_mbart.yaml†L1-L47】【F:docs/mska-paper-config.md†L1-L17】
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --decoder-preset mska_paper_mbart \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --pose-dir data/single_signer/processed/pose \
+  --keypoints-dir data/single_signer/processed/keypoints \
+  --gloss-csv data/single_signer/gloss.csv \
+  --metadata-csv meta.csv \
+  --train-index data/single_signer/index/train.csv \
+  --val-index data/single_signer/index/val.csv \
+  --work-dir work_dirs/mska_mbart_offline \
+  --batch-size 4 --sequence-length 128
+```
+
+El preset fija `lr=1e-5`, `weight_decay=1e-3` y `epochs=40`, preservando los pesos MSKA de
+distilación (`mska_distillation_weight=1.0`) y CTC (`mska_ctc_weight=1.0`). Las banderas
+`--mska-heads`, `--mska-stream-heads` y `--mska-temporal-blocks` vuelven a ajustar `ModelConfig`
+incluso cuando el preset está activo, por lo que puedes escalar la atención sin editar el YAML.
+El alias `--decoder-model mbart` se normaliza automáticamente a `facebook/mbart-large-cc25` si
+necesitas sobrescribir el modelo del decoder sin abandonar el preset.
 
 Cuando trabajes con decoders T5 puedes activar *prompt tuning* y scheduled sampling
 directamente desde la CLI: `--decoder-prompt-length`, `--decoder-prompt-init`,
