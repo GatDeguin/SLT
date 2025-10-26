@@ -1,7 +1,9 @@
 # Herramientas
 
 Este directorio reúne las CLI que complementan el paquete `slt`. Todas requieren
-Python 3.9+ y las dependencias del proyecto instaladas en modo editable.
+Python 3.9+ y las dependencias del proyecto instaladas en modo editable. Consulta
+`docs/architecture_overview.md` para entender cómo se enlazan con los módulos de
+datos, modelos y runtime.
 
 ## Dependencias opcionales
 

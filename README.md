@@ -9,15 +9,16 @@ experimentos o adaptar el flujo a nuevas variantes.
 ## Tabla de contenidos
 
 1. [Resumen del pipeline](#resumen-del-pipeline)
-2. [Instalación](#instalación)
-3. [Flujo recomendado de extremo a extremo](#flujo-recomendado-de-extremo-a-extremo)
-4. [Preparación de datos](#preparacion-de-datos-datasingle_signer)
-5. [Entrenamiento y evaluación](#entrenamiento-y-evaluación)
-6. [Exportación y demos](#exportación-y-demos-en-tiempo-real)
-7. [Preentrenamiento de backbones](#preentrenamiento-de-backbones)
-8. [Control de calidad y pruebas](#control-de-calidad-y-pruebas)
-9. [Estructura de carpetas](#estructura-de-carpetas)
-10. [Soporte y aportes](#soporte-y-aportes)
+2. [Arquitectura del paquete](#arquitectura-del-paquete)
+3. [Instalación](#instalación)
+4. [Flujo recomendado de extremo a extremo](#flujo-recomendado-de-extremo-a-extremo)
+5. [Preparación de datos](#preparacion-de-datos-datasingle_signer)
+6. [Entrenamiento y evaluación](#entrenamiento-y-evaluación)
+7. [Exportación y demos](#exportación-y-demos-en-tiempo-real)
+8. [Preentrenamiento de backbones](#preentrenamiento-de-backbones)
+9. [Control de calidad y pruebas](#control-de-calidad-y-pruebas)
+10. [Estructura de carpetas](#estructura-de-carpetas)
+11. [Soporte y aportes](#soporte-y-aportes)
 
 ## Resumen del pipeline
 
@@ -42,6 +43,32 @@ experimentos o adaptar el flujo a nuevas variantes.
 Consulta `docs/data_contract.md`, `docs/train_slt_multistream_v9.md`,
 `docs/pretraining.md` y `docs/finetuning.md` para ampliar cada etapa.
 `tools/README.md` describe cada script CLI disponible.
+
+## Arquitectura del paquete
+
+`docs/architecture_overview.md` conecta todos los módulos del repositorio y detalla
+cómo fluyen los datos desde los recortes hasta la inferencia en demos tiempo real.
+Esta sección resume los componentes principales y dónde encontrarlos en el código
+fuente.
+
+- **Dataset multi-stream (`slt/data/lsa_t_multistream.py`)**: normaliza rostro,
+  manos, pose y keypoints, emitiendo tensores y máscaras alineadas con el
+  contrato de datos.
+- **Encoder unificado (`slt/models/multistream.py`)**: proyecta cada stream,
+  concatena las representaciones y combina la dinámica temporal junto con MSKA
+  opcional.
+- **Modelo entrenable (`slt/training/models.py`)**: encapsula el encoder, el
+  decoder seq2seq y las cabezas auxiliares de traducción, CTC y distilación.
+- **Bucles de entrenamiento (`slt/training/loops.py`)**: implementan
+  `train_epoch`/`eval_epoch`, acumulación de gradiente y registro de métricas.
+- **Runtime en vivo (`slt/runtime/realtime.py`)**: gestiona ventanas deslizantes y
+  máscaras para demos con latencia controlada.
+- **Parsers de CLI (`slt/utils/cli.py`)**: convierten rangos y overrides de
+  configuración compartidos por las herramientas.
+
+Los presets de decoder y las configuraciones declarativas (`configs/`) conectan
+estas piezas con los scripts de `tools/`, facilitando reproducir experimentos o
+adaptar el pipeline a otros datasets.
 
 ### Pipeline unificado ROI + keypoints
 
