@@ -311,7 +311,8 @@ class AugmentationConfig:
     global_crop_scale: Tuple[float, float] = (0.4, 1.0)
     local_crop_size: int = 96
     local_crop_scale: Tuple[float, float] = (0.05, 0.4)
-    num_local_crops: int = 4
+    num_global_crops: int = 2
+    num_local_crops: int = 8
     brightness: float = 0.4
     contrast: float = 0.4
     saturation: float = 0.2
@@ -353,7 +354,7 @@ class DINOMultiCropAugmentation:
     def __call__(self, image: Image.Image) -> tuple[list[Tensor], list[Tensor]]:
         globals: list[Tensor] = []
         locals_: list[Tensor] = []
-        for _ in range(2):
+        for _ in range(self.config.num_global_crops):
             globals.append(
                 self._base_transform(
                     image,
@@ -433,19 +434,49 @@ class DINOLoss(nn.Module):
         student_temp: float = 0.1,
         teacher_temp: float = 0.04,
         center_momentum: float = 0.9,
+        use_sinkhorn: bool = False,
+        sinkhorn_eps: float = 0.05,
+        sinkhorn_iters: int = 3,
     ) -> None:
         super().__init__()
         self.student_temp = student_temp
         self.teacher_temp = teacher_temp
         self.center_momentum = center_momentum
+        self.use_sinkhorn = use_sinkhorn
+        self.sinkhorn_eps = sinkhorn_eps
+        self.sinkhorn_iters = sinkhorn_iters
         self.register_buffer("center", torch.zeros(out_dim), persistent=True)
+
+    def _sinkhorn_normalize(self, logits: Tensor) -> Tensor:
+        if logits.dim() != 2:
+            raise ValueError("Sinkhorn normalization expects 2D logits")
+
+        # Adapted from the DINOv2 reference implementation (non-distributed).
+        Q = torch.exp(logits / max(self.sinkhorn_eps, 1e-6)).t()
+        Q = torch.clamp(Q, min=1e-12)
+        Q = Q / Q.sum()
+
+        k, b = Q.shape
+        r = torch.full((k,), 1.0 / k, device=Q.device, dtype=Q.dtype)
+        c = torch.full((b,), 1.0 / b, device=Q.device, dtype=Q.dtype)
+
+        for _ in range(self.sinkhorn_iters):
+            u = Q.sum(dim=1)
+            Q = Q * (r / (u + 1e-12)).unsqueeze(1)
+            v = Q.sum(dim=0)
+            Q = Q * (c / (v + 1e-12)).unsqueeze(0)
+
+        Q = Q / Q.sum(dim=0, keepdim=True)
+        return Q.t()
 
     def forward(self, student: Tensor, teacher: Tensor) -> Tensor:
         teacher = teacher.detach()
         student_logprob = torch.nn.functional.log_softmax(student / self.student_temp, dim=-1)
-        teacher_prob = torch.nn.functional.softmax(
-            (teacher - self.center) / self.teacher_temp, dim=-1
-        )
+        teacher_logits = (teacher - self.center) / self.teacher_temp
+        if self.use_sinkhorn:
+            teacher_prob = self._sinkhorn_normalize(teacher_logits)
+        else:
+            teacher_prob = torch.nn.functional.softmax(teacher_logits, dim=-1)
         loss = -(teacher_prob * student_logprob).sum(dim=-1).mean()
         with torch.no_grad():
             batch_center = teacher.mean(dim=0)
@@ -465,6 +496,9 @@ class IBOTLoss(nn.Module):
         center_momentum: float = 0.9,
         global_weight: float = 1.0,
         patch_weight: float = 1.0,
+        use_sinkhorn: bool = False,
+        sinkhorn_eps: float = 0.05,
+        sinkhorn_iters: int = 3,
     ) -> None:
         super().__init__()
         self.global_loss = DINOLoss(
@@ -472,6 +506,9 @@ class IBOTLoss(nn.Module):
             student_temp=student_temp,
             teacher_temp=teacher_temp,
             center_momentum=center_momentum,
+            use_sinkhorn=use_sinkhorn,
+            sinkhorn_eps=sinkhorn_eps,
+            sinkhorn_iters=sinkhorn_iters,
         )
         self.global_weight = global_weight
         self.patch_weight = patch_weight
