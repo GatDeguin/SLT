@@ -1,0 +1,81 @@
+# Preset MSKA-SLT con decoder configurable entre mBART y T5 v1.1 Base.
+preset:
+  name: mska_paper_mbart
+  description: >-
+    Configuración basada en MSKA-SLT con 8 bloques y 6 cabezas por stream que activa mBART
+    large CC25 por defecto para traducción offline, con opción de cambiar a T5 v1.1 Base.
+  reference: docs/mska-paper-config.md
+
+metadata:
+  default_decoder: mbart
+  decoder_variants:
+    mbart:
+      aliases:
+        - mbart
+        - mbart-large
+        - mbart-large-cc25
+        - facebook/mbart-large-cc25
+      tokenizer: facebook/mbart-large-cc25
+      model: facebook/mbart-large-cc25
+      decoder_layers: 12
+      decoder_heads: 16
+      decoder_dropout: 0.3
+      decoder_kwargs:
+        forced_bos_token_id: 250004
+    t5:
+      aliases:
+        - t5
+        - t5-base
+        - t5-v1_1-base
+        - google/t5-v1_1-base
+      tokenizer: google/t5-v1_1-base
+      model: google/t5-v1_1-base
+      decoder_layers: 12
+      decoder_heads: 12
+      decoder_dropout: 0.1
+      decoder_kwargs:
+        tie_embeddings: true
+
+data:
+  tokenizer: facebook/mbart-large-cc25
+  max_target_length: 196
+
+model:
+  use_mska: true
+  projector_dim: 64
+  d_model: 256
+  temporal_layers: 8
+  temporal_nhead: 6
+  temporal_dim_feedforward: 1024
+  temporal_dropout: 0.1
+  sequence_length: 128
+  decoder_layers: 12
+  decoder_heads: 16
+  decoder_dropout: 0.3
+  decoder_model: facebook/mbart-large-cc25
+  decoder_kwargs:
+    forced_bos_token_id: 250004
+  mska_heads: 6
+  mska_stream_heads: 6
+  mska_temporal_blocks: 8
+  mska_temporal_kernel: 3
+  mska_temporal_dilation: 1
+  mska_dropout: 0.1
+  mska_translation_weight: 1.0
+  mska_ctc_weight: 1.0
+  mska_distillation_weight: 1.0
+  mska_distillation_temperature: 1.0
+  mska_gloss_hidden_dim: 512
+  mska_gloss_second_hidden_dim: 256
+  mska_gloss_dropout: 0.1
+  mska_gloss_fusion: concat
+
+training:
+  epochs: 40
+
+optim:
+  optimizer: adamw
+  lr: 1.0e-5
+  weight_decay: 1.0e-3
+  scheduler: cosine
+  scheduler_step_size: 40

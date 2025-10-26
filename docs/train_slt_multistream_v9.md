@@ -147,6 +147,38 @@ Pasos recomendados:
 El preset está inspirado en el paper SignMusketeers, que reporta ~14 BLEU en How2Sign con
 esta arquitectura multi-stream. 【F:docs/signmusketeers-paper-summary.md†L9-L33】
 
+## Traducción offline con MSKA (`--decoder-preset mska_paper_mbart`)
+
+La configuración `mska_paper_mbart` replica los 8 bloques atencionales con 6 cabezas descritos en el
+paper MSKA-SLT y activa la ruta `facebook/mbart-large-cc25` para inferencia offline. El YAML incluye
+metadatos para intercambiar el decoder por `google/t5-v1_1-base` sin editar archivos: basta con
+añadir `--decoder-model t5` o `--decoder-model mbart` y la CLI ajustará capas, cabezas, dropout y
+tokenizer según corresponda. 【F:configs/presets/mska_paper_mbart.yaml†L1-L55】
+
+```bash
+python tools/train_slt_multistream_v9.py \
+  --decoder-preset mska_paper_mbart \
+  --face-dir data/single_signer/processed/face \
+  --hand-left-dir data/single_signer/processed/hand_l \
+  --hand-right-dir data/single_signer/processed/hand_r \
+  --pose-dir data/single_signer/processed/pose \
+  --keypoints-dir data/single_signer/processed/keypoints \
+  --gloss-csv data/single_signer/gloss.csv \
+  --metadata-csv meta.csv \
+  --train-index data/single_signer/index/train.csv \
+  --val-index data/single_signer/index/val.csv \
+  --work-dir work_dirs/mska_mbart_offline \
+  --batch-size 4 --sequence-length 128
+```
+
+El preset fija `lr=1e-5`, `weight_decay=1e-3`, `epochs=40` y preserva los pesos MSKA
+(`mska_ctc_weight` e `mska_distillation_weight`) en 1.0 conforme al paper original.
+【F:configs/presets/mska_paper_mbart.yaml†L33-L63】【F:docs/mska-paper-config.md†L1-L26】
+Los flags `--mska-heads`, `--mska-stream-heads` y `--mska-temporal-blocks` actualizan `ModelConfig`
+tras cargar el preset; la combinación con `--decoder-model t5` rehace también `decoder_layers`,
+`decoder_heads`, `decoder_dropout`, `decoder_kwargs` y el tokenizer sin perder el resto de valores
+MSKA.
+
 ## Prompt tuning del decoder T5
 
 Cuando el decoder es un T5 (`model_type=t5` o presets basados en T5) puedes inyectar

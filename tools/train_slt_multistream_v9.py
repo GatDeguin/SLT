@@ -20,7 +20,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +55,26 @@ _DECODER_PRESETS: dict[str, dict[str, Any]] = {
             "Preset inspirado en SignMusketeers que concatena rostro, manos y pose hacia"
             " un decoder T5 v1.1 Base."
         ),
-    }
+    },
+    "mska_paper_mbart": {
+        "path": _DECODER_PRESET_DIR / "mska_paper_mbart.yaml",
+        "aliases": {"mska-paper-mbart", "mska_slt_mbart", "mska_slt"},
+        "summary": (
+            "Replica los hiperparámetros MSKA-SLT (8 bloques, 6 cabezas) y permite"
+            " alternar entre mBART-large CC25 y T5 v1.1 Base como decoder."
+        ),
+    },
+}
+
+_DECODER_MODEL_ALIASES: dict[str, str] = {
+    "mbart": "facebook/mbart-large-cc25",
+    "mbart-large": "facebook/mbart-large-cc25",
+    "mbart-large-cc25": "facebook/mbart-large-cc25",
+    "facebook/mbart-large-cc25": "facebook/mbart-large-cc25",
+    "t5": "google/t5-v1_1-base",
+    "t5-base": "google/t5-v1_1-base",
+    "t5-v1_1-base": "google/t5-v1_1-base",
+    "google/t5-v1_1-base": "google/t5-v1_1-base",
 }
 
 
@@ -363,6 +382,21 @@ def _compute_validation_text_metrics(
     return {"bleu": float(bleu_score), "chrf": float(chrf_score)}
 
 
+def _decoder_preset_help() -> str:
+    if not _DECODER_PRESETS:
+        return "Nombre del preset de decoder a aplicar."
+    lines = [
+        "Nombre del preset de decoder a aplicar. Disponibles:",
+    ]
+    for name in _decoder_preset_names():
+        summary = _DECODER_PRESETS[name].get("summary")
+        if summary:
+            lines.append(f"  - {name}: {summary}")
+        else:
+            lines.append(f"  - {name}")
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -370,10 +404,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-preset",
         type=str,
-        help=(
-            "Nombre del preset de decoder a aplicar. Disponibles: "
-            + ", ".join(_decoder_preset_names())
-        ),
+        help=_decoder_preset_help(),
     )
     parser.add_argument(
         "--set",
@@ -523,7 +554,14 @@ def parse_args() -> argparse.Namespace:
             " is enabled"
         ),
     )
-    parser.add_argument("--decoder-model", type=str, help="Pretrained decoder model name or path")
+    parser.add_argument(
+        "--decoder-model",
+        type=str,
+        help=(
+            "Pretrained decoder model name or path (alias mbart, mbart-large,"
+            " mbart-large-cc25 → facebook/mbart-large-cc25)"
+        ),
+    )
     parser.add_argument("--decoder-config", type=str, help="Decoder configuration name or path")
     parser.add_argument(
         "--decoder-class",
@@ -801,13 +839,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.decoder_preset:
         try:
-            args.decoder_preset, _ = _resolve_decoder_preset(args.decoder_preset)
+            preset_name, preset_payload = _resolve_decoder_preset(args.decoder_preset)
         except (ValueError, FileNotFoundError) as exc:
             parser.error(str(exc))
+        else:
+            args.decoder_preset = preset_name
+            args._decoder_preset_payload = preset_payload
     if args.decoder_config and args.decoder_model:
         parser.error("--decoder-model and --decoder-config are mutually exclusive")
     if args.decoder_class and (args.decoder_model or args.decoder_config):
         parser.error("--decoder-class cannot be combined with --decoder-model/--decoder-config")
+    if args.decoder_model:
+        canonical = _DECODER_MODEL_ALIASES.get(args.decoder_model.strip().lower())
+        if canonical:
+            args.decoder_model = canonical
     if args.decoder_kwargs:
         try:
             parsed_kwargs = json.loads(args.decoder_kwargs)
@@ -973,21 +1018,149 @@ def _collect_cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]
     return overrides
 
 
+def _collect_explicit_override_fields(
+    cli_overrides: Mapping[str, Mapping[str, Any]],
+    set_overrides: Iterable[str],
+) -> tuple[set[str], set[str]]:
+    data_fields = {str(key) for key in cli_overrides.get("data", {})}
+    model_fields = {str(key) for key in cli_overrides.get("model", {})}
+
+    for item in set_overrides:
+        if "=" not in item:
+            continue
+        dotted, _ = item.split("=", 1)
+        dotted = dotted.strip()
+        if dotted.startswith("data."):
+            data_fields.add(dotted.split(".", 1)[1])
+        elif dotted.startswith("model."):
+            model_fields.add(dotted.split(".", 1)[1])
+
+    return data_fields, model_fields
+
+
+def _select_decoder_variant(
+    metadata: Mapping[str, Any],
+    identifier: Optional[str],
+) -> tuple[Optional[str], Optional[Mapping[str, Any]]]:
+    variants = metadata.get("decoder_variants") if metadata else None
+    if not isinstance(variants, Mapping):
+        return None, None
+    if identifier:
+        target = identifier.strip().lower()
+        for name, spec in variants.items():
+            if not isinstance(spec, Mapping):
+                continue
+            aliases: set[str] = {str(name).strip().lower()}
+            model_name = spec.get("model")
+            if isinstance(model_name, str):
+                aliases.add(model_name.strip().lower())
+            raw_aliases = spec.get("aliases", ())
+            if isinstance(raw_aliases, Iterable) and not isinstance(raw_aliases, (str, bytes)):
+                aliases.update(str(item).strip().lower() for item in raw_aliases)
+            if target in aliases:
+                return str(name), spec
+    default_name = metadata.get("default_decoder")
+    if isinstance(default_name, str) and default_name in variants:
+        spec = variants[default_name]
+        if isinstance(spec, Mapping):
+            return default_name, spec
+    return None, None
+
+
+def _apply_decoder_variant_defaults(
+    *,
+    variant_name: str,
+    variant_spec: Mapping[str, Any],
+    metadata: dict[str, Any],
+    data_config: DataConfig,
+    model_config: ModelConfig,
+    merged: dict[str, Any],
+    explicit_data_fields: set[str],
+    explicit_model_fields: set[str],
+) -> None:
+    metadata["decoder_variant"] = variant_name
+
+    model_section = merged.setdefault("model", {})
+    data_section = merged.setdefault("data", {})
+
+    decoder_model = variant_spec.get("model")
+    if isinstance(decoder_model, str) and "decoder_model" not in explicit_model_fields:
+        model_config.decoder_model = decoder_model
+        model_section["decoder_model"] = decoder_model
+
+    for field_name in ("decoder_layers", "decoder_heads", "decoder_dropout"):
+        if field_name in explicit_model_fields:
+            continue
+        if field_name in variant_spec:
+            value = variant_spec[field_name]
+            if value is not None:
+                setattr(model_config, field_name, value)
+                model_section[field_name] = value
+
+    if "decoder_kwargs" not in explicit_model_fields:
+        decoder_kwargs = variant_spec.get("decoder_kwargs")
+        if isinstance(decoder_kwargs, Mapping):
+            model_config.decoder_kwargs = dict(decoder_kwargs)
+            model_section["decoder_kwargs"] = dict(decoder_kwargs)
+
+    tokenizer_name = variant_spec.get("tokenizer")
+    if isinstance(tokenizer_name, str) and "tokenizer" not in explicit_data_fields:
+        data_config.tokenizer = tokenizer_name
+        data_section["tokenizer"] = tokenizer_name
+
+
 def build_configs(
     args: argparse.Namespace,
 ) -> tuple[DataConfig, ModelConfig, OptimConfig, TrainingConfig, dict[str, Any]]:
     cli_overrides = _collect_cli_overrides(args)
+    explicit_data_fields, explicit_model_fields = _collect_explicit_override_fields(
+        cli_overrides,
+        args.overrides,
+    )
     base: dict[str, Any] = {}
     decoder_preset = getattr(args, "decoder_preset", None)
     if decoder_preset:
-        _, preset_payload = _resolve_decoder_preset(decoder_preset)
-        base = preset_payload
-    return resolve_configs(
+        preset_payload = getattr(args, "_decoder_preset_payload", None)
+        if preset_payload is None:
+            _, preset_payload = _resolve_decoder_preset(decoder_preset)
+        base = dict(preset_payload)
+    (
+        data_config,
+        model_config,
+        optim_config,
+        training_config,
+        merged_config,
+    ) = resolve_configs(
         config_path=args.config,
         cli_overrides=cli_overrides,
         set_overrides=args.overrides,
         base=base,
     )
+
+    metadata_obj = merged_config.get("metadata", {})
+    if isinstance(metadata_obj, dict):
+        metadata = metadata_obj
+    else:
+        metadata = dict(metadata_obj) if metadata_obj else {}
+        merged_config["metadata"] = metadata
+    variant_identifier = getattr(args, "decoder_model", None) or model_config.decoder_model
+    variant_name, variant_spec = _select_decoder_variant(
+        metadata,
+        variant_identifier,
+    )
+    if variant_name and variant_spec:
+        _apply_decoder_variant_defaults(
+            variant_name=variant_name,
+            variant_spec=variant_spec,
+            metadata=metadata,
+            data_config=data_config,
+            model_config=model_config,
+            merged=merged_config,
+            explicit_data_fields=explicit_data_fields,
+            explicit_model_fields=explicit_model_fields,
+        )
+
+    return data_config, model_config, optim_config, training_config, merged_config
 
 
 def setup_logging() -> None:
