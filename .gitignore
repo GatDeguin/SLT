@@ -1,0 +1,4 @@
+# Ignore all files inside the singlesigner directory.
+singlesigner/**
+# Keep the ignore file itself if present.
+!singlesigner/.gitignore
