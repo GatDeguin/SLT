@@ -75,6 +75,29 @@ junto al archivo original para facilitar su corrección. Con `--emit-split-json`
 también genera `split_segments.jsonl`, un JSONL con los fragmentos textualizados
 que facilita reutilizar las mismas alineaciones en pipelines posteriores.
 
+### Normalizar campos temporales
+
+- `sanitize_time_value` convierte valores como `6.299.999.999.999.980` en `6.299`
+  conservando el primer punto decimal, por lo que acepta valores escritos con
+  múltiples separadores o con comas.
+- Al ejecutar `tools/prepare_lsat_crops.py --dry-run` se aplica la limpieza sin
+  invocar MediaPipe. El CSV limpio se mantiene en memoria, pero los reportes
+  auxiliares (`meta_missing.csv`, `meta_outliers.csv`) se escriben en disco.
+- Los campos `prev_delta` y `post_delta` se normalizan con la misma rutina,
+  permitiendo identificar silencios anómalos o clips duplicados.
+
+### Emitir subtítulos parciales
+
+- `parse_split_column` convierte el campo `split` en una lista de segmentos con
+  texto, inicio y fin para cada fragmento. Es la misma estructura que produce la
+  bandera `--emit-split-json` de `tools/prepare_lsat_crops.py`.
+- `split_segments.jsonl` se organiza con un objeto por clip (`clip_id`, `video`
+  y `segments`), lo que permite alinear los subtítulos parciales con audios o
+  anotaciones externas sin volver a parsear el CSV.
+- Cuando la celda está vacía o contiene valores no parseables se devuelve una
+  lista vacía; en esos casos conviene revisar los cortes manualmente antes de
+  continuar.
+
 ## Control de outliers
 
 Ejecuta `tools/prepare_lsat_crops.py` para inspeccionar las duraciones
