@@ -54,7 +54,11 @@ def synthetic_dataset(tmp_path: Path) -> dict:
         keypoints[frame, :, 2] = 0.9
     np.savez(keypoints_dir / f"{video_id}.npz", keypoints=keypoints)
 
-    textos_path.write_text("video_id;texto\nvid001;hola mundo\n", encoding="utf-8")
+    textos_path.write_text(
+        "video_id;texto;fps;duration;frame_count\n"
+        "vid001;hola mundo;25,0;6.359.999.999.999.990;\n",
+        encoding="utf-8",
+    )
     split_path.write_text("video_id\nvid001\n", encoding="utf-8")
     gloss_path.write_text("video_id;gloss;ctc_labels\nvid001;ga gb;1 2\n", encoding="utf-8")
 
@@ -102,6 +106,15 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
     assert sample.gloss_sequence == ["ga", "gb"]
     assert sample.text == "hola mundo"
     assert sample.video_id == "vid001"
+
+
+def test_meta_sanitizes_numeric_fields(synthetic_dataset: dict) -> None:
+    ds = LsaTMultiStream(T=2, img_size=32, flip_prob=0.0, **synthetic_dataset)
+    meta = ds.meta["vid001"]
+
+    assert meta["fps"] == pytest.approx(25.0)
+    assert meta["duration"] == pytest.approx(6.35999999999999)
+    assert meta["frame_count"] is None
 
 
 def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
