@@ -130,6 +130,36 @@ python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
+### Configurar entorno en Windows
+
+Sigue estos pasos para habilitar todas las funcionalidades (extras `media`,
+`metrics` y `export`) en Windows:
+
+1. Instala **Python 3.12 (64 bits)** desde python.org y marca *Add python.exe to
+   PATH* durante la instalación. MediaPipe solo publica ruedas hasta 3.12.
+2. Instala **Git for Windows** y, si tu entorno no cuenta con compiladores C++,
+   añade *Microsoft C++ Build Tools* con la carga de trabajo *Desktop
+   development with C++* para cubrir dependencias que requieran extensiones.
+3. Instala **PyTorch** siguiendo la guía oficial para Windows, seleccionando la
+   versión (CPU o CUDA) que corresponda a tu GPU:
+   https://pytorch.org/get-started/locally/
+4. Abre PowerShell en la carpeta del repositorio y crea el entorno virtual con
+   `py -3.12`. Si la política de ejecución bloquea la activación, ejecuta
+   `Set-ExecutionPolicy -Scope Process RemoteSigned -Force` en la misma sesión.
+
+```powershell
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process RemoteSigned -Force  # Solo si es necesario
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+```
+
+El archivo `requirements-dev.txt` instala el paquete en modo editable junto con
+los extras opcionales. Tras la instalación, verifica que `mediapipe` esté
+disponible ejecutando `pip show mediapipe` y comprueba PyTorch con
+`python -c "import torch; print(torch.__version__)"`.
+
 ### Extras opcionales
 
 El paquete define grupos de extras que habilitan funcionalidades específicas:
