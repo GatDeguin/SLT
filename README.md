@@ -188,7 +188,23 @@ para conocer las verificaciones recomendadas tras la instalación.
    meta.csv              # CSV con columnas video_id;texto
    ```
 2. Copia los videos originales en `data/single_signer/videos/`.
-3. Ejecuta la extracción de regiones de interés para rostro, manos y pose:
+3. Normaliza `meta.csv` antes de lanzar cualquier pipeline. El comando limpia
+   separadores repetidos, descarta filas sin temporización y emite resúmenes de
+   outliers junto con `meta_missing.csv` cuando corresponde:
+   ```bash
+   python tools/prepare_lsat_crops.py \
+     --lsa-root data/single_signer/videos \
+     --meta-csv meta.csv \
+     --dry-run \
+     --duration-threshold 20 \
+     --delta-threshold 0.5 \
+     --fail-on-outliers
+   ```
+   El `dry-run` evita la ejecución de MediaPipe pero mantiene la limpieza,
+   dejando los archivos auxiliares junto al CSV original. Activa
+   `--emit-split-json` para exportar `split_segments.jsonl` y reutilizar los
+   subtítulos parciales en otros pipelines.
+4. Ejecuta la extracción de regiones de interés para rostro, manos y pose:
    ```bash
    python tools/extract_rois_v2.py \
      --videos data/single_signer/videos \
@@ -205,21 +221,19 @@ para conocer las verificaciones recomendadas tras la instalación.
    Para LSA-T y corpus externos con millones de crops combina fuentes mediante
    `python tools/prepare_lsat_crops.py --lsa-root data/lsa_t/videos --output-root \
    data/single_signer/processed_lsat --extra-datasets "data/externo/**/*.mp4"`.
-   El helper aplica las mismas ROI, valida los IDs contra `meta.csv` y permite
-   detenerse al alcanzar un número objetivo de frames con `--target-crops`.
-   Además ofrece un control de outliers configurable (`--duration-threshold`,
-   `--delta-threshold`, `--fail-on-outliers`) documentado en
-   [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers). Activa
-   `--emit-split-json` para generar `split_segments.jsonl` con los segmentos
-   textualizados de la columna `split` y así encadenar pipelines aguas abajo.
-4. Genera o copia los keypoints multistream en
+   El helper reaprovecha la metadata limpia, valida los IDs contra `meta.csv` y
+   permite detenerse al alcanzar un número objetivo de frames con
+   `--target-crops`. Mantiene los mismos controles de outliers descritos en
+   [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers) y puede
+   emitir `split_segments.jsonl` al activar `--emit-split-json`.
+5. Genera o copia los keypoints multistream en
    `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
    `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en
    formato `(T, landmarks, 3)` con `(x, y, conf)` siguiendo el layout de
    MediaPipe. Si cuentas con anotaciones de glosa, agrégalas al CSV opcional
    `data/single_signer/annotations/gloss.csv` con columnas
    `video_id;gloss;ctc_labels` (índices separados por espacios).
-5. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
+6. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
    contener un `video_id` por línea sin encabezado. Un ejemplo mínimo:
    ```bash
    python - <<'PY'
@@ -235,7 +249,7 @@ para conocer las verificaciones recomendadas tras la instalación.
    pd.Series(ids[90:]).to_csv(out_dir / 'test.csv', index=False)
    PY
    ```
-6. Valida la estructura con `python tools/ci_validate_data_contract.py` o
+7. Valida la estructura con `python tools/ci_validate_data_contract.py` o
    ejecuta `pytest tests/data/test_dataset_quality.py` para comprobar los
    avisos producidos ante inconsistencias de FPS, frames faltantes, keypoints
    ausentes o splits incompletos.

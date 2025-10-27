@@ -11,18 +11,32 @@ enlaza con la documentación correspondiente.
    `python tools/ci_validate_data_contract.py` para generar un dataset sintético y
    confirmar que las máscaras por stream, los keypoints y las etiquetas
    CTC/gloss coinciden con `docs/data_contract.md`.
-2. **Alineación ROI-keypoints**: corre `pytest tests/data/test_lsa_t_multistream.py`
+2. **Normalización de `meta.csv`**: lanza
+   ```bash
+   python tools/prepare_lsat_crops.py \
+     --lsa-root data/single_signer/videos \
+     --meta-csv meta.csv \
+     --dry-run \
+     --duration-threshold 20 \
+     --delta-threshold 0.5 \
+     --fail-on-outliers \
+     --emit-split-json
+   ```
+   El resumen indica cuántos clips se descartaron, escribe `meta_missing.csv` y
+   `meta_outliers.csv` junto al CSV original y genera `split_segments.jsonl` con
+   los subtítulos parciales parseados. Revisa estos archivos antes de continuar.
+3. **Alineación ROI-keypoints**: corre `pytest tests/data/test_lsa_t_multistream.py`
    para verificar que los keypoints por flujo siguen las máscaras y longitudes
    esperadas antes de lanzar experimentos reales.
-3. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
+4. **Entrenamiento de humo**: corre `pytest tests/test_pipeline_end_to_end.py`
    para comprobar que los componentes de datos, entrenamiento y exportación
    funcionan integrados. Si trabajas con flujos basados en keypoints, valida
    también `tools/train_slt_multistream_v9.py --use-mska` (o el wrapper) con un
    fragmento representativo.
-4. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
+5. **Evaluación**: valida `tools/eval_slt_multistream_v9.py` usando el checkpoint
    producido por la demo y revisa los reportes con
    `docs/metrics_dashboard_integration.py`.
-5. **Exportación**: ejecuta `pytest tests/test_export.py` o el script
+6. **Exportación**: ejecuta `pytest tests/test_export.py` o el script
    `tools/export_onnx_encoder_v9.py` con el checkpoint de referencia para
    asegurar que ONNX y TorchScript son válidos. Complementa con
    `tools/test_realtime_pipeline.py` cuando existan regresiones de latencia.
