@@ -73,6 +73,30 @@ Los registros con `start`, `end` o `duration` no numéricos se omiten durante
 `tools/prepare_lsat_crops.py`, que emite un resumen y guarda `meta_missing.csv`
 junto al archivo original para facilitar su corrección.
 
+## Control de outliers
+
+Ejecuta `tools/prepare_lsat_crops.py` para inspeccionar las duraciones
+normalizadas de `meta.csv`. La utilidad genera un resumen agregado, crea
+`meta_outliers.csv` con los clips que superan los umbrales y permite hacer fallar
+la ejecución en CI cuando detecta desviaciones.
+
+```bash
+python tools/prepare_lsat_crops.py \
+  --lsa-root data/single_signer/videos \
+  --meta-csv meta.csv \
+  --dry-run \
+  --duration-threshold 20 \
+  --delta-threshold 0.5 \
+  --fail-on-outliers
+```
+
+- Ajustar `--duration-threshold` y `--delta-threshold` según la longitud esperada
+  de los clips. El valor `0` desactiva cada control individual.
+- Revisar `meta_outliers.csv` antes de relajar los límites; documentar cualquier
+  desviación aceptada (por ejemplo, clips de referencia o pruebas).
+- Confirmar que los videos listados cuenten con anotaciones correctas o
+  corregir/descartar los registros antes de relanzar el pipeline.
+
 El dataset `LsaTMultiStream` descarta cualquier `video_id` sin `texto` o
 `duration` válidos tras normalizar la metadata y avisa mediante `warnings.warn`.
 Por lo tanto, los clips sin temporización completa o sin pertenecer a un
