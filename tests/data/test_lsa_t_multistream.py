@@ -9,6 +9,7 @@ pytest.importorskip("PIL")
 from PIL import Image  # type: ignore
 
 from slt.data import LsaTMultiStream, SampleItem, collate_fn
+from slt.utils.metadata import SplitSegment
 
 
 @pytest.fixture()
@@ -72,6 +73,61 @@ def synthetic_dataset(tmp_path: Path) -> dict:
         "index_csv": str(split_path),
         "gloss_csv": str(gloss_path),
     }
+
+
+@pytest.fixture()
+def synthetic_dataset_with_blank_split(synthetic_dataset: dict) -> dict:
+    meta_path = Path(synthetic_dataset["csv_path"])
+    target = meta_path.with_name("subs_blank_split.csv")
+    target.write_text(
+        "video_id;texto;fps;duration;frame_count;split\n"
+        "vid001;hola mundo;25,0;6.359.999.999.999.990;;\n",
+        encoding="utf-8",
+    )
+    data = dict(synthetic_dataset)
+    data["csv_path"] = str(target)
+    return data
+
+
+@pytest.fixture()
+def synthetic_dataset_with_segments(synthetic_dataset: dict) -> dict:
+    meta_path = Path(synthetic_dataset["csv_path"])
+    target = meta_path.with_name("subs_split_segments.csv")
+    target.write_text(
+        "video_id;texto;fps;duration;frame_count;split\n"
+        "vid001;hola mundo;25,0;6.359.999.999.999.990;;"
+        "[('segmento uno', 0, 1.5), ('segmento dos', '2,0', '3,5')]\n",
+        encoding="utf-8",
+    )
+    data = dict(synthetic_dataset)
+    data["csv_path"] = str(target)
+    return data
+
+
+def test_get_split_segments_returns_empty_on_blank_cells(
+    synthetic_dataset_with_blank_split: dict,
+) -> None:
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset_with_blank_split)
+
+    assert ds.get_split_segments("vid001") == []
+
+
+def test_get_split_segments_parses_and_caches(
+    synthetic_dataset_with_segments: dict,
+) -> None:
+    ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset_with_segments)
+
+    segments = ds.get_split_segments("vid001")
+
+    assert len(segments) == 2
+    assert isinstance(segments[0], SplitSegment)
+    assert segments[0].text == "segmento uno"
+    assert segments[0].start == pytest.approx(0.0)
+    assert segments[0].end == pytest.approx(1.5)
+    assert segments[1].text == "segmento dos"
+    assert segments[1].start == pytest.approx(2.0)
+    assert segments[1].end == pytest.approx(3.5)
+    assert ds.get_split_segments("vid001") is segments
 
 
 def test_sample_item_structure(synthetic_dataset: dict) -> None:

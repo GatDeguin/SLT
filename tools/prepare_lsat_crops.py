@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import json
 import logging
 import random
 import sys
@@ -22,7 +23,7 @@ from extract_rois_v2 import (
     process_video,
 )
 
-from slt.utils.metadata import sanitize_time_value
+from slt.utils.metadata import parse_split_column, sanitize_time_value
 
 
 _VALID_SUFFIXES = {".mp4", ".mov", ".mkv"}
@@ -78,6 +79,14 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--metadata",
         type=Path,
         help="Archivo JSONL para registrar métricas. Por defecto dentro de out_root.",
+    )
+    parser.add_argument(
+        "--emit-split-json",
+        action="store_true",
+        help=(
+            "Escribe split_segments.jsonl con los segmentos textualizados desde la columna "
+            "split de meta.csv."
+        ),
     )
     parser.add_argument(
         "--fps",
@@ -451,6 +460,30 @@ def _resolve_metadata_path(out_root: Path, metadata_flag: Optional[Path]) -> Pat
     return _metadata_path(out_root, None)
 
 
+def _emit_split_segments_jsonl(
+    out_root: Path, result: _MetaLoadResult
+) -> Path:
+    path = out_root / "split_segments.jsonl"
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            for clip in result.clips:
+                segments = parse_split_column(clip.row.get("split"))
+                payload = {
+                    "clip_id": clip.clip_id,
+                    "video": clip.video,
+                    "segments": [
+                        {"text": seg.text, "start": seg.start, "end": seg.end}
+                        for seg in segments
+                    ],
+                }
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:  # pragma: no cover - error path
+        raise RuntimeError(
+            f"No se pudo escribir split_segments.jsonl en {path}: {exc}"
+        ) from exc
+    return path
+
+
 def _build_queue(
     videos: Dict[str, Tuple[Path, str]],
     meta: Dict[str, Dict[str, object]],
@@ -499,6 +532,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "hand_r": str(ensure_dir(out_root / "hand_r")),
     }
     pose_dir = str(ensure_dir(out_root / "pose"))
+
+    if args.emit_split_json:
+        split_path = _emit_split_segments_jsonl(out_root, meta_result)
+        logger.info("Segmentos por split escritos en %s", split_path)
 
     metadata_path = _resolve_metadata_path(out_root, args.metadata)
     index = _read_metadata_index(metadata_path)

@@ -209,7 +209,9 @@ para conocer las verificaciones recomendadas tras la instalación.
    detenerse al alcanzar un número objetivo de frames con `--target-crops`.
    Además ofrece un control de outliers configurable (`--duration-threshold`,
    `--delta-threshold`, `--fail-on-outliers`) documentado en
-   [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers).
+   [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers). Activa
+   `--emit-split-json` para generar `split_segments.jsonl` con los segmentos
+   textualizados de la columna `split` y así encadenar pipelines aguas abajo.
 4. Genera o copia los keypoints multistream en
    `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
    `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en
