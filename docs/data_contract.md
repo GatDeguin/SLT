@@ -69,6 +69,15 @@ Campos adicionales admitidos y utilizados por los *quality checks* del dataset:
 Cuando `fps` está ausente pero `duration` y `frame_count` existen, se calcula
 `fps = frame_count / duration`.
 
+Los registros con `start`, `end` o `duration` no numéricos se omiten durante
+`tools/prepare_lsat_crops.py`, que emite un resumen y guarda `meta_missing.csv`
+junto al archivo original para facilitar su corrección.
+
+El dataset `LsaTMultiStream` descarta cualquier `video_id` sin `texto` o
+`duration` válidos tras normalizar la metadata y avisa mediante `warnings.warn`.
+Por lo tanto, los clips sin temporización completa o sin pertenecer a un
+`split` deben corregirse manualmente o excluirse antes del entrenamiento.
+
 ### CSV de índices (`index/*.csv`)
 
 - Formato: una columna sin encabezado denominada `video_id`.
