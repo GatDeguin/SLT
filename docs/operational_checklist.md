@@ -5,6 +5,9 @@ antes de publicar un release. Úsala como complemento del README, la visión de
 arquitectura (`docs/architecture_overview.md`) y las guías técnicas; cada ítem
 enlaza con la documentación correspondiente.
 
+> Nota: MediaPipe solo ofrece ruedas para Python <=3.12; usa esa versión al
+> ejecutar utilidades dependientes de `tools/extract_rois_v2.py`.
+
 ## Reproducir errores y validar fixes
 
 1. **Contrato de datos y keypoints**: ejecuta

@@ -1,4 +1,5 @@
 # Instalación editable del paquete con extras comunes
+# Nota: el extra "media" solo se instalará en Python <3.13.
 -e .[media,metrics,export]
 
 # Herramientas de pruebas y formato utilizadas en CI
