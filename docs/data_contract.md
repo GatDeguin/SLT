@@ -71,7 +71,9 @@ Cuando `fps` está ausente pero `duration` y `frame_count` existen, se calcula
 
 Los registros con `start`, `end` o `duration` no numéricos se omiten durante
 `tools/prepare_lsat_crops.py`, que emite un resumen y guarda `meta_missing.csv`
-junto al archivo original para facilitar su corrección.
+junto al archivo original para facilitar su corrección. Con `--emit-split-json`
+también genera `split_segments.jsonl`, un JSONL con los fragmentos textualizados
+que facilita reutilizar las mismas alineaciones en pipelines posteriores.
 
 ## Control de outliers
 

@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import Dataset
 
-from slt.utils.metadata import sanitize_time_value
+from slt.utils.metadata import (
+    SplitSegment,
+    parse_split_column,
+    sanitize_time_value,
+)
 
 _POSE_SENTINEL = -1.0
 _POSE_SIGNING_WIDTH = 6.0
@@ -207,6 +211,8 @@ class LsaTMultiStream(Dataset):
         self._pose_norm_flags: Dict[str, bool] = {}
         self._legacy_pose_warning_emitted = False
         self._keypoint_source_total: int = 0
+        self._split_segments_cache: Dict[str, List[SplitSegment]] = {}
+        self._has_split_column = False
 
         df = pd.read_csv(csv_path, sep=";")
         df.columns = [c.strip().lower() for c in df.columns]
@@ -257,6 +263,7 @@ class LsaTMultiStream(Dataset):
         self.df.reset_index(drop=True, inplace=True)
         self.ids = self.df["video_id"].tolist()
         self.texts = dict(zip(self.df["video_id"], self.df["texto"]))
+        self._has_split_column = "split" in self.df.columns
 
         if gloss_csv:
             gloss_df = pd.read_csv(gloss_csv, sep=";")
@@ -313,6 +320,26 @@ class LsaTMultiStream(Dataset):
 
     def __len__(self) -> int:  # pragma: no cover - simple
         return len(self.ids)
+
+    def get_split_segments(self, video_id: str) -> List[SplitSegment]:
+        """Return cached split segments parsed from ``meta.csv`` for ``video_id``."""
+
+        vid = str(video_id)
+        if vid in self._split_segments_cache:
+            return self._split_segments_cache[vid]
+
+        if not self._has_split_column:
+            segments: List[SplitSegment] = []
+        else:
+            rows = self.df.loc[self.df["video_id"] == vid]
+            if rows.empty:
+                segments = []
+            else:
+                raw_value = rows.iloc[0].get("split")
+                segments = parse_split_column(raw_value)
+
+        self._split_segments_cache[vid] = segments
+        return segments
 
     # ------------------------------------------------------------------
     # Utilidades internas
