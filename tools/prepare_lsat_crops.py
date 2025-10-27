@@ -121,6 +121,11 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
         if reader.fieldnames is None:
             raise ValueError("El CSV de metadata no posee encabezado válido")
 
+        fieldnames = list(reader.fieldnames)
+        missing_counts = {"start": 0, "end": 0, "duration": 0}
+        missing_rows: List[Dict[str, object]] = []
+        missing_label = "__missing_fields__"
+
         grouped: Dict[str, Dict[str, object]] = defaultdict(
             lambda: {"clip_count": 0, "total_span": 0.0}
         )
@@ -133,19 +138,66 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
 
             start = sanitize_time_value(row.get("start"))
             end = sanitize_time_value(row.get("end"))
-            if start is None or end is None:
+            duration = sanitize_time_value(row.get("duration"))
+
+            missing_fields = []
+            if start is None:
+                missing_counts["start"] += 1
+                missing_fields.append("start")
+            if end is None:
+                missing_counts["end"] += 1
+                missing_fields.append("end")
+            if duration is None:
+                missing_counts["duration"] += 1
+                missing_fields.append("duration")
+
+            if missing_fields:
                 clip_id = (row.get("id") or video or "desconocido").strip()
                 logger.warning(
-                    "Omitiendo clip %s por tiempos inválidos: start=%r end=%r",
+                    "Omitiendo clip %s por metadata incompleta (%s)",
                     clip_id,
-                    row.get("start"),
-                    row.get("end"),
+                    ", ".join(missing_fields),
                 )
+                missing_row = dict(row)
+                missing_row[missing_label] = ",".join(missing_fields)
+                missing_rows.append(missing_row)
                 continue
 
             grouped_entry["clip_count"] = int(grouped_entry["clip_count"]) + 1
             span = max(0.0, end - start)
             grouped_entry["total_span"] = float(grouped_entry["total_span"]) + span
+
+        if missing_rows:
+            missing_total = len(missing_rows)
+            summary = ", ".join(
+                f"{key}={value}" for key, value in missing_counts.items() if value
+            )
+            if not summary:
+                summary = "sin_detalle"
+            missing_path = meta_csv.with_name("meta_missing.csv")
+            wrote_detail = False
+            try:
+                with missing_path.open("w", encoding="utf-8", newline="") as out:
+                    writer = csv.DictWriter(
+                        out,
+                        fieldnames=[*fieldnames, missing_label],
+                        delimiter=";",
+                    )
+                    writer.writeheader()
+                    writer.writerows(missing_rows)
+                wrote_detail = True
+            except OSError as exc:
+                logger.error(
+                    "No se pudo escribir meta_missing.csv en %s: %s",
+                    missing_path,
+                    exc,
+                )
+            message = (
+                f"Se omitieron {missing_total} filas con metadata incompleta ({summary})."
+            )
+            if wrote_detail:
+                message += f" Detalle en {missing_path}."
+            logger.info(message)
 
         return {key: dict(value) for key, value in grouped.items()}
 

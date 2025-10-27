@@ -218,9 +218,45 @@ class LsaTMultiStream(Dataset):
         if "video_id" not in idx.columns:
             raise ValueError("El CSV de índices debe contener la columna 'video_id'.")
 
-        self.df = df.merge(idx[["video_id"]], on="video_id", how="inner")
+        def _normalise_text(value: Any) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip()
+            if not text or text.lower() == "nan":
+                return ""
+            return text
+
+        merged = df.merge(idx[["video_id"]], on="video_id", how="inner").copy()
+        merged["_texto_norm"] = merged["texto"].map(_normalise_text)
+
+        if "duration" in merged.columns:
+            merged["_duration_norm"] = merged["duration"].map(sanitize_time_value)
+        else:
+            merged["_duration_norm"] = pd.Series([None] * len(merged), index=merged.index)
+            warnings.warn(
+                "El CSV principal no contiene la columna 'duration'; se descartarán todos "
+                "los videos.",
+                stacklevel=2,
+            )
+
+        drop_mask = (merged["_texto_norm"] == "") | merged["_duration_norm"].isna()
+        dropped_ids = merged.loc[drop_mask, "video_id"].astype(str).tolist()
+        if dropped_ids:
+            sample = ", ".join(dropped_ids[:5])
+            suffix = f" (ejemplos: {sample})" if sample else ""
+            warnings.warn(
+                "Se descartaron %d video(s) sin texto o duración tras la normalización%s."
+                % (len(dropped_ids), suffix),
+                stacklevel=2,
+            )
+
+        self.df = merged.loc[~drop_mask].copy()
+        self.df["texto"] = self.df["_texto_norm"]
+        self.df.drop(columns=["_texto_norm", "_duration_norm"], inplace=True)
+        self.df["video_id"] = self.df["video_id"].astype(str)
+        self.df.reset_index(drop=True, inplace=True)
         self.ids = self.df["video_id"].tolist()
-        self.texts = dict(zip(df["video_id"], df["texto"]))
+        self.texts = dict(zip(self.df["video_id"], self.df["texto"]))
 
         if gloss_csv:
             gloss_df = pd.read_csv(gloss_csv, sep=";")
