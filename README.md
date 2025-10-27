@@ -140,9 +140,13 @@ El paquete define grupos de extras que habilitan funcionalidades específicas:
 | `metrics` | Cálculo de BLEU, ChrF, CER y WER durante la evaluación. |
 | `export` | Exportación ONNX/TorchScript y validación en tiempo real. |
 
-Instálalos en bloque con `pip install .[media,metrics,export]` o agrega cada uno
-según tus necesidades. Consulta la sección de [control de calidad](#control-de-calidad-y-pruebas)
-para conocer las verificaciones recomendadas tras la instalación.
+> Nota: el extra `media` depende de MediaPipe, disponible únicamente en Python <=3.12.
+> Usa un entorno con esa versión cuando necesites sus utilidades.
+
+Instálalos en bloque con `pip install .[media,metrics,export]` en intérpretes
+compatibles o agrega cada uno según tus necesidades. Consulta la sección de
+[control de calidad](#control-de-calidad-y-pruebas) para conocer las
+verificaciones recomendadas tras la instalación.
 
 ## Flujo recomendado de extremo a extremo
 
