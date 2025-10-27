@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import logging
 import random
 import sys
 from collections import defaultdict
@@ -19,8 +20,12 @@ from extract_rois_v2 import (
     process_video,
 )
 
+from slt.utils.metadata import sanitize_time_value
+
 
 _VALID_SUFFIXES = {".mp4", ".mov", ".mkv"}
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -125,13 +130,20 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
                 continue
 
             grouped_entry = grouped[video]
-            grouped_entry["clip_count"] = int(grouped_entry["clip_count"]) + 1
 
-            try:
-                start = float(row.get("start", "0") or 0.0)
-                end = float(row.get("end", "0") or 0.0)
-            except ValueError:
-                start, end = 0.0, 0.0
+            start = sanitize_time_value(row.get("start"))
+            end = sanitize_time_value(row.get("end"))
+            if start is None or end is None:
+                clip_id = (row.get("id") or video or "desconocido").strip()
+                logger.warning(
+                    "Omitiendo clip %s por tiempos inválidos: start=%r end=%r",
+                    clip_id,
+                    row.get("start"),
+                    row.get("end"),
+                )
+                continue
+
+            grouped_entry["clip_count"] = int(grouped_entry["clip_count"]) + 1
             span = max(0.0, end - start)
             grouped_entry["total_span"] = float(grouped_entry["total_span"]) + span
 

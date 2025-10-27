@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import Dataset
 
+from slt.utils.metadata import sanitize_time_value
+
 _POSE_SENTINEL = -1.0
 _POSE_SIGNING_WIDTH = 6.0
 _POSE_SIGNING_HEIGHT = 7.0
@@ -256,12 +258,7 @@ class LsaTMultiStream(Dataset):
         def _coerce(value: Any) -> Optional[float]:
             if value is None:
                 return None
-            if isinstance(value, (int, float)):
-                return float(value)
-            try:
-                return float(str(value).strip())
-            except (TypeError, ValueError):
-                return None
+            return sanitize_time_value(value)
 
         self.meta = {}
         for vid in self.ids:
