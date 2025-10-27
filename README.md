@@ -207,6 +207,9 @@ para conocer las verificaciones recomendadas tras la instalación.
    data/single_signer/processed_lsat --extra-datasets "data/externo/**/*.mp4"`.
    El helper aplica las mismas ROI, valida los IDs contra `meta.csv` y permite
    detenerse al alcanzar un número objetivo de frames con `--target-crops`.
+   Además ofrece un control de outliers configurable (`--duration-threshold`,
+   `--delta-threshold`, `--fail-on-outliers`) documentado en
+   [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers).
 4. Genera o copia los keypoints multistream en
    `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
    `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en

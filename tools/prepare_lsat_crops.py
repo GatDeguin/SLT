@@ -9,7 +9,9 @@ import logging
 import random
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from extract_rois_v2 import (
@@ -26,6 +28,25 @@ from slt.utils.metadata import sanitize_time_value
 _VALID_SUFFIXES = {".mp4", ".mov", ".mkv"}
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ClipSummary:
+    clip_id: str
+    video: str
+    start: float
+    end: float
+    duration: float
+    span: float
+    delta: float
+    row: Dict[str, object]
+
+
+@dataclass
+class _MetaLoadResult:
+    grouped: Dict[str, Dict[str, object]]
+    clips: List[_ClipSummary]
+    fieldnames: List[str]
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -109,10 +130,36 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Lista la información descubierta sin ejecutar MediaPipe.",
     )
+    parser.add_argument(
+        "--duration-threshold",
+        type=float,
+        default=20.0,
+        help=(
+            "Duración máxima en segundos antes de marcar un clip como outlier. "
+            "Use 0 para desactivar este control."
+        ),
+    )
+    parser.add_argument(
+        "--delta-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Diferencia máxima aceptada (segundos) entre end-start y duration. "
+            "Use 0 para desactivar este control."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-outliers",
+        action="store_true",
+        help=(
+            "Finaliza la ejecución con código 1 si hay clips fuera de los "
+            "umbrales configurados."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
+def _load_meta(meta_csv: Path) -> _MetaLoadResult:
     if not meta_csv.exists():
         raise FileNotFoundError(f"No se encontró el CSV de metadata: {meta_csv}")
 
@@ -129,6 +176,7 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
         grouped: Dict[str, Dict[str, object]] = defaultdict(
             lambda: {"clip_count": 0, "total_span": 0.0}
         )
+        clips: List[_ClipSummary] = []
         for row in reader:
             video = (row.get("video") or "").strip()
             if not video:
@@ -167,6 +215,22 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
             span = max(0.0, end - start)
             grouped_entry["total_span"] = float(grouped_entry["total_span"]) + span
 
+            clip_id = (row.get("id") or video or "desconocido").strip()
+            clean_row = {key: row.get(key) for key in fieldnames}
+            clean_row.update({"start": start, "end": end, "duration": duration})
+            clips.append(
+                _ClipSummary(
+                    clip_id=clip_id,
+                    video=video,
+                    start=float(start),
+                    end=float(end),
+                    duration=float(duration),
+                    span=float(span),
+                    delta=abs(float(duration) - float(span)),
+                    row=clean_row,
+                )
+            )
+
         if missing_rows:
             missing_total = len(missing_rows)
             summary = ", ".join(
@@ -199,13 +263,124 @@ def _load_meta(meta_csv: Path) -> Dict[str, Dict[str, object]]:
                 message += f" Detalle en {missing_path}."
             logger.info(message)
 
-        return {key: dict(value) for key, value in grouped.items()}
+        return _MetaLoadResult(
+            grouped={key: dict(value) for key, value in grouped.items()},
+            clips=clips,
+            fieldnames=fieldnames,
+        )
 
 
 def _iter_videos(root: Path) -> Iterator[Path]:
     if not root.exists():
         raise FileNotFoundError(f"El directorio de videos no existe: {root}")
     yield from root.rglob("*.mp4")
+
+
+def _write_outliers(
+    meta_csv: Path,
+    result: _MetaLoadResult,
+    duration_threshold: Optional[float],
+    delta_threshold: Optional[float],
+) -> Tuple[int, Path]:
+    duration_limit = None if duration_threshold in (None, 0) else duration_threshold
+    delta_limit = None if delta_threshold in (None, 0) else delta_threshold
+
+    outliers: List[Dict[str, object]] = []
+    for clip in result.clips:
+        reasons = []
+        if duration_limit is not None and clip.duration > duration_limit:
+            reasons.append("duration")
+        if delta_limit is not None and clip.delta > delta_limit:
+            reasons.append("delta")
+        if not reasons:
+            continue
+
+        row = dict(clip.row)
+        row["clean_duration"] = f"{clip.duration:.3f}"
+        row["span_seconds"] = f"{clip.span:.3f}"
+        row["duration_delta"] = f"{clip.delta:.3f}"
+        row["outlier_reasons"] = ",".join(reasons)
+        outliers.append(row)
+
+    outlier_path = meta_csv.with_name("meta_outliers.csv")
+    fieldnames = list(result.fieldnames)
+    for extra in ["clean_duration", "span_seconds", "duration_delta", "outlier_reasons"]:
+        if extra not in fieldnames:
+            fieldnames.append(extra)
+
+    try:
+        with outlier_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=";")
+            writer.writeheader()
+            writer.writerows(outliers)
+    except OSError as exc:
+        logger.error(
+            "No se pudo escribir meta_outliers.csv en %s: %s", outlier_path, exc
+        )
+
+    return len(outliers), outlier_path
+
+
+def _summarize_durations(
+    meta_csv: Path,
+    result: _MetaLoadResult,
+    duration_threshold: Optional[float],
+    delta_threshold: Optional[float],
+) -> Tuple[int, Path]:
+    if not result.clips:
+        logger.warning("meta.csv no contiene filas con tiempos completos tras limpiarlo.")
+        return _write_outliers(meta_csv, result, duration_threshold, delta_threshold)
+
+    durations = [clip.duration for clip in result.clips]
+    deltas = [clip.delta for clip in result.clips]
+
+    logger.info(
+        (
+            "Duraciones limpias por clip: total=%d, media=%.2fs, min=%.2fs, "
+            "max=%.2fs, delta_max=%.2fs"
+        ),
+        len(durations),
+        mean(durations),
+        min(durations),
+        max(durations),
+        max(deltas),
+    )
+
+    outlier_count, outlier_path = _write_outliers(
+        meta_csv, result, duration_threshold, delta_threshold
+    )
+
+    duration_msg = (
+        "sin_límite"
+        if duration_threshold in (None, 0)
+        else f">{duration_threshold:.2f}s"
+    )
+    delta_msg = (
+        "sin_límite"
+        if delta_threshold in (None, 0)
+        else f">{delta_threshold:.2f}s"
+    )
+
+    if outlier_count:
+        logger.warning(
+            (
+                "Se detectaron %d clips fuera de rango (duración %s, delta %s). "
+                "Detalle en %s"
+            ),
+            outlier_count,
+            duration_msg,
+            delta_msg,
+            outlier_path,
+        )
+    else:
+        logger.info(
+            "Sin outliers según los umbrales (duración %s, delta %s). Detalle en %s",
+            duration_msg,
+            delta_msg,
+            outlier_path,
+        )
+
+    return outlier_count, outlier_path
 
 
 def _expand_extra(patterns: Sequence[str]) -> List[Path]:
@@ -298,7 +473,22 @@ def _build_queue(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
 
-    meta = _load_meta(args.meta_csv)
+    meta_result = _load_meta(args.meta_csv)
+    outlier_count, outlier_path = _summarize_durations(
+        args.meta_csv, meta_result, args.duration_threshold, args.delta_threshold
+    )
+    if args.fail_on_outliers and outlier_count:
+        logger.error(
+            (
+                "Se encontraron %d clips fuera de los umbrales configurados. "
+                "Revise %s antes de continuar."
+            ),
+            outlier_count,
+            outlier_path,
+        )
+        return 1
+
+    meta = meta_result.grouped
     videos = _collect_videos(args.lsa_root, args.extra_datasets)
     _validate_sources(videos, meta)
 
