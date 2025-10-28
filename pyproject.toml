@@ -29,7 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 media = [
-    "mediapipe>=0.10",
+    "mediapipe>=0.10; python_version < \"3.13\"",
 ]
 metrics = [
     "sacrebleu>=2.3",
