@@ -133,32 +133,50 @@ pip install -r requirements-dev.txt
 ### Configurar entorno en Windows
 
 Sigue estos pasos para habilitar todas las funcionalidades (extras `media`,
-`metrics` y `export`) en Windows:
+`metrics` y `export`) en Windows.
 
-1. Instala **Python 3.12 (64 bits)** desde python.org y marca *Add python.exe to
-   PATH* durante la instalación. MediaPipe solo publica ruedas hasta 3.12.
-2. Instala **Git for Windows** y, si tu entorno no cuenta con compiladores C++,
-   añade *Microsoft C++ Build Tools* con la carga de trabajo *Desktop
-   development with C++* para cubrir dependencias que requieran extensiones.
-3. Instala **PyTorch** siguiendo la guía oficial para Windows, seleccionando la
-   versión (CPU o CUDA) que corresponda a tu GPU:
-   https://pytorch.org/get-started/locally/
-4. Abre PowerShell en la carpeta del repositorio y crea el entorno virtual con
-   `py -3.12`. Si la política de ejecución bloquea la activación, ejecuta
-   `Set-ExecutionPolicy -Scope Process RemoteSigned -Force` en la misma sesión.
+#### Prerrequisitos
+
+1. Instala **Python 3.10 (64 bits)** desde python.org y marca *Add python.exe to
+   PATH* durante la instalación. MediaPipe publica ruedas hasta 3.12; 3.10 es la
+   versión recomendada y totalmente compatible con el resto del pipeline.
+2. Instala **Git for Windows** y habilita `git lfs install` si descargas
+   artefactos pesados desde repositorios del equipo.
+3. Instala **Microsoft C++ Build Tools** con la carga *Desktop development with
+   C++* si tu máquina no cuenta con compiladores; varias dependencias usan
+   extensiones C++.
+4. Elige la distribución de **PyTorch** acorde a tu GPU en
+   https://pytorch.org/get-started/locally/. Ejecuta el comando sugerido en una
+   consola que ya tenga Python 3.10 disponible.
+
+> Consejo: habilita `LongPathsEnabled` o usa rutas cortas (p. ej. `C:\SLT`) para
+> evitar errores de longitud al crear el entorno virtual y los artefactos de
+> entrenamiento.
+
+#### Crear el entorno y aplicar dependencias
+
+Ejecuta PowerShell dentro del repositorio y prepara el entorno virtual. Si la
+política de ejecución bloquea la activación, establece `RemoteSigned` solo para
+la sesión actual.
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.10 -m venv .venv
 Set-ExecutionPolicy -Scope Process RemoteSigned -Force  # Solo si es necesario
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
-El archivo `requirements-dev.txt` instala el paquete en modo editable junto con
-los extras opcionales. Tras la instalación, verifica que `mediapipe` esté
-disponible ejecutando `pip show mediapipe` y comprueba PyTorch con
-`python -c "import torch; print(torch.__version__)"`.
+`requirements-dev.txt` instala el paquete en modo editable e incluye los extras
+necesarios para MediaPipe, métricas y exportaciones. Ejecuta las comprobaciones
+rápidas para confirmar que cada componente quedó disponible:
+
+```powershell
+pip show mediapipe        # Debe listar una versión >=0.10 (solo Python <=3.12)
+pip show sacrebleu        # Extra metrics
+python -c "import onnx"   # Extra export
+python -c "import torch; print(torch.__version__)"
+```
 
 ### Extras opcionales
 
@@ -171,7 +189,8 @@ El paquete define grupos de extras que habilitan funcionalidades específicas:
 | `export` | Exportación ONNX/TorchScript y validación en tiempo real. |
 
 > Nota: el extra `media` depende de MediaPipe, disponible únicamente en Python <=3.12.
-> Usa un entorno con esa versión cuando necesites sus utilidades.
+> Usa un entorno con esa versión (recomendado 3.10 en Windows) cuando necesites sus
+> utilidades.
 
 Instálalos en bloque con `pip install .[media,metrics,export]` en intérpretes
 compatibles o agrega cada uno según tus necesidades. Consulta la sección de
