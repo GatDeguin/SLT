@@ -264,6 +264,10 @@ verificaciones recomendadas tras la instalación.
      --output data/single_signer/processed \
      --metadata meta.csv
    ```
+   También puedes invocar el script con argumentos posicionales
+   (`python tools/extract_rois_v2.py data/single_signer/videos
+   data/single_signer/processed`), y `--output` acepta el alias
+   `--out` para mantener compatibilidad con pipelines previos.
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
    fuese necesario. Las poses se guardan normalizadas en `[0, 1]` dentro del

@@ -765,8 +765,27 @@ def run_bulk(
 
 if __name__ == "__main__":  # pragma: no cover - ejecución manual
     parser = argparse.ArgumentParser(description="Extracción de ROIs (cara/manos/pose)")
-    parser.add_argument("videos_dir", help="Directorio con videos .mp4")
-    parser.add_argument("out_root", help="Directorio destino para los recortes")
+    parser.add_argument(
+        "videos_dir",
+        nargs="?",
+        help="Directorio con videos .mp4 (posicional o --videos)",
+    )
+    parser.add_argument(
+        "out_root",
+        nargs="?",
+        help="Directorio destino para los recortes (posicional o --output)",
+    )
+    parser.add_argument(
+        "--videos",
+        dest="videos_opt",
+        help="Directorio con videos .mp4 (equivalente al posicional videos_dir)",
+    )
+    parser.add_argument(
+        "--output",
+        "--out",
+        dest="out_opt",
+        help="Directorio destino para los recortes (equivalente al posicional out_root)",
+    )
     parser.add_argument("--fps", type=int, default=25, help="FPS de muestreo")
     parser.add_argument(
         "--face-blur",
@@ -789,9 +808,22 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
     )
 
     args = parser.parse_args()
+
+    videos_dir = args.videos_opt or args.videos_dir
+    out_root = args.out_opt or args.out_root
+
+    if args.videos_dir and args.videos_opt and args.videos_dir != args.videos_opt:
+        parser.error("Usa solo uno de los parámetros videos_dir o --videos")
+    if args.out_root and args.out_opt and args.out_root != args.out_opt:
+        parser.error("Usa solo uno de los parámetros out_root o --output/--out")
+    if not videos_dir:
+        parser.error("Debes especificar el directorio de videos (posicional o --videos)")
+    if not out_root:
+        parser.error("Debes especificar el directorio de salida (posicional o --output)")
+
     run_bulk(
-        args.videos_dir,
-        args.out_root,
+        videos_dir,
+        out_root,
         fps_target=args.fps,
         face_blur=args.face_blur,
         resume=args.resume,
