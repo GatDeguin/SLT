@@ -12,7 +12,7 @@ import json
 import os
 import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -417,18 +417,68 @@ def _ensure_mediapipe_available() -> bool:
     return True
 
 
+def _normalise_format(value: str) -> str:
+    fmt = value.lower().strip()
+    if fmt in {"jpg", "jpeg"}:
+        return "jpg"
+    if fmt == "png":
+        return "png"
+    if fmt == "npz":
+        return "npz"
+    raise ValueError("Formato no soportado. Usa 'jpg', 'png' o 'npz'.")
+
+
+def _normalise_streams(selection: Optional[Iterable[str]]) -> Set[str]:
+    mapping = {
+        "face": {"face"},
+        "hands": {"hand_l", "hand_r"},
+        "hand_l": {"hand_l"},
+        "hand-left": {"hand_l"},
+        "left": {"hand_l"},
+        "hand_r": {"hand_r"},
+        "hand-right": {"hand_r"},
+        "right": {"hand_r"},
+        "pose": {"pose"},
+        "all": {"face", "hand_l", "hand_r", "pose"},
+    }
+
+    if selection is None:
+        return {"face", "hand_l", "hand_r", "pose"}
+
+    resolved: Set[str] = set()
+    for item in selection:
+        key = item.lower().strip()
+        if key not in mapping:
+            raise ValueError(f"Stream desconocido: {item}")
+        resolved.update(mapping[key])
+
+    if not resolved:
+        raise ValueError("Debes seleccionar al menos un stream válido")
+
+    return resolved
+
+
 def process_video(
     video_path: str,
-    out_dirs: Dict[str, str],
-    pose_dir: str,
+    out_dirs: Dict[str, Path],
+    pose_dir: Optional[Path],
     fps_target: int = 25,
     face_blur: bool = False,
     fps_limit: Optional[float] = None,
+    streams: Optional[Iterable[str]] = None,
+    image_format: str = "jpg",
 ) -> Dict[str, object]:
     """Procesa un único video y guarda los ROIs correspondientes.
 
     Devuelve un diccionario de metadata con métricas de procesamiento.
     """
+
+    resolved_streams = _normalise_streams(streams)
+    resolved_format = _normalise_format(image_format)
+    export_face = "face" in resolved_streams
+    export_hand_l = "hand_l" in resolved_streams
+    export_hand_r = "hand_r" in resolved_streams
+    export_pose = "pose" in resolved_streams
 
     metadata = {
         "video": Path(video_path).name,
@@ -442,13 +492,17 @@ def process_video(
         "pose_frames": 0,
         "stride": None,
         "face_blur": face_blur,
+        "streams": sorted(resolved_streams),
     }
 
-    metadata["fallbacks"] = {
-        "face": {"pose": 0, "previous": 0, "black": 0},
-        "hand_left": {"pose": 0, "previous": 0, "black": 0},
-        "hand_right": {"pose": 0, "previous": 0, "black": 0},
-    }
+    fallback_template = {"pose": 0, "previous": 0, "black": 0}
+    metadata["fallbacks"] = {}
+    if export_face:
+        metadata["fallbacks"]["face"] = dict(fallback_template)
+    if export_hand_l:
+        metadata["fallbacks"]["hand_left"] = dict(fallback_template)
+    if export_hand_r:
+        metadata["fallbacks"]["hand_right"] = dict(fallback_template)
 
     if not _ensure_mediapipe_available():  # pragma: no cover - dependencias opcionales
         metadata["error"] = "mediapipe-no-disponible"
@@ -467,10 +521,14 @@ def process_video(
 
     try:
         basename = Path(video_path).stem
-        face_out = ensure_dir(out_dirs.get("face", os.path.join(pose_dir, "face")))
-        hand_l_out = ensure_dir(out_dirs.get("hand_l", os.path.join(pose_dir, "hand_l")))
-        hand_r_out = ensure_dir(out_dirs.get("hand_r", os.path.join(pose_dir, "hand_r")))
-        pose_out = ensure_dir(pose_dir)
+        face_out = ensure_dir(out_dirs["face"]) if export_face and "face" in out_dirs else None
+        hand_l_out = (
+            ensure_dir(out_dirs["hand_l"]) if export_hand_l and "hand_l" in out_dirs else None
+        )
+        hand_r_out = (
+            ensure_dir(out_dirs["hand_r"]) if export_hand_r and "hand_r" in out_dirs else None
+        )
+        pose_out = ensure_dir(pose_dir) if export_pose and pose_dir is not None else None
 
         fps = cap.get(cv2.CAP_PROP_FPS) or fps_target
         metadata["fps_source"] = fps
@@ -484,6 +542,11 @@ def process_video(
         prev_face_bbox: Optional[Tuple[int, int, int, int]] = None
         prev_left_bbox: Optional[Tuple[int, int, int, int]] = None
         prev_right_bbox: Optional[Tuple[int, int, int, int]] = None
+
+        face_buffer: List[np.ndarray] = []
+        hand_l_buffer: List[np.ndarray] = []
+        hand_r_buffer: List[np.ndarray] = []
+        image_ext = f".{resolved_format}" if resolved_format in {"jpg", "png"} else ""
 
         with (
             mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh,
@@ -542,7 +605,7 @@ def process_video(
                     width,
                     height,
                 )
-                if face_source != "detected":
+                if export_face and face_source != "detected":
                     metadata["fallbacks"]["face"][face_source] += 1
 
                 if face_bbox is not None and face_bbox[2] > 0 and face_bbox[3] > 0:
@@ -567,7 +630,14 @@ def process_video(
                 else:
                     prev_face_bbox = None
 
-                cv2.imwrite(str(face_out / f"{basename}_f{out_index:06d}.jpg"), face_crop)
+                if export_face and face_out is not None:
+                    if resolved_format == "npz":
+                        face_buffer.append(face_crop)
+                    else:
+                        cv2.imwrite(
+                            str(face_out / f"{basename}_f{out_index:06d}{image_ext}"),
+                            face_crop,
+                        )
 
                 # Manos
                 left_detected: Optional[Tuple[int, int, int, int]] = None
@@ -606,27 +676,46 @@ def process_video(
                     height,
                 )
 
-                if left_source != "detected":
+                if export_hand_l and left_source != "detected":
                     metadata["fallbacks"]["hand_left"][left_source] += 1
-                if right_source != "detected":
+                if export_hand_r and right_source != "detected":
                     metadata["fallbacks"]["hand_right"][right_source] += 1
 
-                if left_bbox is not None:
-                    left_crop = crop_square(frame, *left_bbox, 224)
-                    prev_left_bbox = left_bbox if left_bbox[2] > 0 and left_bbox[3] > 0 else None
+                if export_hand_l:
+                    if left_bbox is not None:
+                        left_crop = crop_square(frame, *left_bbox, 224)
+                        prev_left_bbox = left_bbox if left_bbox[2] > 0 and left_bbox[3] > 0 else None
+                    else:
+                        left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                        prev_left_bbox = None
+                    if hand_l_out is not None:
+                        if resolved_format == "npz":
+                            hand_l_buffer.append(left_crop)
+                        else:
+                            cv2.imwrite(
+                                str(hand_l_out / f"{basename}_f{out_index:06d}{image_ext}"),
+                                left_crop,
+                            )
                 else:
-                    left_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
                     prev_left_bbox = None
 
-                if right_bbox is not None:
-                    right_crop = crop_square(frame, *right_bbox, 224)
-                    prev_right_bbox = right_bbox if right_bbox[2] > 0 and right_bbox[3] > 0 else None
+                if export_hand_r:
+                    if right_bbox is not None:
+                        right_crop = crop_square(frame, *right_bbox, 224)
+                        prev_right_bbox = right_bbox if right_bbox[2] > 0 and right_bbox[3] > 0 else None
+                    else:
+                        right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
+                        prev_right_bbox = None
+                    if hand_r_out is not None:
+                        if resolved_format == "npz":
+                            hand_r_buffer.append(right_crop)
+                        else:
+                            cv2.imwrite(
+                                str(hand_r_out / f"{basename}_f{out_index:06d}{image_ext}"),
+                                right_crop,
+                            )
                 else:
-                    right_crop = np.zeros((224, 224, 3), dtype=frame.dtype)
                     prev_right_bbox = None
-
-                cv2.imwrite(str(hand_l_out / f"{basename}_f{out_index:06d}.jpg"), left_crop)
-                cv2.imwrite(str(hand_r_out / f"{basename}_f{out_index:06d}.jpg"), right_crop)
 
                 # Pose
                 pose_landmarks = getattr(pose_result, "pose_landmarks", None)
@@ -641,22 +730,46 @@ def process_video(
                     pose_vec = prev_pose_norm.copy()
                 else:
                     pose_vec = sentinel_pose(POSE_LANDMARK_COUNT)
-                pose_frames.append(pose_vec.reshape(-1))
+                if export_pose:
+                    pose_frames.append(pose_vec.reshape(-1))
 
                 out_index += 1
                 frame_index += 1
 
         metadata["frames_written"] = out_index
-        metadata["pose_frames"] = len(pose_frames)
+        metadata["pose_frames"] = len(pose_frames) if export_pose else 0
 
         cap.release()
 
-        pose_array = np.asarray(pose_frames, dtype=np.float32)
-        np.savez_compressed(
-            pose_out / f"{basename}.npz",
-            pose=pose_array,
-            pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
-        )
+        if export_pose and pose_out is not None:
+            pose_array = np.asarray(pose_frames, dtype=np.float32)
+            np.savez_compressed(
+                pose_out / f"{basename}.npz",
+                pose=pose_array,
+                pose_norm=np.asarray("signing_space_v1", dtype=np.str_),
+            )
+
+        if export_face and resolved_format == "npz" and face_out is not None:
+            face_array = (
+                np.stack(face_buffer, axis=0)
+                if face_buffer
+                else np.zeros((0, 224, 224, 3), dtype=np.uint8)
+            )
+            np.savez_compressed(face_out / f"{basename}.npz", frames=face_array)
+        if export_hand_l and resolved_format == "npz" and hand_l_out is not None:
+            hand_l_array = (
+                np.stack(hand_l_buffer, axis=0)
+                if hand_l_buffer
+                else np.zeros((0, 224, 224, 3), dtype=np.uint8)
+            )
+            np.savez_compressed(hand_l_out / f"{basename}.npz", frames=hand_l_array)
+        if export_hand_r and resolved_format == "npz" and hand_r_out is not None:
+            hand_r_array = (
+                np.stack(hand_r_buffer, axis=0)
+                if hand_r_buffer
+                else np.zeros((0, 224, 224, 3), dtype=np.uint8)
+            )
+            np.savez_compressed(hand_r_out / f"{basename}.npz", frames=hand_r_array)
         metadata["success"] = True
         return metadata
 
@@ -705,23 +818,32 @@ def run_bulk(
     resume: bool = False,
     metadata_path: Optional[str] = None,
     fps_limit: Optional[float] = None,
+    streams: Optional[Iterable[str]] = None,
+    image_format: str = "jpg",
 ) -> None:
     """Procesa todos los videos *.mp4 en ``videos_dir``."""
 
     if not _ensure_mediapipe_available():  # pragma: no cover - dependencias opcionales
         return
 
+    resolved_streams = _normalise_streams(streams)
+    resolved_format = _normalise_format(image_format)
+
     videos_path = Path(videos_dir)
     if not videos_path.exists():
         warnings.warn(f"Directorio no encontrado: {videos_dir}")
         return
 
-    out_dirs = {
-        "face": str(ensure_dir(Path(out_root) / "face")),
-        "hand_l": str(ensure_dir(Path(out_root) / "hand_l")),
-        "hand_r": str(ensure_dir(Path(out_root) / "hand_r")),
-    }
-    pose_dir = str(ensure_dir(Path(out_root) / "pose"))
+    out_root_path = Path(out_root)
+    out_dirs: Dict[str, Path] = {}
+    if "face" in resolved_streams:
+        out_dirs["face"] = ensure_dir(out_root_path / "face")
+    if "hand_l" in resolved_streams:
+        out_dirs["hand_l"] = ensure_dir(out_root_path / "hand_l")
+    if "hand_r" in resolved_streams:
+        out_dirs["hand_r"] = ensure_dir(out_root_path / "hand_r")
+
+    pose_dir = ensure_dir(out_root_path / "pose") if "pose" in resolved_streams else None
 
     meta_file = _metadata_path(out_root, metadata_path)
     index = _read_metadata_index(meta_file)
@@ -743,6 +865,8 @@ def run_bulk(
             fps_target=fps_target,
             face_blur=face_blur,
             fps_limit=fps_limit,
+            streams=resolved_streams,
+            image_format=resolved_format,
         )
         entry["video"] = video_name
         entry["video_path"] = str(video_path)
@@ -806,6 +930,18 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
         type=float,
         help="FPS máximo leído desde el video original antes de aplicar el muestreo",
     )
+    parser.add_argument(
+        "--format",
+        default="jpg",
+        help="Formato para cara/manos: jpg, png o npz",
+    )
+    parser.add_argument(
+        "--streams",
+        nargs="+",
+        help=(
+            "Streams a exportar (face, hand_l, hand_r, hands, pose, all)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -821,15 +957,20 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
     if not out_root:
         parser.error("Debes especificar el directorio de salida (posicional o --output)")
 
-    run_bulk(
-        videos_dir,
-        out_root,
-        fps_target=args.fps,
-        face_blur=args.face_blur,
-        resume=args.resume,
-        metadata_path=args.metadata,
-        fps_limit=args.fps_limit,
-    )
+    try:
+        run_bulk(
+            videos_dir,
+            out_root,
+            fps_target=args.fps,
+            face_blur=args.face_blur,
+            resume=args.resume,
+            metadata_path=args.metadata,
+            fps_limit=args.fps_limit,
+            streams=args.streams,
+            image_format=args.format,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 POSE_LANDMARK_COUNT = 17
 POSE_SIGNING_WIDTH = 6.0
 POSE_SIGNING_HEIGHT = 7.0

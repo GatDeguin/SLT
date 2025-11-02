@@ -6,6 +6,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
+import pytest
 
 try:  # pragma: no cover - entorno sin dependencias nativas
     import cv2  # type: ignore  # noqa: F401
@@ -129,6 +130,8 @@ except Exception:  # pragma: no cover - fallback de pruebas
     sys.modules["cv2"] = fake_cv2
 
 from tools.extract_rois_v2 import (
+    _normalise_format,
+    _normalise_streams,
     apply_face_partial_grayscale,
     blur_face_preserve_eyes_mouth,
     build_face_keep_mask,
@@ -225,3 +228,17 @@ def test_face_partial_grayscale_preserves_mask_regions() -> None:
     assert np.any(blurred[outside] != gray_patch[outside])
     assert np.all(blurred[outside][:, 0] == blurred[outside][:, 1])
     assert np.all(blurred[outside][:, 1] == blurred[outside][:, 2])
+
+
+def test_normalise_streams_accepts_aliases() -> None:
+    resolved = _normalise_streams(["hands", "face"])
+    assert resolved == {"hand_l", "hand_r", "face"}
+
+
+def test_normalise_format_accepts_jpeg() -> None:
+    assert _normalise_format("JPEG") == "jpg"
+
+
+def test_normalise_streams_raises_on_unknown() -> None:
+    with pytest.raises(ValueError):
+        _normalise_streams(["unknown"])

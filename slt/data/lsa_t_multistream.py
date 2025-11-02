@@ -126,9 +126,9 @@ class LsaTMultiStream(Dataset):
 
     Espera la siguiente estructura de carpetas:
 
-    - ``face/<video_id>_fXXXXXX.jpg``
-    - ``hand_l/<video_id>_fXXXXXX.jpg``
-    - ``hand_r/<video_id>_fXXXXXX.jpg``
+    - ``face/<video_id>_fXXXXXX.jpg`` o ``face/<video_id>.npz`` con ``frames``
+    - ``hand_l/<video_id>_fXXXXXX.jpg`` o ``hand_l/<video_id>.npz``
+    - ``hand_r/<video_id>_fXXXXXX.jpg`` o ``hand_r/<video_id>.npz``
     - ``pose/<video_id>.npz`` con clave ``pose``
 
     Además necesita un CSV con columnas ``video_id`` y ``texto`` (separadas
@@ -202,6 +202,7 @@ class LsaTMultiStream(Dataset):
             symmetric_on_scalar=False,
         )
         self._np = np
+        self._roi_npz_cache: Dict[str, Any] = {}
         self._keypoint_layout: Optional[Dict[str, List[int]]] = None
         self._keypoint_total: int = 0
         self._gloss_sequences: Dict[str, List[str]] = {}
@@ -350,22 +351,77 @@ class LsaTMultiStream(Dataset):
         Image = _get_pil_image()
         np = self._np
 
-        with Image.open(path) as img:
-            img = img.convert("RGB").resize((self.img_size, self.img_size))
-            arr = np.asarray(img, dtype="float32") / 255.0
+        if "::npz::" in path:
+            base, _, index_str = path.partition("::npz::")
+            cache_key = base
+            frames = self._roi_npz_cache.get(cache_key)
+            if frames is None:
+                with np.load(base) as data:
+                    frames = data.get("frames")
+                    if frames is None:
+                        raise ValueError(f"{base} no contiene la clave 'frames'")
+                    frames = np.asarray(frames)
+                if frames.ndim != 4:
+                    raise ValueError(
+                        f"{base} no contiene un tensor (N, H, W, C) válido"
+                    )
+                self._roi_npz_cache[cache_key] = frames
+            idx = int(index_str)
+            if idx < 0 or idx >= frames.shape[0]:
+                raise IndexError(f"Índice {idx} fuera de rango para {base}")
+            frame = frames[idx]
+            arr = frame.astype("float32") / 255.0
+        else:
+            with Image.open(path) as img:
+                img = img.convert("RGB").resize((self.img_size, self.img_size))
+                arr = np.asarray(img, dtype="float32") / 255.0
         arr = arr.transpose(2, 0, 1)
         return torch.from_numpy(arr)
 
     def _list_frames(self, base_dir: str, vid: str) -> List[str]:
         if not os.path.isdir(base_dir):
             return []
+        entries = sorted(os.listdir(base_dir))
         prefix = f"{vid}_f"
         files = [
             os.path.join(base_dir, name)
-            for name in sorted(os.listdir(base_dir))
-            if name.startswith(prefix) and name.endswith(".jpg")
+            for name in entries
+            if name.startswith(prefix)
+            and name.lower().endswith((".jpg", ".png"))
         ]
-        return files
+        if files:
+            return files
+
+        npz_path = os.path.join(base_dir, f"{vid}.npz")
+        if os.path.isfile(npz_path):
+            cache_key = npz_path
+            frames = self._roi_npz_cache.get(cache_key)
+            if frames is None:
+                try:
+                    with self._np.load(npz_path) as data:
+                        frames = data.get("frames")
+                        if frames is None:
+                            raise KeyError("frames")
+                        frames = self._np.asarray(frames)
+                except Exception as exc:  # pragma: no cover - lectura inesperada
+                    warnings.warn(
+                        f"No se pudo leer {npz_path}: {exc}",
+                        stacklevel=2,
+                    )
+                    self._roi_npz_cache.pop(cache_key, None)
+                    return []
+                if frames.ndim != 4:
+                    warnings.warn(
+                        f"{npz_path} no contiene un tensor (N, H, W, C) válido.",
+                        stacklevel=2,
+                    )
+                    self._roi_npz_cache.pop(cache_key, None)
+                    return []
+                self._roi_npz_cache[cache_key] = frames
+            count = int(frames.shape[0]) if hasattr(frames, "shape") else 0
+            return [f"{npz_path}::npz::{idx}" for idx in range(max(count, 0))]
+
+        return []
 
     def _sample_indices(self, T0: int) -> List[int]:
         """Devuelve índices equiespaciados para muestrear ``T0`` frames."""
