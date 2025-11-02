@@ -268,6 +268,10 @@ verificaciones recomendadas tras la instalación.
    (`python tools/extract_rois_v2.py data/single_signer/videos
    data/single_signer/processed`), y `--output` acepta el alias
    `--out` para mantener compatibilidad con pipelines previos.
+   Activa `--streams` para seleccionar vistas específicas (por ejemplo
+   `--streams pose` o `--streams face hands`) y `--format npz` cuando
+   prefieras tensores comprimidos por video en lugar de imágenes por
+   frame.
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
    fuese necesario. Las poses se guardan normalizadas en `[0, 1]` dentro del

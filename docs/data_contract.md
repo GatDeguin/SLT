@@ -35,7 +35,9 @@ Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
 - `videos/`: clips originales en MP4/MKV; sólo se consumen durante la extracción
   de ROIs.
 - `processed/face/`, `processed/hand_l/`, `processed/hand_r/`: recortes en JPEG
-  con patrón `<video_id>_fXXXXXX.jpg`, normalizados a RGB.
+  con patrón `<video_id>_fXXXXXX.jpg`, normalizados a RGB. Alternativamente
+  pueden almacenarse como `.npz` comprimidos por video (`<video_id>.npz`) con la
+  clave `frames` y forma `(T, 224, 224, 3)` en `uint8`.
 - `processed/pose/`: archivos `.npz` con un arreglo `pose` de forma
   `(T, 3 * landmarks)` en `float32` y la clave `pose_norm="signing_space_v1"`.
   Las coordenadas `(x, y)` se normalizan al *signing space* (ancho de 6 y alto
@@ -189,11 +191,15 @@ Los resultados se almacenan en `quality` para auditoría posterior.
 video. Cada objeto JSON incluye:
 
 - `video_id`: identificador del clip procesado.
-- `frames_written`: cantidad de frames escritos por stream (`face`, `hand_l`,
-  `hand_r`, `pose`).
-- `duration`: duración estimada según timestamps del detector.
-- `fps_observed`: tasa derivada de `frames_written / duration`.
-- `status`: `"ok"` o detalles del error ocurrido durante la extracción.
+- `streams`: lista de streams exportados (`face`, `hand_l`, `hand_r`, `pose`).
+- `frames_written`: cantidad total de frames escritos tras aplicar el muestreo.
+- `pose_frames`: frames disponibles en el stream de pose (0 si se omitió).
+- `fps_source` y `fps_target`: FPS observados y configurados en la ejecución.
+- `stride`: salto aplicado al video original.
+- `fallbacks`: contadores por stream para detecciones resueltas por `pose`,
+  `previous` o `black` (solo se incluyen los streams solicitados).
+- `success` / `error`: bandera final y descripción del error cuando falla el
+  procesamiento.
 
 Guarda este archivo junto a los recortes para facilitar reintentos con
 `--resume` y comparar métricas entre ejecuciones.
