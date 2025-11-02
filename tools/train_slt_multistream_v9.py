@@ -43,6 +43,7 @@ from slt.training.models import MultiStreamClassifier
 from slt.training.optim import create_optimizer, create_scheduler
 from slt.utils.cli import parse_range_pair, parse_translation_range
 from slt.utils.general import set_seed
+from slt.utils.inspection import filter_kwargs
 from slt.utils.text import create_tokenizer
 
 
@@ -1516,12 +1517,13 @@ def main() -> None:
     tokenizer_source = data_config.tokenizer or model_config.decoder_model
     if tokenizer_source is None:
         raise ValueError("Tokenizer source could not be resolved.")
-    tokenizer = create_tokenizer(
-        tokenizer_source,
-        local_files_only=data_config.tokenizer_local_files_only,
-        local_paths=(data_config.tokenizer_search_paths or None),
-        env_var_paths=(data_config.tokenizer_path_env_vars or None),
-    )
+    tokenizer_options = {
+        "local_files_only": data_config.tokenizer_local_files_only,
+        "local_paths": data_config.tokenizer_search_paths or None,
+        "env_var_paths": data_config.tokenizer_path_env_vars or None,
+    }
+    tokenizer_kwargs = filter_kwargs(create_tokenizer, tokenizer_options)
+    tokenizer = create_tokenizer(tokenizer_source, **tokenizer_kwargs)
 
     train_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),

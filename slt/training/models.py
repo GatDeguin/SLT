@@ -21,6 +21,7 @@ from slt.models import (
 )
 from slt.models.mska import MSKAEncoder
 from slt.models.single_signer import load_single_signer_components
+from slt.utils.inspection import filter_kwargs
 
 from .configuration import ModelConfig
 
@@ -366,13 +367,14 @@ class MultiStreamClassifier(nn.Module):
         )
         decoder_input_ids = extra_inputs.pop("decoder_input_ids", None)
 
-        decoder_output = self.decoder(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            labels=labels,
-            decoder_attention_mask=decoder_attention_mask,
-            decoder_input_ids=decoder_input_ids,
-        )
+        decoder_kwargs = {
+            "encoder_attention_mask": encoder_attention_mask,
+            "labels": labels,
+            "decoder_attention_mask": decoder_attention_mask,
+            "decoder_input_ids": decoder_input_ids,
+        }
+        filtered_decoder_kwargs = filter_kwargs(self.decoder.forward, decoder_kwargs)
+        decoder_output = self.decoder(encoded, **filtered_decoder_kwargs)
         auxiliary = None
         if self._mska_enabled and self.encoder.mska_encoder is not None:
             mska_output = self.encoder.last_mska_output

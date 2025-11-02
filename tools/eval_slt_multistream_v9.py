@@ -22,6 +22,7 @@ from slt.training.configuration import ModelConfig
 from slt.training.loops import ctc_beam_search
 from slt.training.models import MultiStreamClassifier as _TrainingMultiStreamClassifier
 from slt.utils.cli import parse_range_pair, parse_translation_range
+from slt.utils.inspection import filter_kwargs
 from slt.utils.text import (
     TokenizerValidationError,
     character_error_rate,
@@ -818,31 +819,28 @@ def _predict(
 
 
 def _write_csv(path: Path, rows: Iterable[PredictionItem]) -> None:
+    items = list(rows)
+    include_gloss = any(item.gloss_prediction is not None for item in items)
+    header = ["video_id", "prediction", "reference", "latency_ms"]
+    if include_gloss:
+        header.extend(["gloss_prediction", "gloss_reference"])
+
     temp_file = None
-    with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)) as tmp:
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=str(path.parent),
+    ) as tmp:
         writer = csv.writer(tmp)
-        writer.writerow(
-            [
-                "video_id",
-                "prediction",
-                "reference",
-                "latency_ms",
-                "gloss_prediction",
-                "gloss_reference",
-            ]
-        )
-        for row in rows:
-            latency = "" if row.latency_ms is None else f"{row.latency_ms:.6f}"
-            writer.writerow(
-                [
-                    row.video_id,
-                    row.prediction,
-                    row.reference,
-                    latency,
-                    row.gloss_prediction or "",
-                    row.gloss_reference or "",
-                ]
-            )
+        writer.writerow(header)
+        for item in items:
+            latency = "" if item.latency_ms is None else f"{item.latency_ms:.6f}"
+            row = [item.video_id, item.prediction, item.reference, latency]
+            if include_gloss:
+                row.extend([item.gloss_prediction or "", item.gloss_reference or ""])
+            writer.writerow(row)
         temp_file = Path(tmp.name)
     if temp_file is None:
         raise RuntimeError("No se pudo escribir el archivo temporal de predicciones")
@@ -1039,12 +1037,13 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     _validate_inputs(args)
     device = _select_device(args.device)
 
-    tokenizer = create_tokenizer(
-        args.tokenizer,
-        local_files_only=args.tokenizer_local_files_only,
-        local_paths=args.tokenizer_search_paths,
-        env_var_paths=args.tokenizer_path_env_vars,
-    )
+    tokenizer_options = {
+        "local_files_only": args.tokenizer_local_files_only,
+        "local_paths": args.tokenizer_search_paths,
+        "env_var_paths": args.tokenizer_path_env_vars,
+    }
+    tokenizer_kwargs = filter_kwargs(create_tokenizer, tokenizer_options)
+    tokenizer = create_tokenizer(args.tokenizer, **tokenizer_kwargs)
     if hasattr(tokenizer, "encode"):
         try:
             validate_tokenizer(tokenizer, allow_empty_decode=True)
@@ -1059,7 +1058,8 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
         logging.info("Evaluando checkpoint %s", checkpoint_path)
         model = _build_model(args, tokenizer).to(device)
         _load_checkpoint(model, checkpoint_path, device)
-        mska_available = getattr(model.encoder, "mska_encoder", None) is not None
+        encoder = getattr(model, "encoder", None)
+        mska_available = getattr(encoder, "mska_encoder", None) is not None
         if args.report_gloss_wer and not mska_available:
             logging.warning(
                 "MSKA está deshabilitado en el checkpoint %s, se omiten métricas de glosa",
