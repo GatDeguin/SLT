@@ -243,14 +243,14 @@ def test_normalise_format_accepts_jpeg() -> None:
 
 def test_resolve_delegate_models_uses_mediapipe_defaults(tmp_path, monkeypatch) -> None:
     package_root = tmp_path / "mediapipe_pkg"
-    (package_root / "modules" / "face_landmark").mkdir(parents=True)
-    (package_root / "modules" / "hand_landmark").mkdir(parents=True)
-    (package_root / "modules" / "pose_landmark").mkdir(parents=True)
+    (package_root / "modules" / "face_landmarker").mkdir(parents=True)
+    (package_root / "modules" / "hand_landmarker").mkdir(parents=True)
+    (package_root / "modules" / "pose_landmarker").mkdir(parents=True)
 
     for relative in (
-        ("modules", "face_landmark", "face_landmarker.task"),
-        ("modules", "hand_landmark", "hand_landmarker.task"),
-        ("modules", "pose_landmark", "pose_landmarker_full.task"),
+        ("modules", "face_landmarker", "face_landmarker.task"),
+        ("modules", "hand_landmarker", "hand_landmarker.task"),
+        ("modules", "pose_landmarker", "pose_landmarker_full.task"),
     ):
         target = package_root.joinpath(*relative)
         target.write_bytes(b"")
@@ -268,9 +268,9 @@ def test_resolve_delegate_models_uses_mediapipe_defaults(tmp_path, monkeypatch) 
         None,
     )
 
-    expected_face = package_root / "modules" / "face_landmark" / "face_landmarker.task"
-    expected_hand = package_root / "modules" / "hand_landmark" / "hand_landmarker.task"
-    expected_pose = package_root / "modules" / "pose_landmark" / "pose_landmarker_full.task"
+    expected_face = package_root / "modules" / "face_landmarker" / "face_landmarker.task"
+    expected_hand = package_root / "modules" / "hand_landmarker" / "hand_landmarker.task"
+    expected_pose = package_root / "modules" / "pose_landmarker" / "pose_landmarker_full.task"
 
     assert face_model == str(expected_face)
     assert hand_model == str(expected_hand)
