@@ -264,6 +264,11 @@ verificaciones recomendadas tras la instalación.
      --output data/single_signer/processed \
      --metadata meta.csv
    ```
+   > Nota: el parámetro `--output` (o su alias `--out`) debe apuntar siempre al
+   > directorio raíz de ROIs, por ejemplo `data/single_signer/processed`. El
+   > script creará allí las carpetas `face/`, `hand_l/`, `hand_r/` y `pose/`.
+   > No lo mezcles con `processed/keypoints/`, que está reservado para los
+   > keypoints exportados en el paso siguiente.
    También puedes invocar el script con argumentos posicionales
    (`python tools/extract_rois_v2.py data/single_signer/videos
    data/single_signer/processed`), y `--output` acepta el alias
