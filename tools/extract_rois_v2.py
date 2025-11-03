@@ -66,6 +66,16 @@ _TASK_DEFAULTS = {
 }
 
 
+_MP_LOG_LEVELS = {
+    "info": 0,
+    "warning": 1,
+    "error": 2,
+    "fatal": 3,
+}
+_DEFAULT_MP_LOG_LEVEL = "error"
+_configured_mp_log_level: Optional[str] = None
+
+
 def _ensure_uint8(array: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(array), 0, 255).astype(np.uint8)
 
@@ -474,6 +484,34 @@ def blur_face_preserve_eyes_mouth(patch: np.ndarray, mask: np.ndarray) -> np.nda
     return _add_images(kept, blurred_rest)
 
 
+def _configure_mediapipe_logging(level: str) -> None:
+    global _configured_mp_log_level
+
+    resolved = level.strip().lower()
+    if resolved not in _MP_LOG_LEVELS:
+        raise ValueError(
+            "Nivel de log de MediaPipe no soportado. Usa info, warning, error o fatal."
+        )
+
+    if _configured_mp_log_level == resolved:
+        return
+
+    level_value = str(_MP_LOG_LEVELS[resolved])
+    os.environ["GLOG_minloglevel"] = level_value
+    os.environ["ABSL_MIN_LOG_LEVEL"] = level_value
+
+    try:  # pragma: no cover - dependencias opcionales
+        from absl import logging as absl_logging
+    except Exception:  # pragma: no cover - dependencias opcionales
+        pass
+    else:
+        verbosity = _MP_LOG_LEVELS[resolved]
+        absl_logging.set_stderrthreshold(verbosity)
+        absl_logging.set_verbosity(verbosity)
+
+    _configured_mp_log_level = resolved
+
+
 def _ensure_mediapipe_available() -> bool:
     if mp is None:  # pragma: no cover - dependencias opcionales
         warnings.warn(_MP_WARNING)
@@ -765,6 +803,7 @@ def process_video(
     face_model: Optional[str] = None,
     hand_model: Optional[str] = None,
     pose_model: Optional[str] = None,
+    mp_log_level: str = _DEFAULT_MP_LOG_LEVEL,
 ) -> Dict[str, object]:
     """Procesa un único video y guarda los ROIs correspondientes.
 
@@ -785,6 +824,8 @@ def process_video(
     export_hand_r = "hand_r" in resolved_streams
     export_pose = "pose" in resolved_streams
 
+    _configure_mediapipe_logging(mp_log_level)
+
     metadata = {
         "video": Path(video_path).name,
         "video_path": video_path,
@@ -799,6 +840,7 @@ def process_video(
         "face_blur": face_blur,
         "streams": sorted(resolved_streams),
         "delegate": resolved_delegate,
+        "mp_log_level": mp_log_level,
     }
 
     fallback_template = {"pose": 0, "previous": 0, "black": 0}
@@ -1139,8 +1181,11 @@ def run_bulk(
     face_model: Optional[str] = None,
     hand_model: Optional[str] = None,
     pose_model: Optional[str] = None,
+    mp_log_level: str = _DEFAULT_MP_LOG_LEVEL,
 ) -> None:
     """Procesa todos los videos *.mp4 en ``videos_dir``."""
+
+    _configure_mediapipe_logging(mp_log_level)
 
     if not _ensure_mediapipe_available():  # pragma: no cover - dependencias opcionales
         return
@@ -1197,6 +1242,7 @@ def run_bulk(
             face_model=face_model,
             hand_model=hand_model,
             pose_model=pose_model,
+            mp_log_level=mp_log_level,
         )
         entry["video"] = video_name
         entry["video_path"] = str(video_path)
@@ -1380,6 +1426,12 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
         help="Delegate de MediaPipe a utilizar (cpu o gpu).",
     )
     parser.add_argument(
+        "--mp-log-level",
+        choices=sorted(_MP_LOG_LEVELS.keys()),
+        default=_DEFAULT_MP_LOG_LEVEL,
+        help="Nivel mínimo para los logs de MediaPipe (info, warning, error o fatal).",
+    )
+    parser.add_argument(
         "--face-model",
         help=(
             "Ruta al modelo .task para FaceLandmarker. "
@@ -1430,6 +1482,7 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
             face_model=args.face_model,
             hand_model=args.hand_model,
             pose_model=args.pose_model,
+            mp_log_level=args.mp_log_level,
         )
     except ValueError as exc:
         parser.error(str(exc))
