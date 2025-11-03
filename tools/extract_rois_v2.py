@@ -60,9 +60,9 @@ _DELEGATE_GPU = "gpu"
 
 
 _TASK_DEFAULTS = {
-    "--face-model": Path("modules/face_landmark/face_landmarker.task"),
-    "--hand-model": Path("modules/hand_landmark/hand_landmarker.task"),
-    "--pose-model": Path("modules/pose_landmark/pose_landmarker_full.task"),
+    "--face-model": Path("modules/face_landmarker/face_landmarker.task"),
+    "--hand-model": Path("modules/hand_landmarker/hand_landmarker.task"),
+    "--pose-model": Path("modules/pose_landmarker/pose_landmarker_full.task"),
 }
 
 
