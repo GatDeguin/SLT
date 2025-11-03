@@ -3,6 +3,7 @@ from __future__ import annotations
 """Tests for face fallback and preprocessing helpers in extract_rois_v2."""
 
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -16,6 +17,7 @@ except Exception:  # pragma: no cover - fallback de pruebas
     fake_cv2.COLOR_BGR2GRAY = 0
     fake_cv2.COLOR_GRAY2BGR = 1
     fake_cv2.COLOR_BGR2RGB = 2
+    fake_cv2.INTER_LINEAR = 1
 
     def _ensure_uint8(arr: np.ndarray) -> np.ndarray:
         return np.clip(arr, 0, 255).astype(np.uint8)
@@ -137,6 +139,11 @@ from tools.extract_rois_v2 import (
     apply_face_partial_grayscale,
     blur_face_preserve_eyes_mouth,
     build_face_keep_mask,
+    KEYPOINT_BODY_LANDMARKS,
+    KEYPOINT_FACE_LANDMARKS,
+    KEYPOINT_HAND_LANDMARKS,
+    KEYPOINT_LAYOUT_NAME,
+    KEYPOINT_TOTAL_LANDMARKS,
     resolve_face_bbox,
 )
 
@@ -230,6 +237,150 @@ def test_face_partial_grayscale_preserves_mask_regions() -> None:
     assert np.any(blurred[outside] != gray_patch[outside])
     assert np.all(blurred[outside][:, 0] == blurred[outside][:, 1])
     assert np.all(blurred[outside][:, 1] == blurred[outside][:, 2])
+
+
+@pytest.mark.parametrize("keypoints_format", ["npz", "npy"])
+def test_process_video_exports_keypoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keypoints_format: str
+) -> None:
+    frames = [np.full((8, 8, 3), 32, dtype=np.uint8), np.full((8, 8, 3), 48, dtype=np.uint8)]
+
+    class _VideoCaptureStub:
+        def __init__(self, *_: object, **__: object) -> None:
+            self._frames = [frame.copy() for frame in frames]
+            self._index = 0
+
+        def isOpened(self) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, np.ndarray]:
+            if self._index < len(self._frames):
+                frame = self._frames[self._index]
+                self._index += 1
+                return True, frame.copy()
+            return False, np.empty((0, 0, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            return None
+
+        def get(self, *_: object) -> float:
+            return 25.0
+
+    monkeypatch.setattr(extract_rois_v2.cv2, "VideoCapture", _VideoCaptureStub)
+    monkeypatch.setattr(extract_rois_v2, "_ensure_mediapipe_available", lambda: True)
+
+    def _landmarks(count: int, base_x: float, base_y: float, conf: float) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(x=base_x + idx * 0.001, y=base_y + idx * 0.001, visibility=conf)
+            for idx in range(count)
+        ]
+
+    face_landmarks = SimpleNamespace(
+        landmark=_landmarks(KEYPOINT_FACE_LANDMARKS + 5, 0.3, 0.4, 0.0)
+    )
+    left_landmarks = SimpleNamespace(landmark=_landmarks(KEYPOINT_HAND_LANDMARKS, 0.6, 0.2, 0.0))
+    right_landmarks = SimpleNamespace(landmark=_landmarks(KEYPOINT_HAND_LANDMARKS, 0.8, 0.2, 0.0))
+    pose_landmarks = SimpleNamespace(
+        landmark=_landmarks(KEYPOINT_BODY_LANDMARKS, 0.1, 0.2, 0.8)
+    )
+
+    frame_results = [
+        (
+            SimpleNamespace(multi_face_landmarks=[face_landmarks]),
+            SimpleNamespace(
+                multi_hand_landmarks=[left_landmarks, right_landmarks],
+                multi_handedness=[
+                    SimpleNamespace(classification=[SimpleNamespace(label="Left")]),
+                    SimpleNamespace(classification=[SimpleNamespace(label="Right")]),
+                ],
+            ),
+            SimpleNamespace(pose_landmarks=pose_landmarks),
+        ),
+        (
+            SimpleNamespace(multi_face_landmarks=[]),
+            SimpleNamespace(multi_hand_landmarks=[], multi_handedness=[]),
+            SimpleNamespace(pose_landmarks=None),
+        ),
+    ]
+
+    class _PipelineStub:
+        def __init__(self) -> None:
+            self._index = 0
+
+        def __enter__(self) -> "_PipelineStub":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self.close()
+
+        def close(self) -> None:
+            return None
+
+        def process(
+            self, _: np.ndarray
+        ) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+            result = frame_results[min(self._index, len(frame_results) - 1)]
+            self._index += 1
+            return result
+
+    monkeypatch.setattr(extract_rois_v2, "_create_pipeline", lambda *args, **kwargs: _PipelineStub())
+
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"")
+
+    metadata = extract_rois_v2.process_video(
+        str(video_path),
+        {},
+        tmp_path / "pose",
+        tmp_path / "keypoints",
+        fps_target=25,
+        streams={"pose"},
+        export_keypoints=True,
+        keypoints_format=keypoints_format,
+    )
+
+    assert metadata["success"] is True
+    assert metadata["keypoints_frames"] == 2
+    assert metadata["keypoints_format"] == keypoints_format
+    keypoints_file = tmp_path / "keypoints" / f"{video_path.stem}.{keypoints_format}"
+    assert keypoints_file.exists()
+
+    if keypoints_format == "npz":
+        loaded = np.load(keypoints_file)
+        keypoints = loaded["keypoints"]
+        assert loaded["layout"].item() == KEYPOINT_LAYOUT_NAME
+    else:
+        keypoints = np.load(keypoints_file)
+
+    assert keypoints.shape == (2, KEYPOINT_TOTAL_LANDMARKS, 3)
+
+    body_end = KEYPOINT_BODY_LANDMARKS
+    face_end = body_end + KEYPOINT_FACE_LANDMARKS
+    hand_l_end = face_end + KEYPOINT_HAND_LANDMARKS
+
+    body_section = keypoints[0, :body_end]
+    np.testing.assert_allclose(body_section[:3, 0], [0.1, 0.101, 0.102], atol=1e-6)
+    np.testing.assert_allclose(body_section[:3, 1], [0.2, 0.201, 0.202], atol=1e-6)
+    assert np.all(body_section[:, 2] > 0.7)
+
+    face_section = keypoints[0, body_end:face_end]
+    np.testing.assert_allclose(face_section[0, :2], [0.3, 0.4], atol=1e-6)
+    np.testing.assert_allclose(
+        face_section[-1, :2],
+        [
+            0.3 + (KEYPOINT_FACE_LANDMARKS - 1) * 0.001,
+            0.4 + (KEYPOINT_FACE_LANDMARKS - 1) * 0.001,
+        ],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(face_section[:, 2], 1.0, atol=1e-6)
+
+    left_section = keypoints[0, face_end:hand_l_end]
+    right_section = keypoints[0, hand_l_end : hand_l_end + KEYPOINT_HAND_LANDMARKS]
+    np.testing.assert_allclose(left_section[:, 2], 1.0, atol=1e-6)
+    np.testing.assert_allclose(right_section[:, 2], 1.0, atol=1e-6)
+
+    assert not keypoints[1].any()
 
 
 def test_normalise_streams_accepts_aliases() -> None:

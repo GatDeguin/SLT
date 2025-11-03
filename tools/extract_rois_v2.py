@@ -77,6 +77,15 @@ _DEFAULT_MP_LOG_LEVEL = "error"
 _configured_mp_log_level: Optional[str] = None
 
 
+KEYPOINT_BODY_LANDMARKS = 33
+KEYPOINT_FACE_LANDMARKS = 468
+KEYPOINT_HAND_LANDMARKS = 21
+KEYPOINT_TOTAL_LANDMARKS = (
+    KEYPOINT_BODY_LANDMARKS + KEYPOINT_FACE_LANDMARKS + 2 * KEYPOINT_HAND_LANDMARKS
+)
+KEYPOINT_LAYOUT_NAME = "mediapipe_holistic_v1"
+
+
 def _ensure_uint8(array: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(array), 0, 255).astype(np.uint8)
 
@@ -531,6 +540,13 @@ def _normalise_format(value: str) -> str:
     raise ValueError("Formato no soportado. Usa 'jpg', 'png' o 'npz'.")
 
 
+def _normalise_keypoints_format(value: str) -> str:
+    fmt = value.lower().strip()
+    if fmt in {"npz", "npy"}:
+        return fmt
+    raise ValueError("Formato de keypoints no soportado. Usa 'npz' o 'npy'.")
+
+
 def _normalise_streams(selection: Optional[Iterable[str]]) -> Set[str]:
     mapping = {
         "face": {"face"},
@@ -795,6 +811,7 @@ def process_video(
     video_path: str,
     out_dirs: Dict[str, Path],
     pose_dir: Optional[Path],
+    keypoints_dir: Optional[Path] = None,
     fps_target: int = 25,
     face_blur: bool = False,
     fps_limit: Optional[float] = None,
@@ -805,6 +822,8 @@ def process_video(
     hand_model: Optional[str] = None,
     pose_model: Optional[str] = None,
     mp_log_level: str = _DEFAULT_MP_LOG_LEVEL,
+    export_keypoints: bool = False,
+    keypoints_format: str = "npz",
 ) -> Dict[str, object]:
     """Procesa un único video y guarda los ROIs correspondientes.
 
@@ -813,6 +832,7 @@ def process_video(
 
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
+    resolved_keypoints_format = _normalise_keypoints_format(keypoints_format)
     resolved_delegate = _normalise_delegate(delegate)
     face_model, hand_model, pose_model = _resolve_delegate_models(
         resolved_delegate,
@@ -837,11 +857,14 @@ def process_video(
         "fps_limit": fps_limit,
         "frames_written": 0,
         "pose_frames": 0,
+        "keypoints_frames": 0,
         "stride": None,
         "face_blur": face_blur,
         "streams": sorted(resolved_streams),
         "delegate": resolved_delegate,
         "mp_log_level": mp_log_level,
+        "keypoints_format": resolved_keypoints_format if export_keypoints else None,
+        "keypoints_layout": KEYPOINT_LAYOUT_NAME if export_keypoints else None,
     }
 
     fallback_template = {"pose": 0, "previous": 0, "black": 0}
@@ -887,6 +910,9 @@ def process_video(
             ensure_dir(out_dirs["hand_r"]) if export_hand_r and "hand_r" in out_dirs else None
         )
         pose_out = ensure_dir(pose_dir) if export_pose and pose_dir is not None else None
+        keypoints_out = (
+            ensure_dir(keypoints_dir) if export_keypoints and keypoints_dir is not None else None
+        )
 
         fps = cap.get(cv2.CAP_PROP_FPS) or fps_target
         metadata["fps_source"] = fps
@@ -904,6 +930,7 @@ def process_video(
         face_buffer: List[np.ndarray] = []
         hand_l_buffer: List[np.ndarray] = []
         hand_r_buffer: List[np.ndarray] = []
+        keypoints_buffer: List[np.ndarray] = []
         image_ext = f".{resolved_format}" if resolved_format in {"jpg", "png"} else ""
 
         with pipeline as detectors:
@@ -1069,6 +1096,35 @@ def process_video(
                 else:
                     prev_right_bbox = None
 
+                if export_keypoints:
+                    left_landmarks_obj, right_landmarks_obj = _resolve_hands_landmarks(
+                        hands_result
+                    )
+                    body_arr = _landmark_list_to_array(
+                        pose_landmarks,
+                        KEYPOINT_BODY_LANDMARKS,
+                        default_confidence=0.0,
+                    )
+                    face_arr = _landmark_list_to_array(
+                        face_landmarks,
+                        KEYPOINT_FACE_LANDMARKS,
+                        default_confidence=1.0,
+                    )
+                    left_arr = _landmark_list_to_array(
+                        left_landmarks_obj,
+                        KEYPOINT_HAND_LANDMARKS,
+                        default_confidence=1.0,
+                    )
+                    right_arr = _landmark_list_to_array(
+                        right_landmarks_obj,
+                        KEYPOINT_HAND_LANDMARKS,
+                        default_confidence=1.0,
+                    )
+                    frame_keypoints = np.concatenate(
+                        [body_arr, face_arr, left_arr, right_arr], axis=0
+                    )
+                    keypoints_buffer.append(frame_keypoints)
+
                 # Pose
                 pose_landmarks = getattr(pose_result, "pose_landmarks", None)
                 pose_vec: Optional[np.ndarray] = None
@@ -1123,6 +1179,22 @@ def process_video(
                 else np.zeros((0, 224, 224, 3), dtype=np.uint8)
             )
             np.savez_compressed(hand_r_out / f"{basename}.npz", frames=hand_r_array)
+        if export_keypoints and keypoints_out is not None:
+            keypoints_array = (
+                np.stack(keypoints_buffer, axis=0)
+                if keypoints_buffer
+                else np.zeros((0, KEYPOINT_TOTAL_LANDMARKS, 3), dtype=np.float32)
+            )
+            keypoints_path = keypoints_out / f"{basename}.{resolved_keypoints_format}"
+            if resolved_keypoints_format == "npz":
+                np.savez_compressed(
+                    keypoints_path,
+                    keypoints=keypoints_array,
+                    layout=np.asarray(KEYPOINT_LAYOUT_NAME, dtype=np.str_),
+                )
+            else:
+                np.save(keypoints_path, keypoints_array)
+            metadata["keypoints_frames"] = keypoints_array.shape[0]
         metadata["success"] = True
         return metadata
 
@@ -1183,6 +1255,9 @@ def run_bulk(
     hand_model: Optional[str] = None,
     pose_model: Optional[str] = None,
     mp_log_level: str = _DEFAULT_MP_LOG_LEVEL,
+    export_keypoints: bool = False,
+    keypoints_output: Optional[str] = None,
+    keypoints_format: str = "npz",
 ) -> None:
     """Procesa todos los videos *.mp4 en ``videos_dir``."""
 
@@ -1194,6 +1269,7 @@ def run_bulk(
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
     resolved_delegate = _normalise_delegate(delegate)
+    resolved_keypoints_format = _normalise_keypoints_format(keypoints_format)
     face_model, hand_model, pose_model = _resolve_delegate_models(
         resolved_delegate,
         face_model,
@@ -1216,6 +1292,10 @@ def run_bulk(
         out_dirs["hand_r"] = ensure_dir(out_root_path / "hand_r")
 
     pose_dir = ensure_dir(out_root_path / "pose") if "pose" in resolved_streams else None
+    keypoints_dir: Optional[Path] = None
+    if export_keypoints:
+        base_dir = Path(keypoints_output) if keypoints_output else out_root_path / "keypoints"
+        keypoints_dir = ensure_dir(base_dir)
 
     meta_file = _metadata_path(out_root, metadata_path)
     index = _read_metadata_index(meta_file)
@@ -1234,6 +1314,7 @@ def run_bulk(
             str(video_path),
             out_dirs,
             pose_dir,
+            keypoints_dir,
             fps_target=fps_target,
             face_blur=face_blur,
             fps_limit=fps_limit,
@@ -1244,6 +1325,8 @@ def run_bulk(
             hand_model=hand_model,
             pose_model=pose_model,
             mp_log_level=mp_log_level,
+            export_keypoints=export_keypoints,
+            keypoints_format=resolved_keypoints_format,
         )
         entry["video"] = video_name
         entry["video_path"] = str(video_path)
@@ -1298,6 +1381,67 @@ def _build_pose_array(
         arr[idx, 1] = _as_float32(getattr(landmark, "y", 0.0))
         arr[idx, 2] = _as_float32(getattr(landmark, "visibility", 0.0))
     return arr
+
+
+def _landmark_list_to_array(
+    landmarks: Optional[object],
+    expected_count: int,
+    *,
+    default_confidence: float = 0.0,
+) -> np.ndarray:
+    """Convierte una lista de landmarks en ``(N, 3)`` con ``(x, y, conf)``."""
+
+    arr = np.zeros((expected_count, 3), dtype=np.float32)
+    if landmarks is None:
+        return arr
+
+    iterator = getattr(landmarks, "landmark", None)
+    if iterator is None:
+        return arr
+
+    for idx, landmark in enumerate(iterator):
+        if idx >= expected_count:
+            break
+        arr[idx, 0] = _as_float32(getattr(landmark, "x", 0.0))
+        arr[idx, 1] = _as_float32(getattr(landmark, "y", 0.0))
+        raw_conf = getattr(landmark, "visibility", None)
+        if raw_conf is None:
+            conf = default_confidence
+        else:
+            try:
+                conf = float(raw_conf)
+            except (TypeError, ValueError):
+                conf = default_confidence
+        if not np.isfinite(conf) or conf <= 0.0:
+            conf = default_confidence
+        arr[idx, 2] = _as_float32(conf)
+    return arr
+
+
+def _resolve_hands_landmarks(
+    hands_result: object,
+) -> Tuple[Optional[object], Optional[object]]:
+    """Devuelve los landmarks detectados para la mano izquierda y derecha."""
+
+    left_landmarks: Optional[object] = None
+    right_landmarks: Optional[object] = None
+
+    multi_landmarks = getattr(hands_result, "multi_hand_landmarks", None)
+    multi_handedness = getattr(hands_result, "multi_handedness", None)
+    if not multi_landmarks or not multi_handedness:
+        return None, None
+
+    for landmarks, handedness in zip(multi_landmarks, multi_handedness):
+        classifications = getattr(handedness, "classification", None)
+        if not classifications:
+            continue
+        label = str(getattr(classifications[0], "label", "")).lower()
+        if label.startswith("left"):
+            left_landmarks = landmarks
+        else:
+            right_landmarks = landmarks
+
+    return left_landmarks, right_landmarks
 
 
 def _head_unit_and_center(coords: np.ndarray) -> tuple[np.ndarray, float, float]:
@@ -1459,6 +1603,27 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
             "Por defecto se usa el asset incluido en MediaPipe."
         ),
     )
+    parser.add_argument(
+        "--export-keypoints",
+        action="store_true",
+        help=(
+            "Genera keypoints MediaPipe (pose+cara+manos) en processed/keypoints/ "
+            "o en la ruta indicada."
+        ),
+    )
+    parser.add_argument(
+        "--keypoints-output",
+        help=(
+            "Directorio destino para los keypoints (.npz/.npy). "
+            "Por defecto se usa <out_root>/keypoints."
+        ),
+    )
+    parser.add_argument(
+        "--keypoints-format",
+        choices=["npz", "npy"],
+        default="npz",
+        help="Formato de serialización para los keypoints (npz o npy).",
+    )
 
     args = parser.parse_args()
 
@@ -1490,6 +1655,9 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
             hand_model=args.hand_model,
             pose_model=args.pose_model,
             mp_log_level=args.mp_log_level,
+            export_keypoints=args.export_keypoints,
+            keypoints_output=args.keypoints_output,
+            keypoints_format=args.keypoints_format,
         )
     except ValueError as exc:
         parser.error(str(exc))

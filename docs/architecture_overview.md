@@ -9,8 +9,11 @@ README. Emplea rutas relativas a la raíz del repositorio y se complementa con
 
 1. **Fuentes de video y metadata**: los clips viven en `data/single_signer/videos/`
    y sus transcripciones en `meta.csv`.
-2. **Extracción**: `tools/extract_rois_v2.py` genera recortes por stream, keypoints
-   y `metadata.jsonl` respetando el contrato de datos.
+2. **Extracción**: `tools/extract_rois_v2.py` genera recortes por stream y,
+   con `--export-keypoints`, escribe `processed/keypoints/<video>.npz` (o `.npy`)
+   con la matriz `(T, 543, 3)` en layout MediaPipe. El `metadata.jsonl` registra
+   ahora `keypoints_frames`, `keypoints_format` y `keypoints_layout` junto a las
+   métricas originales.
 3. **Dataset instalable**: `slt/data/lsa_t_multistream.py` crea tensores, máscaras y
    metadatos listos para entrenamiento.
 4. **Encoder multi-stream**: `slt/models/multistream.py` fusiona rostro, manos y pose.
