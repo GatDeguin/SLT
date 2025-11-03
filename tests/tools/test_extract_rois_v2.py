@@ -129,6 +129,8 @@ except Exception:  # pragma: no cover - fallback de pruebas
 
     sys.modules["cv2"] = fake_cv2
 
+import tools.extract_rois_v2 as extract_rois_v2
+
 from tools.extract_rois_v2 import (
     _normalise_format,
     _normalise_streams,
@@ -237,6 +239,69 @@ def test_normalise_streams_accepts_aliases() -> None:
 
 def test_normalise_format_accepts_jpeg() -> None:
     assert _normalise_format("JPEG") == "jpg"
+
+
+def test_resolve_delegate_models_uses_mediapipe_defaults(tmp_path, monkeypatch) -> None:
+    package_root = tmp_path / "mediapipe_pkg"
+    (package_root / "modules" / "face_landmark").mkdir(parents=True)
+    (package_root / "modules" / "hand_landmark").mkdir(parents=True)
+    (package_root / "modules" / "pose_landmark").mkdir(parents=True)
+
+    for relative in (
+        ("modules", "face_landmark", "face_landmarker.task"),
+        ("modules", "hand_landmark", "hand_landmarker.task"),
+        ("modules", "pose_landmark", "pose_landmarker_full.task"),
+    ):
+        target = package_root.joinpath(*relative)
+        target.write_bytes(b"")
+
+    init_file = package_root / "__init__.py"
+    init_file.write_text("# dummy mediapipe package")
+
+    fake_mp = SimpleNamespace(__file__=str(init_file))
+    monkeypatch.setattr(extract_rois_v2, "mp", fake_mp)
+
+    face_model, hand_model, pose_model = extract_rois_v2._resolve_delegate_models(
+        extract_rois_v2._DELEGATE_GPU,
+        None,
+        None,
+        None,
+    )
+
+    expected_face = package_root / "modules" / "face_landmark" / "face_landmarker.task"
+    expected_hand = package_root / "modules" / "hand_landmark" / "hand_landmarker.task"
+    expected_pose = package_root / "modules" / "pose_landmark" / "pose_landmarker_full.task"
+
+    assert face_model == str(expected_face)
+    assert hand_model == str(expected_hand)
+    assert pose_model == str(expected_pose)
+
+
+def test_resolve_delegate_models_respects_custom_paths(tmp_path, monkeypatch) -> None:
+    package_root = tmp_path / "mediapipe_pkg"
+    package_root.mkdir()
+    init_file = package_root / "__init__.py"
+    init_file.write_text("# dummy mediapipe package")
+
+    fake_mp = SimpleNamespace(__file__=str(init_file))
+    monkeypatch.setattr(extract_rois_v2, "mp", fake_mp)
+
+    face_override = tmp_path / "face_override.task"
+    hand_override = tmp_path / "hand_override.task"
+    pose_override = tmp_path / "pose_override.task"
+    for path in (face_override, hand_override, pose_override):
+        path.write_bytes(b"")
+
+    face_model, hand_model, pose_model = extract_rois_v2._resolve_delegate_models(
+        extract_rois_v2._DELEGATE_GPU,
+        str(face_override),
+        str(hand_override),
+        str(pose_override),
+    )
+
+    assert face_model == str(face_override)
+    assert hand_model == str(hand_override)
+    assert pose_model == str(pose_override)
 
 
 def test_normalise_streams_raises_on_unknown() -> None:
