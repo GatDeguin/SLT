@@ -272,6 +272,19 @@ verificaciones recomendadas tras la instalación.
    `--streams pose` o `--streams face hands`) y `--format npz` cuando
    prefieras tensores comprimidos por video en lugar de imágenes por
    frame.
+   Con `--delegate gpu` puedes forzar el uso del delegado CUDA de MediaPipe
+   Tasks siempre que proporciones los modelos `.task` oficiales mediante
+   `--face-model`, `--hand-model` y `--pose-model`.
+   Un ejemplo reutilizando los artefactos publicados por Google:
+   ```bash
+   python tools/extract_rois_v2.py \
+     --videos data/single_signer/videos \
+     --output data/single_signer/processed \
+     --delegate gpu \
+     --face-model models/face_landmarker.task \
+     --hand-model models/hand_landmarker.task \
+     --pose-model models/pose_landmarker_full.task
+   ```
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
    `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
    fuese necesario. Las poses se guardan normalizadas en `[0, 1]` dentro del

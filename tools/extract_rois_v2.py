@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -21,6 +22,13 @@ try:  # pragma: no cover - dependencias opcionales
     import mediapipe as mp
 except Exception:  # pragma: no cover - dependencias opcionales
     mp = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - dependencias opcionales
+    from mediapipe.tasks import python as mp_tasks_python
+    from mediapipe.tasks.python import vision as mp_vision
+except Exception:  # pragma: no cover - dependencias opcionales
+    mp_tasks_python = None  # type: ignore[assignment]
+    mp_vision = None  # type: ignore[assignment]
 
 
 _MP_WARNING = (
@@ -45,6 +53,10 @@ _HAS_CV2_MERGE = hasattr(cv2, "merge")
 _HAS_CV2_BITWISE_AND = hasattr(cv2, "bitwise_and")
 _HAS_CV2_BITWISE_NOT = hasattr(cv2, "bitwise_not")
 _HAS_CV2_ADD = hasattr(cv2, "add")
+
+
+_DELEGATE_CPU = "cpu"
+_DELEGATE_GPU = "gpu"
 
 
 def _ensure_uint8(array: np.ndarray) -> np.ndarray:
@@ -458,6 +470,236 @@ def _normalise_streams(selection: Optional[Iterable[str]]) -> Set[str]:
     return resolved
 
 
+def _normalise_delegate(value: Optional[str]) -> str:
+    if value is None:
+        return _DELEGATE_CPU
+
+    delegate = value.strip().lower()
+    if delegate in {_DELEGATE_CPU, _DELEGATE_GPU}:
+        return delegate
+
+    raise ValueError("Delegate no soportado. Usa 'cpu' o 'gpu'.")
+
+
+@dataclass
+class _Landmark:
+    x: float
+    y: float
+    z: float = 0.0
+    visibility: float = 0.0
+
+
+@dataclass
+class _LandmarkList:
+    landmark: List[_Landmark]
+
+
+@dataclass
+class _Classification:
+    label: str
+
+
+@dataclass
+class _Handedness:
+    classification: List[_Classification]
+
+
+@dataclass
+class _FaceResult:
+    multi_face_landmarks: List[_LandmarkList]
+
+
+@dataclass
+class _HandsResult:
+    multi_hand_landmarks: List[_LandmarkList]
+    multi_handedness: List[_Handedness]
+
+
+@dataclass
+class _PoseResult:
+    pose_landmarks: Optional[_LandmarkList]
+
+
+class _PipelineBase:
+    def process(self, rgb_frame: np.ndarray) -> Tuple[object, object, object]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def __enter__(self) -> "_PipelineBase":
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb) -> None:
+        self.close()
+
+
+class _CpuMediaPipePipeline(_PipelineBase):
+    def __init__(self) -> None:
+        if mp is None:
+            raise RuntimeError("MediaPipe no está disponible")
+
+        self._face = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+        )
+        self._hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+        )
+        self._pose = mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+        )
+
+    def process(self, rgb_frame: np.ndarray) -> Tuple[object, object, object]:
+        face_result = self._face.process(rgb_frame)
+        hands_result = self._hands.process(rgb_frame)
+        pose_result = self._pose.process(rgb_frame)
+        return face_result, hands_result, pose_result
+
+    def close(self) -> None:
+        self._face.close()
+        self._hands.close()
+        self._pose.close()
+
+
+def _wrap_landmarks(sequence: Iterable[object]) -> List[_Landmark]:
+    wrapped: List[_Landmark] = []
+    for landmark in sequence:
+        wrapped.append(
+            _Landmark(
+                float(getattr(landmark, "x", 0.0)),
+                float(getattr(landmark, "y", 0.0)),
+                float(getattr(landmark, "z", 0.0)),
+                float(getattr(landmark, "visibility", 0.0)),
+            )
+        )
+    return wrapped
+
+
+def _wrap_landmark_lists(raw: Optional[Iterable[Iterable[object]]]) -> List[_LandmarkList]:
+    if raw is None:
+        return []
+
+    wrapped: List[_LandmarkList] = []
+    for group in raw:
+        wrapped.append(_LandmarkList(_wrap_landmarks(group)))
+    return wrapped
+
+
+def _wrap_pose_landmarks(raw: Optional[Iterable[Iterable[object]]]) -> Optional[_LandmarkList]:
+    lists = _wrap_landmark_lists(raw)
+    if not lists:
+        return None
+    return lists[0]
+
+
+def _wrap_handedness(raw: Optional[Iterable[Iterable[object]]]) -> List[_Handedness]:
+    if raw is None:
+        return []
+
+    handedness: List[_Handedness] = []
+    for group in raw:
+        classifications: List[_Classification] = []
+        for item in group:
+            label = getattr(item, "category_name", None) or getattr(item, "display_name", None)
+            if not label:
+                label = getattr(item, "label", "")
+            classifications.append(_Classification(str(label)))
+        handedness.append(_Handedness(classifications))
+    return handedness
+
+
+class _GpuMediaPipePipeline(_PipelineBase):
+    def __init__(
+        self,
+        face_model: str,
+        hand_model: str,
+        pose_model: str,
+    ) -> None:
+        if mp is None or mp_tasks_python is None or mp_vision is None:
+            raise RuntimeError("MediaPipe Tasks no está disponible para GPU")
+
+        delegate = mp_tasks_python.BaseOptions.Delegate.GPU
+        running_mode = mp_vision.RunningMode.IMAGE
+
+        face_options = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_tasks_python.BaseOptions(
+                model_asset_path=face_model,
+                delegate=delegate,
+            ),
+            running_mode=running_mode,
+            num_faces=1,
+        )
+        hand_options = mp_vision.HandLandmarkerOptions(
+            base_options=mp_tasks_python.BaseOptions(
+                model_asset_path=hand_model,
+                delegate=delegate,
+            ),
+            running_mode=running_mode,
+            num_hands=2,
+        )
+        pose_options = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_tasks_python.BaseOptions(
+                model_asset_path=pose_model,
+                delegate=delegate,
+            ),
+            running_mode=running_mode,
+            output_segmentation_masks=False,
+        )
+
+        self._face = mp_vision.FaceLandmarker.create_from_options(face_options)
+        self._hands = mp_vision.HandLandmarker.create_from_options(hand_options)
+        self._pose = mp_vision.PoseLandmarker.create_from_options(pose_options)
+
+    def process(self, rgb_frame: np.ndarray) -> Tuple[_FaceResult, _HandsResult, _PoseResult]:
+        if mp is None:
+            raise RuntimeError("MediaPipe no está disponible")
+
+        rgb_contiguous = np.ascontiguousarray(rgb_frame)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_contiguous)
+
+        face_raw = self._face.detect(mp_image)
+        hands_raw = self._hands.detect(mp_image)
+        pose_raw = self._pose.detect(mp_image)
+
+        face_result = _FaceResult(
+            multi_face_landmarks=_wrap_landmark_lists(getattr(face_raw, "face_landmarks", None))
+        )
+        hands_result = _HandsResult(
+            multi_hand_landmarks=_wrap_landmark_lists(getattr(hands_raw, "hand_landmarks", None)),
+            multi_handedness=_wrap_handedness(getattr(hands_raw, "handedness", None)),
+        )
+        pose_result = _PoseResult(
+            pose_landmarks=_wrap_pose_landmarks(getattr(pose_raw, "pose_landmarks", None))
+        )
+
+        return face_result, hands_result, pose_result
+
+    def close(self) -> None:
+        self._face.close()
+        self._hands.close()
+        self._pose.close()
+
+
+def _create_pipeline(
+    delegate: str,
+    face_model: Optional[str],
+    hand_model: Optional[str],
+    pose_model: Optional[str],
+) -> _PipelineBase:
+    if delegate == _DELEGATE_GPU:
+        if not face_model or not hand_model or not pose_model:
+            raise ValueError(
+                "Debes especificar --face-model, --hand-model y --pose-model para usar GPU."
+            )
+        return _GpuMediaPipePipeline(face_model, hand_model, pose_model)
+
+    return _CpuMediaPipePipeline()
+
+
 def process_video(
     video_path: str,
     out_dirs: Dict[str, Path],
@@ -467,6 +709,10 @@ def process_video(
     fps_limit: Optional[float] = None,
     streams: Optional[Iterable[str]] = None,
     image_format: str = "jpg",
+    delegate: str = _DELEGATE_CPU,
+    face_model: Optional[str] = None,
+    hand_model: Optional[str] = None,
+    pose_model: Optional[str] = None,
 ) -> Dict[str, object]:
     """Procesa un único video y guarda los ROIs correspondientes.
 
@@ -475,6 +721,7 @@ def process_video(
 
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
+    resolved_delegate = _normalise_delegate(delegate)
     export_face = "face" in resolved_streams
     export_hand_l = "hand_l" in resolved_streams
     export_hand_r = "hand_r" in resolved_streams
@@ -493,6 +740,7 @@ def process_video(
         "stride": None,
         "face_blur": face_blur,
         "streams": sorted(resolved_streams),
+        "delegate": resolved_delegate,
     }
 
     fallback_template = {"pose": 0, "previous": 0, "black": 0}
@@ -508,15 +756,24 @@ def process_video(
         metadata["error"] = "mediapipe-no-disponible"
         return metadata
 
-    mp_face = mp.solutions.face_mesh
-    mp_hands = mp.solutions.hands
-    mp_pose = mp.solutions.pose
+    try:
+        pipeline = _create_pipeline(
+            resolved_delegate,
+            face_model=face_model,
+            hand_model=hand_model,
+            pose_model=pose_model,
+        )
+    except Exception as exc:
+        metadata["error"] = str(exc)
+        warnings.warn(str(exc))
+        return metadata
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         msg = f"No se pudo abrir el video: {video_path}"
         warnings.warn(msg)
         metadata["error"] = "video-no-abre"
+        pipeline.close()
         return metadata
 
     try:
@@ -548,11 +805,7 @@ def process_video(
         hand_r_buffer: List[np.ndarray] = []
         image_ext = f".{resolved_format}" if resolved_format in {"jpg", "png"} else ""
 
-        with (
-            mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh,
-            mp_hands.Hands(static_image_mode=False, max_num_hands=2) as hands,
-            mp_pose.Pose(static_image_mode=False, model_complexity=1) as pose,
-        ):
+        with pipeline as detectors:
             frame_index = 0
             out_index = 0
 
@@ -568,9 +821,7 @@ def process_video(
                 height, width = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                face_result = face_mesh.process(rgb)
-                hands_result = hands.process(rgb)
-                pose_result = pose.process(rgb)
+                face_result, hands_result, pose_result = detectors.process(rgb)
                 pose_landmarks = getattr(pose_result, "pose_landmarks", None)
 
                 # Cara
@@ -736,6 +987,7 @@ def process_video(
                 out_index += 1
                 frame_index += 1
 
+        pipeline = None
         metadata["frames_written"] = out_index
         metadata["pose_frames"] = len(pose_frames) if export_pose else 0
 
@@ -778,6 +1030,11 @@ def process_video(
         return metadata
     finally:
         cap.release()
+        try:
+            if "pipeline" in locals() and pipeline is not None:
+                pipeline.close()
+        except Exception:
+            pass
 
 
 def _metadata_path(out_root: str, metadata_path: Optional[str]) -> Path:
@@ -820,6 +1077,10 @@ def run_bulk(
     fps_limit: Optional[float] = None,
     streams: Optional[Iterable[str]] = None,
     image_format: str = "jpg",
+    delegate: str = _DELEGATE_CPU,
+    face_model: Optional[str] = None,
+    hand_model: Optional[str] = None,
+    pose_model: Optional[str] = None,
 ) -> None:
     """Procesa todos los videos *.mp4 en ``videos_dir``."""
 
@@ -828,6 +1089,30 @@ def run_bulk(
 
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
+    resolved_delegate = _normalise_delegate(delegate)
+
+    if resolved_delegate == _DELEGATE_GPU:
+        missing = [
+            name
+            for name, path in (
+                ("--face-model", face_model),
+                ("--hand-model", hand_model),
+                ("--pose-model", pose_model),
+            )
+            if not path
+        ]
+        if missing:
+            raise ValueError(
+                "Debes proporcionar rutas para " + ", ".join(missing) + " al usar --delegate gpu."
+            )
+        for label, path in (
+            ("--face-model", face_model),
+            ("--hand-model", hand_model),
+            ("--pose-model", pose_model),
+        ):
+            model_path = Path(path) if path else None
+            if model_path and not model_path.exists():
+                raise ValueError(f"No se encontró el modelo {label}: {model_path}")
 
     videos_path = Path(videos_dir)
     if not videos_path.exists():
@@ -867,6 +1152,10 @@ def run_bulk(
             fps_limit=fps_limit,
             streams=resolved_streams,
             image_format=resolved_format,
+            delegate=resolved_delegate,
+            face_model=face_model,
+            hand_model=hand_model,
+            pose_model=pose_model,
         )
         entry["video"] = video_name
         entry["video_path"] = str(video_path)
@@ -942,6 +1231,24 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
             "Streams a exportar (face, hand_l, hand_r, hands, pose, all)."
         ),
     )
+    parser.add_argument(
+        "--delegate",
+        choices=[_DELEGATE_CPU, _DELEGATE_GPU],
+        default=_DELEGATE_CPU,
+        help="Delegate de MediaPipe a utilizar (cpu o gpu).",
+    )
+    parser.add_argument(
+        "--face-model",
+        help="Ruta al modelo .task para FaceLandmarker (requerido con --delegate gpu)",
+    )
+    parser.add_argument(
+        "--hand-model",
+        help="Ruta al modelo .task para HandLandmarker (requerido con --delegate gpu)",
+    )
+    parser.add_argument(
+        "--pose-model",
+        help="Ruta al modelo .task para PoseLandmarker (requerido con --delegate gpu)",
+    )
 
     args = parser.parse_args()
 
@@ -968,6 +1275,10 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
             fps_limit=args.fps_limit,
             streams=args.streams,
             image_format=args.format,
+            delegate=args.delegate,
+            face_model=args.face_model,
+            hand_model=args.hand_model,
+            pose_model=args.pose_model,
         )
     except ValueError as exc:
         parser.error(str(exc))
