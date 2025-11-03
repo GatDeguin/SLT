@@ -23,7 +23,10 @@ cuando necesites procesar videos o ejecutar demos.
 - `extract_rois_v2.py`: genera los recortes de rostro/manos/pose en
   `data/single_signer/processed/` siguiendo el [contrato de datos](../docs/data_contract.md).
   Soporta reanudación con `--resume`, controla el ruido de MediaPipe mediante
-  `--mp-log-level` y produce `metadata.jsonl` con métricas por video.
+  `--mp-log-level` y produce `metadata.jsonl` con métricas por video. Activa
+  `--export-keypoints` para crear `processed/keypoints/<video>.npz` (o `.npy`)
+  con el tensor `(T, 543, 3)` en formato MediaPipe; ajusta el directorio con
+  `--keypoints-output` y el formato con `--keypoints-format`.
 - `prepare_lsat_crops.py`: recorre LSA-T (y globs externos) aplicando las mismas ROI para
   muestrear millones de crops en `data/single_signer/processed_lsat/`, valida `meta.csv` y
   permite cortar al alcanzar `--target-crops`.

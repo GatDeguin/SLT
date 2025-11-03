@@ -45,7 +45,9 @@ Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
   `(0.5, 0.5)`. Cuando no hay landmarks válidos se escribe un sentinel con
   `-1` en las coordenadas y visibilidad `0`.
 - `processed/keypoints/`: matrices `.npy` o `.npz` con keypoints MediaPipe en
-  formato `(T, landmarks, 3)` donde la última dimensión guarda `(x, y, conf)`.
+  formato `(T, 543, 3)` donde la última dimensión guarda `(x, y, conf)`. Los
+  `.npz` deben incluir la clave `keypoints` y, opcionalmente, `layout=
+  "mediapipe_holistic_v1"` para documentar el origen del layout.
 - `index/*.csv`: listas de `video_id` (una columna, sin encabezado) utilizadas
   para los splits de entrenamiento, validación y prueba.
 - `metadata.jsonl`: emitido por `tools/extract_rois_v2.py` con métricas por
@@ -198,6 +200,11 @@ video. Cada objeto JSON incluye:
 - `stride`: salto aplicado al video original.
 - `delegate` y `mp_log_level`: configuración del runtime de MediaPipe aplicada
   en la extracción.
+- `keypoints_frames`: frames exportados en `processed/keypoints/` (0 si no se
+  habilitó `--export-keypoints`).
+- `keypoints_format`: formato elegido para los keypoints (`npz` o `npy`).
+- `keypoints_layout`: etiqueta descriptiva del layout almacenado (por defecto
+  `mediapipe_holistic_v1`).
 - `fallbacks`: contadores por stream para detecciones resueltas por `pose`,
   `previous` o `black` (solo se incluyen los streams solicitados).
 - `success` / `error`: bandera final y descripción del error cuando falla el

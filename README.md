@@ -267,8 +267,11 @@ verificaciones recomendadas tras la instalación.
    > Nota: el parámetro `--output` (o su alias `--out`) debe apuntar siempre al
    > directorio raíz de ROIs, por ejemplo `data/single_signer/processed`. El
    > script creará allí las carpetas `face/`, `hand_l/`, `hand_r/` y `pose/`.
-   > No lo mezcles con `processed/keypoints/`, que está reservado para los
-   > keypoints exportados en el paso siguiente.
+   > Activa `--export-keypoints` para que el propio script cree
+   > `processed/keypoints/<video>.npz` (o `.npy`) con la matriz `(T, 543, 3)` y
+   > la etiqueta `layout="mediapipe_holistic_v1"`. Usa `--keypoints-output` si
+   > necesitas un directorio alternativo o `--keypoints-format npy` para grabar
+   > tensores sin comprimir.
    También puedes invocar el script con argumentos posicionales
    (`python tools/extract_rois_v2.py data/single_signer/videos
    data/single_signer/processed`), y `--output` acepta el alias
@@ -292,12 +295,13 @@ verificaciones recomendadas tras la instalación.
      --pose-model models/pose_landmarker_full.task
    ```
    El script genera `face/`, `hand_l/`, `hand_r/` y `pose/` junto a un
-   `metadata.jsonl` con métricas por video. Reanuda ejecuciones con `--resume` si
-   fuese necesario. Las poses se guardan normalizadas en `[0, 1]` dentro del
-   *signing space* (ancho 6, alto 7 unidades de cabeza) y los `.npz` incluyen la
-   clave `pose_norm="signing_space_v1"`. Cuando MediaPipe no reporta landmarks
-   se replica la pose previa o se rellena con `-1` y visibilidad `0` como
-   sentinel.
+   `metadata.jsonl` con métricas por video, incluyendo `keypoints_frames`,
+   `keypoints_format` y `keypoints_layout` cuando se habilita la exportación.
+   Reanuda ejecuciones con `--resume` si fuese necesario. Las poses se guardan
+   normalizadas en `[0, 1]` dentro del *signing space* (ancho 6, alto 7 unidades
+   de cabeza) y los `.npz` incluyen la clave `pose_norm="signing_space_v1"`.
+   Cuando MediaPipe no reporta landmarks se replica la pose previa o se rellena
+   con `-1` y visibilidad `0` como sentinel.
    El flag `--mp-log-level` controla los logs nativos de MediaPipe: `error` (por
    defecto) silencia advertencias ruidosas en CPU, mientras que `warning` o
    `info` restauran la verbosidad original para depurar pipelines.
@@ -309,12 +313,12 @@ verificaciones recomendadas tras la instalación.
    `--target-crops`. Mantiene los mismos controles de outliers descritos en
    [`docs/data_contract.md`](docs/data_contract.md#control-de-outliers) y puede
    emitir `split_segments.jsonl` al activar `--emit-split-json`.
-5. Genera o copia los keypoints multistream en
-   `data/single_signer/processed/keypoints/`. Cada archivo debe nombrarse como
-   `<video_id>.npy` o `<video_id>.npz` y contener un arreglo `keypoints` en
-   formato `(T, landmarks, 3)` con `(x, y, conf)` siguiendo el layout de
-   MediaPipe. Si cuentas con anotaciones de glosa, agrégalas al CSV opcional
-   `data/single_signer/annotations/gloss.csv` con columnas
+5. Verifica que `data/single_signer/processed/keypoints/` contenga un archivo
+   por video con clave `keypoints` en `(T, 543, 3)` y, cuando aplique, la
+   etiqueta `layout="mediapipe_holistic_v1"`. Estos archivos se generan con el
+   flag `--export-keypoints`; si necesitas producirlos manualmente, respeta las
+   mismas convenciones de nombres y layout. Si cuentas con anotaciones de glosa,
+   agrégalas al CSV opcional `data/single_signer/annotations/gloss.csv` con columnas
    `video_id;gloss;ctc_labels` (índices separados por espacios).
 6. Construye los splits desde `meta.csv` según tus criterios. Los CSV deben
    contener un `video_id` por línea sin encabezado. Un ejemplo mínimo:
