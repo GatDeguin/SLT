@@ -66,11 +66,12 @@ _TASK_DEFAULTS = {
 }
 
 
+# Valores admitidos por GLOG/ABSL y sus equivalentes en MediaPipe.
 _MP_LOG_LEVELS = {
-    "info": 0,
-    "warning": 1,
-    "error": 2,
-    "fatal": 3,
+    "info": {"env": "0", "absl": "info"},
+    "warning": {"env": "1", "absl": "warning"},
+    "error": {"env": "2", "absl": "error"},
+    "fatal": {"env": "3", "absl": "fatal"},
 }
 _DEFAULT_MP_LOG_LEVEL = "error"
 _configured_mp_log_level: Optional[str] = None
@@ -496,18 +497,18 @@ def _configure_mediapipe_logging(level: str) -> None:
     if _configured_mp_log_level == resolved:
         return
 
-    level_value = str(_MP_LOG_LEVELS[resolved])
-    os.environ["GLOG_minloglevel"] = level_value
-    os.environ["ABSL_MIN_LOG_LEVEL"] = level_value
+    level_values = _MP_LOG_LEVELS[resolved]
+    os.environ["GLOG_minloglevel"] = level_values["env"]
+    os.environ["ABSL_MIN_LOG_LEVEL"] = level_values["env"]
 
     try:  # pragma: no cover - dependencias opcionales
         from absl import logging as absl_logging
     except Exception:  # pragma: no cover - dependencias opcionales
         pass
     else:
-        verbosity = _MP_LOG_LEVELS[resolved]
-        absl_logging.set_stderrthreshold(verbosity)
-        absl_logging.set_verbosity(verbosity)
+        absl_verbosity = level_values["absl"]
+        absl_logging.set_stderrthreshold(absl_verbosity)
+        absl_logging.set_verbosity(int(level_values["env"]))
 
     _configured_mp_log_level = resolved
 
