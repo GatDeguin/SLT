@@ -1217,6 +1217,107 @@ def run_bulk(
     )
 
 
+POSE_LANDMARK_COUNT = 17
+POSE_SIGNING_WIDTH = 6.0
+POSE_SIGNING_HEIGHT = 7.0
+
+
+def _as_float32(value: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_pose_array(
+    pose_landmarks: Optional[object],
+    landmark_count: int = POSE_LANDMARK_COUNT,
+) -> np.ndarray:
+    """Convierte los landmarks de MediaPipe en un arreglo ``(N, 3)``."""
+
+    arr = np.zeros((landmark_count, 3), dtype=np.float32)
+    if pose_landmarks is None:
+        return arr
+
+    try:
+        iterator: Iterable[object] = pose_landmarks.landmark  # type: ignore[attr-defined]
+    except AttributeError:
+        return arr
+
+    for idx, landmark in enumerate(iterator):
+        if idx >= landmark_count:
+            break
+        arr[idx, 0] = _as_float32(getattr(landmark, "x", 0.0))
+        arr[idx, 1] = _as_float32(getattr(landmark, "y", 0.0))
+        arr[idx, 2] = _as_float32(getattr(landmark, "visibility", 0.0))
+    return arr
+
+
+def _head_unit_and_center(coords: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Calcula centro y unidad de cabeza para normalizar la pose."""
+
+    landmark_count = coords.shape[0]
+    if landmark_count == 0:
+        center = np.array([0.5, 0.5], dtype=np.float32)
+        return center, 1.0, 1.0
+
+    nose = coords[0]
+    shoulders = []
+    if landmark_count > 11:
+        shoulders.append(coords[11])
+    if landmark_count > 12:
+        shoulders.append(coords[12])
+
+    if shoulders:
+        center = np.mean(np.stack(shoulders, axis=0), axis=0)
+    else:
+        center = nose
+
+    head_unit = float(np.linalg.norm(nose - center))
+    if not np.isfinite(head_unit) or head_unit <= 1e-6:
+        # Fallback: distancia interocular
+        if landmark_count > 5:
+            left_eye = coords[min(2, landmark_count - 1)]
+            right_eye = coords[min(5, landmark_count - 1)]
+            head_unit = float(np.linalg.norm(left_eye - right_eye))
+    if not np.isfinite(head_unit) or head_unit <= 1e-6:
+        head_unit = 1.0 / POSE_SIGNING_HEIGHT
+
+    width = max(head_unit * POSE_SIGNING_WIDTH, 1e-6)
+    height = max(head_unit * POSE_SIGNING_HEIGHT, 1e-6)
+    return center.astype(np.float32), float(width), float(height)
+
+
+def normalize_pose_landmarks(
+    pose_landmarks: Optional[object],
+    landmark_count: int = POSE_LANDMARK_COUNT,
+) -> np.ndarray:
+    """Normaliza los landmarks de pose al rango ``[0, 1]`` dentro del signing space."""
+
+    pose_arr = _build_pose_array(pose_landmarks, landmark_count)
+    coords = pose_arr[:, :2]
+    center, width, height = _head_unit_and_center(coords)
+
+    if width <= 0 or height <= 0:
+        width, height = 1.0, 1.0
+
+    normalized = (coords - center[None, :])
+    normalized[:, 0] /= width
+    normalized[:, 1] /= height
+    normalized += 0.5
+    np.clip(normalized, 0.0, 1.0, out=normalized)
+    pose_arr[:, :2] = normalized
+    return pose_arr
+
+
+def sentinel_pose(landmark_count: int = POSE_LANDMARK_COUNT) -> np.ndarray:
+    """Devuelve un vector sentinel para frames sin landmarks."""
+
+    sentinel = np.full((landmark_count, 3), -1.0, dtype=np.float32)
+    sentinel[:, 2] = 0.0
+    return sentinel
+
+
 if __name__ == "__main__":  # pragma: no cover - ejecución manual
     parser = argparse.ArgumentParser(description="Extracción de ROIs (cara/manos/pose)")
     parser.add_argument(
@@ -1332,103 +1433,3 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
         )
     except ValueError as exc:
         parser.error(str(exc))
-POSE_LANDMARK_COUNT = 17
-POSE_SIGNING_WIDTH = 6.0
-POSE_SIGNING_HEIGHT = 7.0
-
-
-def _as_float32(value: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _build_pose_array(
-    pose_landmarks: Optional[object],
-    landmark_count: int = POSE_LANDMARK_COUNT,
-) -> np.ndarray:
-    """Convierte los landmarks de MediaPipe en un arreglo ``(N, 3)``."""
-
-    arr = np.zeros((landmark_count, 3), dtype=np.float32)
-    if pose_landmarks is None:
-        return arr
-
-    try:
-        iterator: Iterable[object] = pose_landmarks.landmark  # type: ignore[attr-defined]
-    except AttributeError:
-        return arr
-
-    for idx, landmark in enumerate(iterator):
-        if idx >= landmark_count:
-            break
-        arr[idx, 0] = _as_float32(getattr(landmark, "x", 0.0))
-        arr[idx, 1] = _as_float32(getattr(landmark, "y", 0.0))
-        arr[idx, 2] = _as_float32(getattr(landmark, "visibility", 0.0))
-    return arr
-
-
-def _head_unit_and_center(coords: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """Calcula centro y unidad de cabeza para normalizar la pose."""
-
-    landmark_count = coords.shape[0]
-    if landmark_count == 0:
-        center = np.array([0.5, 0.5], dtype=np.float32)
-        return center, 1.0, 1.0
-
-    nose = coords[0]
-    shoulders = []
-    if landmark_count > 11:
-        shoulders.append(coords[11])
-    if landmark_count > 12:
-        shoulders.append(coords[12])
-
-    if shoulders:
-        center = np.mean(np.stack(shoulders, axis=0), axis=0)
-    else:
-        center = nose
-
-    head_unit = float(np.linalg.norm(nose - center))
-    if not np.isfinite(head_unit) or head_unit <= 1e-6:
-        # Fallback: distancia interocular
-        if landmark_count > 5:
-            left_eye = coords[min(2, landmark_count - 1)]
-            right_eye = coords[min(5, landmark_count - 1)]
-            head_unit = float(np.linalg.norm(left_eye - right_eye))
-    if not np.isfinite(head_unit) or head_unit <= 1e-6:
-        head_unit = 1.0 / POSE_SIGNING_HEIGHT
-
-    width = max(head_unit * POSE_SIGNING_WIDTH, 1e-6)
-    height = max(head_unit * POSE_SIGNING_HEIGHT, 1e-6)
-    return center.astype(np.float32), float(width), float(height)
-
-
-def normalize_pose_landmarks(
-    pose_landmarks: Optional[object],
-    landmark_count: int = POSE_LANDMARK_COUNT,
-) -> np.ndarray:
-    """Normaliza los landmarks de pose al rango ``[0, 1]`` dentro del signing space."""
-
-    pose_arr = _build_pose_array(pose_landmarks, landmark_count)
-    coords = pose_arr[:, :2]
-    center, width, height = _head_unit_and_center(coords)
-
-    if width <= 0 or height <= 0:
-        width, height = 1.0, 1.0
-
-    normalized = (coords - center[None, :])
-    normalized[:, 0] /= width
-    normalized[:, 1] /= height
-    normalized += 0.5
-    np.clip(normalized, 0.0, 1.0, out=normalized)
-    pose_arr[:, :2] = normalized
-    return pose_arr
-
-
-def sentinel_pose(landmark_count: int = POSE_LANDMARK_COUNT) -> np.ndarray:
-    """Devuelve un vector sentinel para frames sin landmarks."""
-
-    sentinel = np.full((landmark_count, 3), -1.0, dtype=np.float32)
-    sentinel[:, 2] = 0.0
-    return sentinel
-
