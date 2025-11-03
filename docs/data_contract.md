@@ -196,6 +196,8 @@ video. Cada objeto JSON incluye:
 - `pose_frames`: frames disponibles en el stream de pose (0 si se omitió).
 - `fps_source` y `fps_target`: FPS observados y configurados en la ejecución.
 - `stride`: salto aplicado al video original.
+- `delegate` y `mp_log_level`: configuración del runtime de MediaPipe aplicada
+  en la extracción.
 - `fallbacks`: contadores por stream para detecciones resueltas por `pose`,
   `previous` o `black` (solo se incluyen los streams solicitados).
 - `success` / `error`: bandera final y descripción del error cuando falla el

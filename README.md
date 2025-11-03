@@ -293,6 +293,9 @@ verificaciones recomendadas tras la instalación.
    clave `pose_norm="signing_space_v1"`. Cuando MediaPipe no reporta landmarks
    se replica la pose previa o se rellena con `-1` y visibilidad `0` como
    sentinel.
+   El flag `--mp-log-level` controla los logs nativos de MediaPipe: `error` (por
+   defecto) silencia advertencias ruidosas en CPU, mientras que `warning` o
+   `info` restauran la verbosidad original para depurar pipelines.
    Para LSA-T y corpus externos con millones de crops combina fuentes mediante
    `python tools/prepare_lsat_crops.py --lsa-root data/lsa_t/videos --output-root \
    data/single_signer/processed_lsat --extra-datasets "data/externo/**/*.mp4"`.
