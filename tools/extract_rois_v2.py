@@ -1375,7 +1375,10 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
     parser.add_argument(
         "out_root",
         nargs="?",
-        help="Directorio destino para los recortes (posicional o --output)",
+        help=(
+            "Directorio destino para los recortes (por ejemplo "
+            "data/single_signer/processed)"
+        ),
     )
     parser.add_argument(
         "--videos",
@@ -1386,7 +1389,10 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
         "--output",
         "--out",
         dest="out_opt",
-        help="Directorio destino para los recortes (equivalente al posicional out_root)",
+        help=(
+            "Directorio destino para los recortes MediaPipe; equivale al posicional "
+            "out_root"
+        ),
     )
     parser.add_argument("--fps", type=int, default=25, help="FPS de muestreo")
     parser.add_argument(
