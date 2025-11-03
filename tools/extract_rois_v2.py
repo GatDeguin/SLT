@@ -59,6 +59,13 @@ _DELEGATE_CPU = "cpu"
 _DELEGATE_GPU = "gpu"
 
 
+_TASK_DEFAULTS = {
+    "--face-model": Path("modules/face_landmark/face_landmarker.task"),
+    "--hand-model": Path("modules/hand_landmark/hand_landmarker.task"),
+    "--pose-model": Path("modules/pose_landmark/pose_landmarker_full.task"),
+}
+
+
 def _ensure_uint8(array: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(array), 0, 255).astype(np.uint8)
 
@@ -148,6 +155,51 @@ def ensure_dir(path: str | os.PathLike[str]) -> Path:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _resolve_task_asset(flag: str, provided: Optional[str]) -> str:
+    if provided:
+        model_path = Path(provided)
+        if model_path.exists():
+            return str(model_path)
+        raise ValueError(f"No se encontró el modelo {flag}: {model_path}")
+
+    if mp is None:
+        raise ValueError(
+            "MediaPipe no está disponible. Proporciona la ruta del modelo con "
+            f"{flag} o instala los assets oficiales."
+        )
+
+    module_file = getattr(mp, "__file__", None)
+    if not module_file:
+        raise ValueError(
+            "No fue posible localizar los modelos predeterminados de MediaPipe. "
+            f"Proporciona la ruta manualmente con {flag}."
+        )
+
+    default_path = Path(module_file).resolve().parent / _TASK_DEFAULTS[flag]
+    if default_path.exists():
+        return str(default_path)
+
+    raise ValueError(
+        "No se encontró un modelo predeterminado para "
+        f"{flag}: {default_path}. Proporciona la ruta manualmente."
+    )
+
+
+def _resolve_delegate_models(
+    delegate: str,
+    face_model: Optional[str],
+    hand_model: Optional[str],
+    pose_model: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if delegate != _DELEGATE_GPU:
+        return face_model, hand_model, pose_model
+
+    resolved_face = _resolve_task_asset("--face-model", face_model)
+    resolved_hand = _resolve_task_asset("--hand-model", hand_model)
+    resolved_pose = _resolve_task_asset("--pose-model", pose_model)
+    return resolved_face, resolved_hand, resolved_pose
 
 
 def expand_clamp_bbox(
@@ -693,7 +745,7 @@ def _create_pipeline(
     if delegate == _DELEGATE_GPU:
         if not face_model or not hand_model or not pose_model:
             raise ValueError(
-                "Debes especificar --face-model, --hand-model y --pose-model para usar GPU."
+                "No se pudieron resolver los modelos .task necesarios para ejecutar en GPU."
             )
         return _GpuMediaPipePipeline(face_model, hand_model, pose_model)
 
@@ -722,6 +774,12 @@ def process_video(
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
     resolved_delegate = _normalise_delegate(delegate)
+    face_model, hand_model, pose_model = _resolve_delegate_models(
+        resolved_delegate,
+        face_model,
+        hand_model,
+        pose_model,
+    )
     export_face = "face" in resolved_streams
     export_hand_l = "hand_l" in resolved_streams
     export_hand_r = "hand_r" in resolved_streams
@@ -1090,29 +1148,12 @@ def run_bulk(
     resolved_streams = _normalise_streams(streams)
     resolved_format = _normalise_format(image_format)
     resolved_delegate = _normalise_delegate(delegate)
-
-    if resolved_delegate == _DELEGATE_GPU:
-        missing = [
-            name
-            for name, path in (
-                ("--face-model", face_model),
-                ("--hand-model", hand_model),
-                ("--pose-model", pose_model),
-            )
-            if not path
-        ]
-        if missing:
-            raise ValueError(
-                "Debes proporcionar rutas para " + ", ".join(missing) + " al usar --delegate gpu."
-            )
-        for label, path in (
-            ("--face-model", face_model),
-            ("--hand-model", hand_model),
-            ("--pose-model", pose_model),
-        ):
-            model_path = Path(path) if path else None
-            if model_path and not model_path.exists():
-                raise ValueError(f"No se encontró el modelo {label}: {model_path}")
+    face_model, hand_model, pose_model = _resolve_delegate_models(
+        resolved_delegate,
+        face_model,
+        hand_model,
+        pose_model,
+    )
 
     videos_path = Path(videos_dir)
     if not videos_path.exists():
@@ -1239,15 +1280,24 @@ if __name__ == "__main__":  # pragma: no cover - ejecución manual
     )
     parser.add_argument(
         "--face-model",
-        help="Ruta al modelo .task para FaceLandmarker (requerido con --delegate gpu)",
+        help=(
+            "Ruta al modelo .task para FaceLandmarker. "
+            "Por defecto se usa el asset incluido en MediaPipe."
+        ),
     )
     parser.add_argument(
         "--hand-model",
-        help="Ruta al modelo .task para HandLandmarker (requerido con --delegate gpu)",
+        help=(
+            "Ruta al modelo .task para HandLandmarker. "
+            "Por defecto se usa el asset incluido en MediaPipe."
+        ),
     )
     parser.add_argument(
         "--pose-model",
-        help="Ruta al modelo .task para PoseLandmarker (requerido con --delegate gpu)",
+        help=(
+            "Ruta al modelo .task para PoseLandmarker. "
+            "Por defecto se usa el asset incluido en MediaPipe."
+        ),
     )
 
     args = parser.parse_args()

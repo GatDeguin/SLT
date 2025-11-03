@@ -273,9 +273,10 @@ verificaciones recomendadas tras la instalación.
    prefieras tensores comprimidos por video en lugar de imágenes por
    frame.
    Con `--delegate gpu` puedes forzar el uso del delegado CUDA de MediaPipe
-   Tasks siempre que proporciones los modelos `.task` oficiales mediante
-   `--face-model`, `--hand-model` y `--pose-model`.
-   Un ejemplo reutilizando los artefactos publicados por Google:
+   Tasks. El script busca automáticamente los modelos `.task` incluidos en el
+   paquete `mediapipe`, pero puedes sobrescribirlos con `--face-model`,
+   `--hand-model` y `--pose-model` si deseas versiones personalizadas. Un
+   ejemplo reutilizando los artefactos publicados por Google:
    ```bash
    python tools/extract_rois_v2.py \
      --videos data/single_signer/videos \
