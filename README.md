@@ -79,14 +79,22 @@ adaptar el pipeline a otros datasets.
    `python tools/ci_validate_data_contract.py`, que comprueba máscaras,
    keypoints y etiquetas CTC/gloss en un dataset sintético. Para inspeccionar un
    clip real con video, keypoints y subtítulos sincronizados, utiliza la CLI
-   `slt-visualize-keypoints`:
+   `slt-visualize-keypoints`. Puedes cargar un único archivo o iterar sobre un
+   directorio completo:
 
    ```bash
+   # Clip individual
    slt-visualize-keypoints \
      --video data/single_signer/raw/sample.mp4 \
      --keypoints data/single_signer/processed/keypoints/sample.npz \
      --csv meta.csv \
      --segment-id sample_0001
+
+   # Carpeta con múltiples clips (usa meta.csv para resolver el orden)
+   slt-visualize-keypoints \
+     --videos-dir data/single_signer/processed/clips \
+     --keypoints-dir data/single_signer/processed/keypoints \
+     --csv meta.csv
    ```
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de

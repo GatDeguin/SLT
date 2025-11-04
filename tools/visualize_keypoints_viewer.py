@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -72,6 +72,9 @@ class KeypointData:
     frames: np.ndarray
     layout: Dict[str, List[int]]
     fps: float
+
+
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
 
 def _wrap_text(
@@ -243,6 +246,118 @@ def _load_keypoints(path: Path, fps: Optional[float]) -> KeypointData:
     return KeypointData(frames=frames.astype(np.float32), layout=layout, fps=fps_value)
 
 
+def _resolve_path_by_stem(
+    directory: Path,
+    stem: str,
+    allowed_suffixes: Optional[Sequence[str]] = None,
+) -> Path:
+    """Devuelve el primer archivo en ``directory`` cuyo stem coincide con ``stem``."""
+
+    if allowed_suffixes:
+        normalised = tuple(ext.lower() for ext in allowed_suffixes)
+        allowed_suffixes = normalised
+        for ext in normalised:
+            candidate = directory / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+    for candidate in directory.glob(f"{stem}.*"):
+        if not candidate.is_file():
+            continue
+        if allowed_suffixes and candidate.suffix.lower() not in allowed_suffixes:
+            continue
+        return candidate
+    raise FileNotFoundError(
+        f"No se encontró un archivo con stem '{stem}' dentro de {directory}."
+    )
+
+
+def _iter_clip_resources(
+    videos_dir: Path,
+    keypoints_dir: Path,
+    subtitle_cfg: SubtitleConfig,
+) -> Iterator[Tuple[Path, Path, SubtitleConfig, str]]:
+    """Itera los clips presentes en ``meta.csv`` resolviendo rutas relativas."""
+
+    if not videos_dir.is_dir():
+        raise FileNotFoundError(f"El directorio de videos no existe: {videos_dir}")
+    if not keypoints_dir.is_dir():
+        raise FileNotFoundError(f"El directorio de keypoints no existe: {keypoints_dir}")
+
+    with subtitle_cfg.csv_path.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter=subtitle_cfg.delimiter)
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"El CSV {subtitle_cfg.csv_path} no contiene filas.")
+
+    filtered: List[Dict[str, str]] = []
+    for row in rows:
+        row_norm = {
+            key: (value.strip() if isinstance(value, str) else value)
+            for key, value in row.items()
+        }
+        if (
+            subtitle_cfg.target_id
+            and row_norm.get(subtitle_cfg.id_column) != subtitle_cfg.target_id
+        ):
+            continue
+        if (
+            subtitle_cfg.target_video
+            and row_norm.get(subtitle_cfg.video_column) != subtitle_cfg.target_video
+        ):
+            continue
+        filtered.append(row_norm)
+
+    if not filtered:
+        target = subtitle_cfg.target_id or subtitle_cfg.target_video or "<sin filtro>"
+        raise ValueError(
+            f"No se hallaron filas que coincidan con {target!r} en {subtitle_cfg.csv_path}."
+        )
+
+    for row in filtered:
+        clip_id = row.get(subtitle_cfg.id_column)
+        if not clip_id:
+            raise ValueError(
+                f"La fila {row} no contiene la columna {subtitle_cfg.id_column!r}."
+            )
+
+        video_candidates = [clip_id]
+        video_value = row.get(subtitle_cfg.video_column)
+        if video_value and video_value not in video_candidates:
+            video_candidates.append(video_value)
+
+        video_path: Optional[Path] = None
+        for stem in video_candidates:
+            try:
+                video_path = _resolve_path_by_stem(videos_dir, stem, VIDEO_EXTENSIONS)
+                break
+            except FileNotFoundError:
+                continue
+        if not video_path:
+            raise FileNotFoundError(
+                f"No se encontró el video asociado a {clip_id!r} dentro de {videos_dir}."
+            )
+
+        try:
+            keypoints_path = _resolve_path_by_stem(
+                keypoints_dir,
+                clip_id,
+                (".npy", ".npz"),
+            )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"No se encontró el archivo de keypoints para {clip_id!r} en {keypoints_dir}."
+            ) from exc
+
+        clip_cfg = replace(
+            subtitle_cfg,
+            target_id=clip_id,
+            target_video=video_value or subtitle_cfg.target_video,
+        )
+
+        yield video_path, keypoints_path, clip_cfg, clip_id
+
+
 def _select_subtitle(segments: Sequence[SubtitleEntry], timestamp: float) -> str:
     """Encuentra el subtítulo activo para ``timestamp``."""
 
@@ -390,10 +505,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualiza video, keypoints MediaPipe y subtítulos en tiempo real.",
     )
-    parser.add_argument("--video", required=True, type=Path, help="Ruta al video base.")
+    parser.add_argument("--video", type=Path, help="Ruta al video base.")
     parser.add_argument(
         "--keypoints",
-        required=True,
         type=Path,
         help="Archivo .npz/.npy con los keypoints MediaPipe (forma (T, N, C)).",
     )
@@ -402,6 +516,16 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         type=Path,
         help="CSV con subtítulos y columnas de tiempo (ej. meta.csv).",
+    )
+    parser.add_argument(
+        "--videos-dir",
+        type=Path,
+        help="Directorio base que contiene los videos segmentados (alternativa a --video).",
+    )
+    parser.add_argument(
+        "--keypoints-dir",
+        type=Path,
+        help="Directorio con los keypoints MediaPipe por clip (alternativa a --keypoints).",
     )
     parser.add_argument("--segment-id", help="Valor de la columna 'id' a visualizar.")
     parser.add_argument("--video-id", help="Filtra filas por la columna 'video'.")
@@ -533,7 +657,25 @@ def _parse_args() -> argparse.Namespace:
         help="No posicionar el video en el inicio del clip según el CSV.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    has_directories = args.videos_dir is not None or args.keypoints_dir is not None
+    if has_directories:
+        if not args.videos_dir or not args.keypoints_dir:
+            parser.error("Debe especificar --videos-dir y --keypoints-dir para el modo por lotes.")
+    else:
+        missing = [
+            flag
+            for flag, value in (("--video", args.video), ("--keypoints", args.keypoints))
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "Los argumentos --video y --keypoints son obligatorios cuando no se utilizan "
+                "--videos-dir/--keypoints-dir."
+            )
+
+    return args
 
 
 def main() -> None:
@@ -569,14 +711,45 @@ def main() -> None:
         seek_to_start=not args.no_seek,
     )
 
-    run_viewer(
-        video_path=args.video,
-        keypoints_path=args.keypoints,
-        subtitle_cfg=subtitle_cfg,
-        viewer_cfg=viewer_cfg,
-        video_fps=args.fps,
-        keypoints_fps=args.keypoints_fps,
-    )
+    if args.videos_dir and args.keypoints_dir:
+        clips = list(_iter_clip_resources(args.videos_dir, args.keypoints_dir, subtitle_cfg))
+        total = len(clips)
+        for index, (video_path, keypoints_path, clip_cfg, clip_id) in enumerate(
+            clips, start=1
+        ):
+            print(
+                f"[{index}/{total}] Visualizando clip {clip_id} "
+                f"({video_path.name}, {keypoints_path.name})."
+            )
+            try:
+                run_viewer(
+                    video_path=video_path,
+                    keypoints_path=keypoints_path,
+                    subtitle_cfg=clip_cfg,
+                    viewer_cfg=viewer_cfg,
+                    video_fps=args.fps,
+                    keypoints_fps=args.keypoints_fps,
+                )
+            except KeyboardInterrupt:
+                print("Interrupción del usuario. Finalizando.")
+                break
+
+            if index < total:
+                response = input(
+                    "Presiona Enter para continuar con el siguiente clip o escribe 'q' para salir: "
+                )
+                if response.strip().lower().startswith("q"):
+                    print("Finalizando por solicitud del usuario.")
+                    break
+    else:
+        run_viewer(
+            video_path=args.video,
+            keypoints_path=args.keypoints,
+            subtitle_cfg=subtitle_cfg,
+            viewer_cfg=viewer_cfg,
+            video_fps=args.fps,
+            keypoints_fps=args.keypoints_fps,
+        )
 
 
 if __name__ == "__main__":
