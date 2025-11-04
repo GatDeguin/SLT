@@ -553,7 +553,7 @@ def run_viewer(
             video_pos = raw_pos_ms / 1000.0 if raw_pos_ms > 0 else float("nan")
             if math.isnan(video_pos) or video_pos <= 0:
                 video_pos = frame_index / fps_video
-                if viewer_cfg.seek_to_start and clip_start:
+                if attempted_seek and clip_start:
                     video_pos += clip_start
 
             relative_time = max(0.0, video_pos - clip_reference)
