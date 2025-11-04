@@ -236,17 +236,20 @@ class LsaTMultiStream(Dataset):
         merged = df.merge(idx[["video_id"]], on="video_id", how="inner").copy()
         merged["_texto_norm"] = merged["texto"].map(_normalise_text)
 
-        if "duration" in merged.columns:
+        has_duration = "duration" in merged.columns
+        if has_duration:
             merged["_duration_norm"] = merged["duration"].map(sanitize_time_value)
         else:
             merged["_duration_norm"] = pd.Series([None] * len(merged), index=merged.index)
             warnings.warn(
-                "El CSV principal no contiene la columna 'duration'; se descartarán todos "
-                "los videos.",
+                "El CSV principal no contiene la columna 'duration'; se omitirá el "
+                "filtrado por duración.",
                 stacklevel=2,
             )
 
-        drop_mask = (merged["_texto_norm"] == "") | merged["_duration_norm"].isna()
+        drop_mask = merged["_texto_norm"] == ""
+        if has_duration:
+            drop_mask |= merged["_duration_norm"].isna()
         dropped_ids = merged.loc[drop_mask, "video_id"].astype(str).tolist()
         if dropped_ids:
             sample = ", ".join(dropped_ids[:5])

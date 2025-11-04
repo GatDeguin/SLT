@@ -1516,12 +1516,15 @@ def main() -> None:
     tokenizer_source = data_config.tokenizer or model_config.decoder_model
     if tokenizer_source is None:
         raise ValueError("Tokenizer source could not be resolved.")
-    tokenizer = create_tokenizer(
-        tokenizer_source,
-        local_files_only=data_config.tokenizer_local_files_only,
-        local_paths=(data_config.tokenizer_search_paths or None),
-        env_var_paths=(data_config.tokenizer_path_env_vars or None),
-    )
+    tokenizer_kwargs: Dict[str, object] = {}
+    if data_config.tokenizer_local_files_only:
+        tokenizer_kwargs["local_files_only"] = True
+    if data_config.tokenizer_search_paths:
+        tokenizer_kwargs["local_paths"] = data_config.tokenizer_search_paths
+    if data_config.tokenizer_path_env_vars:
+        tokenizer_kwargs["env_var_paths"] = data_config.tokenizer_path_env_vars
+
+    tokenizer = create_tokenizer(tokenizer_source, **tokenizer_kwargs)
 
     train_dataset = LsaTMultiStream(
         face_dir=str(data_config.face_dir),
