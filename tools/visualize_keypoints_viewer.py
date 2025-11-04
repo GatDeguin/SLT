@@ -497,12 +497,30 @@ def run_viewer(
         or fps_video
     )
 
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    video_duration = float("nan")
+    if frame_count and frame_count > 0 and fps_video > 0:
+        video_duration = frame_count / fps_video
+
+    attempted_seek = False
     if viewer_cfg.seek_to_start and clip_start and clip_start > 0:
-        cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
+        if not math.isnan(video_duration):
+            margin = 1.0 / max(fps_video, 1.0)
+            if clip_start >= video_duration - margin:
+                print(
+                    "Advertencia: el inicio solicitado para el clip supera la duración del video. "
+                    "Se usará el comienzo del archivo segmentado."
+                )
+            else:
+                cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
+                attempted_seek = True
+        else:
+            cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
+            attempted_seek = True
 
     frame_index = 0
     total_keypoint_frames = keypoints_data.frames.shape[0]
-    clip_reference = clip_start or 0.0
+    clip_reference = (clip_start or 0.0) if attempted_seek else 0.0
     playback_start = time.perf_counter()
 
     cv2.namedWindow(viewer_cfg.window_name, cv2.WINDOW_NORMAL)
@@ -511,6 +529,16 @@ def run_viewer(
         while True:
             ok, frame = cap.read()
             if not ok:
+                if attempted_seek and frame_index == 0:
+                    print(
+                        "Advertencia: no fue posible posicionar el video en el timestamp del CSV. "
+                        "Se reproducirá desde el inicio."
+                    )
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    attempted_seek = False
+                    clip_reference = 0.0
+                    playback_start = time.perf_counter()
+                    continue
                 if viewer_cfg.loop:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     frame_index = 0
@@ -525,7 +553,7 @@ def run_viewer(
             video_pos = raw_pos_ms / 1000.0 if raw_pos_ms > 0 else float("nan")
             if math.isnan(video_pos) or video_pos <= 0:
                 video_pos = frame_index / fps_video
-                if viewer_cfg.seek_to_start and clip_start:
+                if attempted_seek and clip_start:
                     video_pos += clip_start
 
             relative_time = max(0.0, video_pos - clip_reference)
