@@ -34,6 +34,8 @@ cuando necesites procesar videos o ejecutar demos.
   estructura esperada y ejecuta verificaciones básicas.
 - `ci_validate_metrics.py`: compara pérdidas y métricas contra valores de
   referencia para detectar regresiones en CI.
+- `visualize_keypoints_viewer.py`: renderiza video, keypoints y subtítulos para
+  validar su alineación temporal.
 
 ## Entrenamiento
 
