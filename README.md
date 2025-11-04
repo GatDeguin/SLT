@@ -100,6 +100,12 @@ adaptar el pipeline a otros datasets.
    Con los 468 landmarks faciales activos por defecto, puedes acelerar el render con
    `--face-point-stride 5` o limitar el máximo a 150 puntos. Para recuperar el subconjunto
    compacto previo pasa `--face-landmark-subset 1,133,362,13`.
+   El visor dibuja un panel con rutas, FPS y offsets, e indica si los subtítulos y keypoints
+   están activos. Usa la barra espaciadora para pausar o reanudar, las flechas `←`/`→` (o
+   `,`/`.`) para avanzar o retroceder un cuadro, `S` para mostrar/ocultar subtítulos, `K`
+   para alternar los keypoints y `R` para restaurar el estado inicial. Si prefieres comenzar
+   detenido o con elementos ocultos, combina `--start-paused`, `--no-subtitles` y
+   `--no-keypoints` según lo necesites.
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
    traducción, CTC y distilación según el escenario (ver ejemplos en
