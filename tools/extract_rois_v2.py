@@ -31,6 +31,156 @@ except Exception:  # pragma: no cover - dependencias opcionales
     mp_vision = None  # type: ignore[assignment]
 
 
+if hasattr(cv2, "__spec__") and getattr(cv2.__spec__, "name", None) is None:  # type: ignore[attr-defined]
+    cv2.__spec__ = None  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "VideoCapture"):
+    class _UnavailableVideoCapture:  # pragma: no cover - fallback mínimo
+        def __init__(self, *_: object, **__: object) -> None:
+            self._opened = False
+
+        def isOpened(self) -> bool:
+            return False
+
+        def read(self):  # type: ignore[override]
+            return False, np.empty((0, 0, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            return None
+
+        def get(self, *_: object) -> float:
+            return 0.0
+
+    cv2.VideoCapture = _UnavailableVideoCapture  # type: ignore[assignment]
+
+if not hasattr(cv2, "COLOR_BGR2GRAY"):
+    cv2.COLOR_BGR2GRAY = 0  # type: ignore[attr-defined]
+if not hasattr(cv2, "COLOR_GRAY2BGR"):
+    cv2.COLOR_GRAY2BGR = 1  # type: ignore[attr-defined]
+if not hasattr(cv2, "COLOR_BGR2RGB"):
+    cv2.COLOR_BGR2RGB = 2  # type: ignore[attr-defined]
+if not hasattr(cv2, "INTER_LINEAR"):
+    cv2.INTER_LINEAR = 1  # type: ignore[attr-defined]
+if not hasattr(cv2, "CAP_PROP_FPS"):
+    cv2.CAP_PROP_FPS = 5  # type: ignore[attr-defined]
+
+
+def _ensure_uint8(array: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(array), 0, 255).astype(np.uint8)
+
+
+if not hasattr(cv2, "cvtColor"):
+
+    def _cvt_color(image: np.ndarray, code: int) -> np.ndarray:
+        if code == cv2.COLOR_BGR2GRAY:
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError("Se requiere una imagen BGR")
+            weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+            gray = np.tensordot(image.astype(np.float32), weights, axes=([2], [0]))
+            return _ensure_uint8(gray)
+        if code == cv2.COLOR_GRAY2BGR:
+            if image.ndim != 2:
+                raise ValueError("Se requiere una imagen en escala de grises")
+            return np.stack([image, image, image], axis=-1)
+        if code == cv2.COLOR_BGR2RGB:
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError("Se requiere una imagen BGR")
+            return image[..., ::-1]
+        raise NotImplementedError(f"Conversión no soportada: {code}")
+
+    cv2.cvtColor = _cvt_color  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "GaussianBlur"):
+
+    def _gaussian_blur(image: np.ndarray, ksize: Tuple[int, int], sigma: float) -> np.ndarray:
+        kernel_x, kernel_y = ksize
+        pad_x = kernel_x // 2
+        pad_y = kernel_y // 2
+        kernel = np.ones((kernel_y, kernel_x), dtype=np.float32)
+        kernel /= kernel.sum()
+
+        if image.ndim == 2:
+            padded = np.pad(image.astype(np.float32), ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+            out = np.zeros_like(image, dtype=np.float32)
+            for row in range(image.shape[0]):
+                for col in range(image.shape[1]):
+                    region = padded[row : row + kernel_y, col : col + kernel_x]
+                    out[row, col] = float(np.sum(region * kernel))
+            return _ensure_uint8(out)
+
+        if image.ndim == 3:
+            channels = [_gaussian_blur(image[:, :, idx], ksize, sigma) for idx in range(image.shape[2])]
+            return np.stack(channels, axis=-1)
+
+        raise ValueError("Imagen no soportada para blur")
+
+    cv2.GaussianBlur = _gaussian_blur  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "merge"):
+
+    def _merge_channels(channels: list[np.ndarray]) -> np.ndarray:
+        return np.stack(channels, axis=-1)
+
+    cv2.merge = _merge_channels  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "bitwise_not"):
+    cv2.bitwise_not = np.bitwise_not  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "bitwise_and"):
+    cv2.bitwise_and = np.bitwise_and  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "add"):
+
+    def _add_images(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+        return _ensure_uint8(lhs.astype(np.int32) + rhs.astype(np.int32))
+
+    cv2.add = _add_images  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "circle"):
+
+    def _draw_circle(image: np.ndarray, center: Tuple[int, int], radius: int, color: int, thickness: int) -> None:
+        if thickness != -1:
+            raise NotImplementedError("Solo se admite thickness=-1 en el modo de compatibilidad")
+        cx, cy = center
+        yy, xx = np.ogrid[: image.shape[0], : image.shape[1]]
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius**2
+        image[mask] = color
+
+    cv2.circle = _draw_circle  # type: ignore[assignment]
+
+
+if not hasattr(cv2, "resize"):
+
+    def _resize(image: np.ndarray, size: Tuple[int, int], interpolation: int | None = None) -> np.ndarray:
+        out_w, out_h = size
+        if image.ndim == 2:
+            channels = [image]
+        else:
+            channels = [image[:, :, idx] for idx in range(image.shape[2])]
+        resized_channels = []
+        for channel in channels:
+            ys = np.linspace(0, channel.shape[0] - 1, out_h)
+            xs = np.linspace(0, channel.shape[1] - 1, out_w)
+            grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+            coords_y = np.clip(np.round(grid_y).astype(int), 0, channel.shape[0] - 1)
+            coords_x = np.clip(np.round(grid_x).astype(int), 0, channel.shape[1] - 1)
+            resized_channels.append(channel[coords_y, coords_x])
+        stacked = np.stack(resized_channels, axis=-1)
+        if image.ndim == 2:
+            return stacked[:, :, 0]
+        return stacked.astype(image.dtype)
+
+    cv2.resize = _resize  # type: ignore[assignment]
+
+
+
 _MP_WARNING = (
     "MediaPipe no está disponible. Instala el paquete `mediapipe` para poder "
     "extraer regiones de interés."
@@ -84,12 +234,6 @@ KEYPOINT_TOTAL_LANDMARKS = (
     KEYPOINT_BODY_LANDMARKS + KEYPOINT_FACE_LANDMARKS + 2 * KEYPOINT_HAND_LANDMARKS
 )
 KEYPOINT_LAYOUT_NAME = "mediapipe_holistic_v1"
-
-
-def _ensure_uint8(array: np.ndarray) -> np.ndarray:
-    return np.clip(np.rint(array), 0, 255).astype(np.uint8)
-
-
 def _fill_circle(mask: np.ndarray, center: tuple[int, int], radius: int, value: int) -> None:
     """Rellena un disco en la máscara sin depender de cv2.circle."""
 
@@ -105,7 +249,12 @@ def _fill_circle(mask: np.ndarray, center: tuple[int, int], radius: int, value: 
 
 def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
     if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_BGR2GRAY"):
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        try:
+            converted = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            if isinstance(converted, np.ndarray) and converted.ndim == 2:
+                return converted
+        except Exception:
+            pass
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("Se requiere una imagen BGR")
     weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
@@ -115,7 +264,12 @@ def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
 
 def _gray_to_bgr(image: np.ndarray) -> np.ndarray:
     if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_GRAY2BGR"):
-        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        try:
+            converted = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            if isinstance(converted, np.ndarray) and converted.ndim == 3:
+                return converted
+        except Exception:
+            pass
     if image.ndim != 2:
         raise ValueError("Se requiere una imagen en escala de grises")
     return np.stack([image, image, image], axis=-1)

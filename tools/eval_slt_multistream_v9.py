@@ -818,31 +818,16 @@ def _predict(
 
 
 def _write_csv(path: Path, rows: Iterable[PredictionItem]) -> None:
+    entries = list(rows)
     temp_file = None
-    with NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)) as tmp:
+    with NamedTemporaryFile(
+        "w", encoding="utf-8", newline="", delete=False, dir=str(path.parent)
+    ) as tmp:
         writer = csv.writer(tmp)
-        writer.writerow(
-            [
-                "video_id",
-                "prediction",
-                "reference",
-                "latency_ms",
-                "gloss_prediction",
-                "gloss_reference",
-            ]
-        )
-        for row in rows:
+        writer.writerow(["video_id", "prediction", "reference", "latency_ms"])
+        for row in entries:
             latency = "" if row.latency_ms is None else f"{row.latency_ms:.6f}"
-            writer.writerow(
-                [
-                    row.video_id,
-                    row.prediction,
-                    row.reference,
-                    latency,
-                    row.gloss_prediction or "",
-                    row.gloss_reference or "",
-                ]
-            )
+            writer.writerow([row.video_id, row.prediction, row.reference, latency])
         temp_file = Path(tmp.name)
     if temp_file is None:
         raise RuntimeError("No se pudo escribir el archivo temporal de predicciones")
@@ -1039,12 +1024,15 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
     _validate_inputs(args)
     device = _select_device(args.device)
 
-    tokenizer = create_tokenizer(
-        args.tokenizer,
-        local_files_only=args.tokenizer_local_files_only,
-        local_paths=args.tokenizer_search_paths,
-        env_var_paths=args.tokenizer_path_env_vars,
-    )
+    tokenizer_kwargs: Dict[str, object] = {}
+    if args.tokenizer_local_files_only:
+        tokenizer_kwargs["local_files_only"] = True
+    if args.tokenizer_search_paths:
+        tokenizer_kwargs["local_paths"] = args.tokenizer_search_paths
+    if args.tokenizer_path_env_vars:
+        tokenizer_kwargs["env_var_paths"] = args.tokenizer_path_env_vars
+
+    tokenizer = create_tokenizer(args.tokenizer, **tokenizer_kwargs)
     if hasattr(tokenizer, "encode"):
         try:
             validate_tokenizer(tokenizer, allow_empty_decode=True)
@@ -1059,7 +1047,11 @@ def run(argv: Optional[Sequence[str]] = None) -> List[PredictionItem]:
         logging.info("Evaluando checkpoint %s", checkpoint_path)
         model = _build_model(args, tokenizer).to(device)
         _load_checkpoint(model, checkpoint_path, device)
-        mska_available = getattr(model.encoder, "mska_encoder", None) is not None
+        encoder = getattr(model, "encoder", None)
+        mska_available = bool(
+            encoder is not None
+            and getattr(encoder, "mska_encoder", None) is not None
+        )
         if args.report_gloss_wer and not mska_available:
             logging.warning(
                 "MSKA está deshabilitado en el checkpoint %s, se omiten métricas de glosa",

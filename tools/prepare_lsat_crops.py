@@ -49,6 +49,18 @@ class _MetaLoadResult:
     clips: List[_ClipSummary]
     fieldnames: List[str]
 
+    def __iter__(self):
+        return iter(self.grouped)
+
+    def __getitem__(self, key: str) -> Dict[str, object]:
+        return self.grouped[key]
+
+    def __len__(self) -> int:  # pragma: no cover - trivial wrapper
+        return len(self.grouped)
+
+    def keys(self):  # pragma: no cover - trivial wrapper
+        return self.grouped.keys()
+
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -196,6 +208,9 @@ def _load_meta(meta_csv: Path) -> _MetaLoadResult:
             start = sanitize_time_value(row.get("start"))
             end = sanitize_time_value(row.get("end"))
             duration = sanitize_time_value(row.get("duration"))
+
+            if duration is None and start is not None and end is not None:
+                duration = max(0.0, float(end) - float(start))
 
             missing_fields = []
             if start is None:
