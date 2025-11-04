@@ -46,6 +46,7 @@ cuando necesites procesar videos o ejecutar demos.
     --csv meta.csv \
     --segment-id sample_0001
   ```
+  validar su alineación temporal.
 
 ## Entrenamiento
 
