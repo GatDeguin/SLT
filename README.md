@@ -77,7 +77,17 @@ adaptar el pipeline a otros datasets.
    `metadata.jsonl` y los keypoints por video (`.npz`/`.npy`).
 2. **Validar alineación y glosas** ejecutando
    `python tools/ci_validate_data_contract.py`, que comprueba máscaras,
-   keypoints y etiquetas CTC/gloss en un dataset sintético.
+   keypoints y etiquetas CTC/gloss en un dataset sintético. Para inspeccionar un
+   clip real con video, keypoints y subtítulos sincronizados, utiliza la CLI
+   `slt-visualize-keypoints`:
+
+   ```bash
+   slt-visualize-keypoints \
+     --video data/single_signer/raw/sample.mp4 \
+     --keypoints data/single_signer/processed/keypoints/sample.npz \
+     --csv meta.csv \
+     --segment-id sample_0001
+   ```
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
    traducción, CTC y distilación según el escenario (ver ejemplos en
