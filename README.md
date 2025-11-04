@@ -96,6 +96,7 @@ adaptar el pipeline a otros datasets.
      --keypoints-dir data/single_signer/processed/keypoints \
      --csv meta.csv
    ```
+   Añade `--no-draw-bones` si necesitas revisar únicamente las posiciones sin las líneas.
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
    traducción, CTC y distilación según el escenario (ver ejemplos en
