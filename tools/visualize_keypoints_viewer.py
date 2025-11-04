@@ -509,14 +509,16 @@ def run_viewer(
             if clip_start >= video_duration - margin:
                 print(
                     "Advertencia: el inicio solicitado para el clip supera la duración del video. "
-                    "Se usará el comienzo del archivo segmentado."
+                    "Se intentará posicionar igualmente en el timestamp solicitado."
                 )
-            else:
-                cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
-                attempted_seek = True
-        else:
-            cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
+        if cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000):
             attempted_seek = True
+        else:
+            print(
+                "Advertencia: no fue posible posicionar el video en el timestamp del CSV. "
+                "Se reproducirá desde el inicio."
+            )
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     frame_index = 0
     total_keypoint_frames = keypoints_data.frames.shape[0]
