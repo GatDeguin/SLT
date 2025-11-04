@@ -25,6 +25,7 @@ __all__ = [
     "character_error_rate",
     "word_error_rate",
     "levenshtein_distance",
+    "call_tokenizer_factory",
 ]
 
 
@@ -114,6 +115,28 @@ def create_tokenizer(
             "Provide a local path via --tokenizer or set SLT_TOKENIZER_PATH."
         )
         raise OSError(message) from exc
+
+
+def call_tokenizer_factory(
+    factory: Callable[..., PreTrainedTokenizerBase],
+    name_or_path: str,
+    **kwargs,
+) -> PreTrainedTokenizerBase:
+    """Invoke ``factory`` handling optional keyword arguments gracefully."""
+
+    try:
+        return factory(name_or_path, **kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword" not in message:
+            raise
+        unexpected = [key for key in kwargs if f"'{key}'" in message]
+        if not unexpected:
+            raise
+        filtered = {key: value for key, value in kwargs.items() if key not in unexpected}
+        if filtered:
+            return call_tokenizer_factory(factory, name_or_path, **filtered)
+        return factory(name_or_path)
 
 
 def _iter_local_paths(

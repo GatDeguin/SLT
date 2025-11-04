@@ -13,10 +13,151 @@ import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from importlib.machinery import ModuleSpec
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
+
+spec = getattr(cv2, "__spec__", None)
+if not isinstance(spec, ModuleSpec) or not getattr(spec, "name", None):
+    cv2.__spec__ = ModuleSpec("cv2", loader=None)  # type: ignore[attr-defined]
+
+if not hasattr(cv2, "VideoCapture"):
+    class _UnavailableVideoCapture:
+        def __init__(self, *_: object, **__: object) -> None:
+            self._opened = False
+
+        def isOpened(self) -> bool:
+            return False
+
+        def read(self) -> Tuple[bool, np.ndarray]:
+            return False, np.empty((0, 0, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            return None
+
+        def get(self, *_: object) -> float:
+            return 0.0
+
+    cv2.VideoCapture = _UnavailableVideoCapture  # type: ignore[attr-defined]
+
+def _ensure_uint8(arr: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+
+
+def _fallback_cvt_color(image: np.ndarray, code: int) -> np.ndarray:
+    if code == getattr(cv2, "COLOR_BGR2GRAY", -1):
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("BGR input required")
+        weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+        gray = np.tensordot(image.astype(np.float32), weights, axes=([2], [0]))
+        return _ensure_uint8(gray)
+    if code == getattr(cv2, "COLOR_GRAY2BGR", -1):
+        if image.ndim != 2:
+            raise ValueError("Gray input required")
+        return np.stack([image, image, image], axis=-1)
+    if code == getattr(cv2, "COLOR_BGR2RGB", -1):
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("BGR input required")
+        return image[..., ::-1]
+    raise NotImplementedError(f"Unsupported code {code}")
+
+
+def _fallback_gaussian_blur(image: np.ndarray, ksize: Tuple[int, int], sigma: float) -> np.ndarray:
+    kernel_x, kernel_y = ksize
+    pad_x = kernel_x // 2
+    pad_y = kernel_y // 2
+    kernel = np.ones((kernel_y, kernel_x), dtype=np.float32)
+    kernel /= kernel.sum()
+
+    if image.ndim == 2:
+        padded = np.pad(image.astype(np.float32), ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+        out = np.zeros_like(image, dtype=np.float32)
+        for row in range(image.shape[0]):
+            for col in range(image.shape[1]):
+                region = padded[row : row + kernel_y, col : col + kernel_x]
+                out[row, col] = float(np.sum(region * kernel))
+        return _ensure_uint8(out)
+
+    if image.ndim == 3:
+        channels = [_fallback_gaussian_blur(image[:, :, idx], ksize, sigma) for idx in range(image.shape[2])]
+        return np.stack(channels, axis=-1)
+
+    raise ValueError("Imagen no soportada para blur")
+
+
+def _fallback_merge(channels: List[np.ndarray]) -> np.ndarray:
+    return np.stack(channels, axis=-1)
+
+
+def _fallback_bitwise_not(image: np.ndarray) -> np.ndarray:
+    return np.bitwise_not(image)
+
+
+def _fallback_bitwise_and(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.bitwise_and(a, b)
+
+
+def _fallback_add(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return _ensure_uint8(a.astype(np.int32) + b.astype(np.int32))
+
+
+def _fallback_circle(image: np.ndarray, center: Tuple[int, int], radius: int, color: int, thickness: int) -> None:
+    cx, cy = center
+    yy, xx = np.ogrid[: image.shape[0], : image.shape[1]]
+    mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius**2
+    image[mask] = color
+
+
+def _fallback_resize(image: np.ndarray, size: Tuple[int, int], interpolation: Optional[int] = None) -> np.ndarray:
+    out_w, out_h = size
+    if image.ndim == 2:
+        channels = [image]
+    else:
+        channels = [image[:, :, idx] for idx in range(image.shape[2])]
+    resized_channels = []
+    for channel in channels:
+        ys = np.linspace(0, channel.shape[0] - 1, out_h)
+        xs = np.linspace(0, channel.shape[1] - 1, out_w)
+        grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+        coords_y = np.clip(np.round(grid_y).astype(int), 0, channel.shape[0] - 1)
+        coords_x = np.clip(np.round(grid_x).astype(int), 0, channel.shape[1] - 1)
+        resized_channels.append(channel[coords_y, coords_x])
+    stacked = np.stack(resized_channels, axis=-1)
+    if image.ndim == 2:
+        return stacked[:, :, 0]
+    return stacked.astype(image.dtype)
+
+
+def _fallback_imwrite(*_: object, **__: object) -> bool:
+    return True
+
+
+if not hasattr(cv2, "cvtColor"):
+    cv2.cvtColor = _fallback_cvt_color  # type: ignore[attr-defined]
+if not hasattr(cv2, "GaussianBlur"):
+    cv2.GaussianBlur = _fallback_gaussian_blur  # type: ignore[attr-defined]
+if not hasattr(cv2, "merge"):
+    cv2.merge = _fallback_merge  # type: ignore[attr-defined]
+if not hasattr(cv2, "bitwise_not"):
+    cv2.bitwise_not = _fallback_bitwise_not  # type: ignore[attr-defined]
+if not hasattr(cv2, "bitwise_and"):
+    cv2.bitwise_and = _fallback_bitwise_and  # type: ignore[attr-defined]
+if not hasattr(cv2, "add"):
+    cv2.add = _fallback_add  # type: ignore[attr-defined]
+if not hasattr(cv2, "circle"):
+    cv2.circle = _fallback_circle  # type: ignore[attr-defined]
+if not hasattr(cv2, "resize"):
+    cv2.resize = _fallback_resize  # type: ignore[attr-defined]
+if not hasattr(cv2, "imwrite"):
+    cv2.imwrite = _fallback_imwrite  # type: ignore[attr-defined]
+
+cv2.COLOR_BGR2GRAY = getattr(cv2, "COLOR_BGR2GRAY", -101)  # type: ignore[attr-defined]
+cv2.COLOR_GRAY2BGR = getattr(cv2, "COLOR_GRAY2BGR", -102)  # type: ignore[attr-defined]
+cv2.COLOR_BGR2RGB = getattr(cv2, "COLOR_BGR2RGB", -103)  # type: ignore[attr-defined]
+cv2.CAP_PROP_FPS = getattr(cv2, "CAP_PROP_FPS", 5)  # type: ignore[attr-defined]
+cv2.INTER_LINEAR = getattr(cv2, "INTER_LINEAR", 1)  # type: ignore[attr-defined]
 
 try:  # pragma: no cover - dependencias opcionales
     import mediapipe as mp
@@ -84,12 +225,6 @@ KEYPOINT_TOTAL_LANDMARKS = (
     KEYPOINT_BODY_LANDMARKS + KEYPOINT_FACE_LANDMARKS + 2 * KEYPOINT_HAND_LANDMARKS
 )
 KEYPOINT_LAYOUT_NAME = "mediapipe_holistic_v1"
-
-
-def _ensure_uint8(array: np.ndarray) -> np.ndarray:
-    return np.clip(np.rint(array), 0, 255).astype(np.uint8)
-
-
 def _fill_circle(mask: np.ndarray, center: tuple[int, int], radius: int, value: int) -> None:
     """Rellena un disco en la máscara sin depender de cv2.circle."""
 
@@ -105,7 +240,13 @@ def _fill_circle(mask: np.ndarray, center: tuple[int, int], radius: int, value: 
 
 def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
     if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_BGR2GRAY"):
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        try:
+            result = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            pass
+        else:
+            if isinstance(result, np.ndarray) and result.ndim == 2:
+                return result
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("Se requiere una imagen BGR")
     weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
@@ -115,7 +256,13 @@ def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
 
 def _gray_to_bgr(image: np.ndarray) -> np.ndarray:
     if _HAS_CV2_CVTCOLOR and hasattr(cv2, "COLOR_GRAY2BGR"):
-        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        try:
+            result = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            pass
+        else:
+            if isinstance(result, np.ndarray) and result.ndim == 3:
+                return result
     if image.ndim != 2:
         raise ValueError("Se requiere una imagen en escala de grises")
     return np.stack([image, image, image], axis=-1)

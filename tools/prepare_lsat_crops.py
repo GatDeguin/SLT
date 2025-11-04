@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from extract_rois_v2 import (
     _append_metadata,
@@ -44,10 +44,19 @@ class _ClipSummary:
 
 
 @dataclass
-class _MetaLoadResult:
+class _MetaLoadResult(Mapping[str, Dict[str, object]]):
     grouped: Dict[str, Dict[str, object]]
     clips: List[_ClipSummary]
     fieldnames: List[str]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.grouped)
+
+    def __len__(self) -> int:
+        return len(self.grouped)
+
+    def __getitem__(self, key: str) -> Dict[str, object]:
+        return self.grouped[key]
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -205,8 +214,11 @@ def _load_meta(meta_csv: Path) -> _MetaLoadResult:
                 missing_counts["end"] += 1
                 missing_fields.append("end")
             if duration is None:
-                missing_counts["duration"] += 1
-                missing_fields.append("duration")
+                if start is not None and end is not None:
+                    duration = end - start
+                else:
+                    missing_counts["duration"] += 1
+                    missing_fields.append("duration")
 
             if missing_fields:
                 clip_id = (row.get("id") or video or "desconocido").strip()

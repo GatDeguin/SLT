@@ -238,15 +238,21 @@ class LsaTMultiStream(Dataset):
 
         if "duration" in merged.columns:
             merged["_duration_norm"] = merged["duration"].map(sanitize_time_value)
+            duration_missing = merged["_duration_norm"].isna()
         else:
             merged["_duration_norm"] = pd.Series([None] * len(merged), index=merged.index)
-            warnings.warn(
-                "El CSV principal no contiene la columna 'duration'; se descartarán todos "
-                "los videos.",
-                stacklevel=2,
-            )
+            duration_missing = merged["_duration_norm"].isna()
+            if len(merged) > 0:
+                warnings.warn(
+                    "El CSV principal no contiene la columna 'duration'; se continuará sin "
+                    "normalizar duraciones.",
+                    stacklevel=2,
+                )
 
-        drop_mask = (merged["_texto_norm"] == "") | merged["_duration_norm"].isna()
+        drop_mask = merged["_texto_norm"] == ""
+        if "duration" in df.columns:
+            drop_mask |= duration_missing
+
         dropped_ids = merged.loc[drop_mask, "video_id"].astype(str).tolist()
         if dropped_ids:
             sample = ", ".join(dropped_ids[:5])
@@ -254,6 +260,12 @@ class LsaTMultiStream(Dataset):
             warnings.warn(
                 "Se descartaron %d video(s) sin texto o duración tras la normalización%s."
                 % (len(dropped_ids), suffix),
+                stacklevel=2,
+            )
+        elif "duration" not in df.columns and len(merged) > 0:
+            warnings.warn(
+                "No se descartaron videos pese a la ausencia de 'duration'; se asumirán "
+                "valores desconocidos.",
                 stacklevel=2,
             )
 
