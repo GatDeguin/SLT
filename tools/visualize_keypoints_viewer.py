@@ -504,16 +504,6 @@ def _parse_args() -> argparse.Namespace:
         "--absolute-keypoints",
         dest="normalised_keypoints",
         action="store_false",
-    parser.add_argument(
-        "--normalised-keypoints",
-        action="store_true",
-        default=True,
-        help="Interpreta los keypoints en coordenadas normalizadas [0, 1].",
-    )
-    parser.add_argument(
-        "--absolute-keypoints",
-        action="store_true",
-        help="Indica que los keypoints ya están en píxeles y no requieren escalado.",
     )
     parser.add_argument(
         "--video-offset",
@@ -574,7 +564,6 @@ def main() -> None:
         subtitle_max_width=args.subtitle_width,
         confidence_threshold=args.confidence_threshold,
         normalised_keypoints=args.normalised_keypoints,
-        normalised_keypoints=not args.absolute_keypoints,
         video_offset=args.video_offset,
         keypoints_offset=args.keypoints_offset,
         seek_to_start=not args.no_seek,
