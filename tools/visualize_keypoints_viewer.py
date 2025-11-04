@@ -14,7 +14,10 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from slt.data.lsa_t_multistream import _resolve_mediapipe_layout
+from slt.data.lsa_t_multistream import (
+    _resolve_mediapipe_connections,
+    _resolve_mediapipe_layout,
+)
 from slt.utils.metadata import SplitSegment, parse_split_column, sanitize_time_value
 
 
@@ -64,6 +67,7 @@ class ViewerConfig:
     video_offset: float = 0.0
     keypoints_offset: float = 0.0
     seek_to_start: bool = True
+    draw_bones: bool = True
 
 
 @dataclass
@@ -72,6 +76,7 @@ class KeypointData:
 
     frames: np.ndarray
     layout: Dict[str, List[int]]
+    connections: Dict[str, List[Tuple[int, int]]]
     fps: float
 
 
@@ -242,9 +247,15 @@ def _load_keypoints(path: Path, fps: Optional[float]) -> KeypointData:
 
     num_landmarks = frames.shape[1]
     layout = _resolve_mediapipe_layout(num_landmarks)
+    connections = _resolve_mediapipe_connections(layout)
 
     fps_value = float(fps) if fps and fps > 0 else math.nan
-    return KeypointData(frames=frames.astype(np.float32), layout=layout, fps=fps_value)
+    return KeypointData(
+        frames=frames.astype(np.float32),
+        layout=layout,
+        connections=connections,
+        fps=fps_value,
+    )
 
 
 def _resolve_path_by_stem(
@@ -436,6 +447,7 @@ def _draw_keypoints(
     frame: np.ndarray,
     keypoints: np.ndarray,
     layout: Dict[str, List[int]],
+    connections: Dict[str, List[Tuple[int, int]]],
     viewer_cfg: ViewerConfig,
     visible_mask: Optional[np.ndarray] = None,
 ) -> None:
@@ -448,18 +460,55 @@ def _draw_keypoints(
         "hand_r": (255, 105, 180),
     }
 
+    num_points = keypoints.shape[0]
+    finite_mask = np.isfinite(keypoints[:, 0]) & np.isfinite(keypoints[:, 1])
+    confidences = (
+        keypoints[:, 2]
+        if keypoints.shape[1] >= 3
+        else np.ones(num_points, dtype=np.float32)
+    )
+    valid_mask = finite_mask.copy()
+    if viewer_cfg.confidence_threshold > 0:
+        valid_mask &= confidences >= viewer_cfg.confidence_threshold
+    if visible_mask is not None:
+        visibility = np.ones(num_points, dtype=bool)
+        source = np.asarray(visible_mask, dtype=bool)
+        limit = min(num_points, source.shape[0])
+        visibility[:limit] = source[:limit]
+        valid_mask &= visibility
+
     for name, indices in layout.items():
         color = colors.get(name, (255, 255, 255))
         for idx in indices:
-            if idx >= keypoints.shape[0]:
+            if idx >= num_points or not valid_mask[idx]:
                 continue
             x, y = keypoints[idx, :2]
-            confidence = keypoints[idx, 2] if keypoints.shape[1] >= 3 else 1.0
-            if viewer_cfg.confidence_threshold > 0 and confidence < viewer_cfg.confidence_threshold:
+            point = (
+                int(round(float(x))),
+                int(round(float(y))),
+            )
+            cv2.circle(frame, point, 3, color, thickness=-1)
+
+        if not viewer_cfg.draw_bones:
+            continue
+
+        for start_idx, end_idx in connections.get(name, []):
+            if (
+                start_idx >= num_points
+                or end_idx >= num_points
+                or not valid_mask[start_idx]
+                or not valid_mask[end_idx]
+            ):
                 continue
-            if visible_mask is not None and not visible_mask[idx]:
-                continue
-            cv2.circle(frame, (int(x), int(y)), 3, color, thickness=-1)
+            start_point = (
+                int(round(float(keypoints[start_idx, 0]))),
+                int(round(float(keypoints[start_idx, 1]))),
+            )
+            end_point = (
+                int(round(float(keypoints[end_idx, 0]))),
+                int(round(float(keypoints[end_idx, 1]))),
+            )
+            cv2.line(frame, start_point, end_point, color, thickness=2)
 
 
 def _resize_frame(frame: np.ndarray, scale: float) -> np.ndarray:
@@ -581,7 +630,14 @@ def run_viewer(
                 if kp_array.shape[1] > 3:
                     visibility = kp_array[:, 3] > 0.0
 
-                _draw_keypoints(frame, kp_array, keypoints_data.layout, viewer_cfg, visibility)
+                _draw_keypoints(
+                    frame,
+                    kp_array,
+                    keypoints_data.layout,
+                    keypoints_data.connections,
+                    viewer_cfg,
+                    visibility,
+                )
 
             if subtitle_text:
                 _draw_subtitles(frame, subtitle_text, viewer_cfg)
@@ -764,6 +820,20 @@ def _parse_args() -> argparse.Namespace:
         dest="normalised_keypoints",
         action="store_false",
     )
+    bones_group = parser.add_mutually_exclusive_group()
+    bones_group.add_argument(
+        "--draw-bones",
+        dest="draw_bones",
+        action="store_true",
+        default=True,
+        help="Dibuja líneas entre keypoints conectados.",
+    )
+    bones_group.add_argument(
+        "--no-draw-bones",
+        dest="draw_bones",
+        action="store_false",
+        help="Desactiva el dibujo de uniones entre keypoints.",
+    )
     parser.add_argument(
         "--video-offset",
         type=float,
@@ -844,6 +914,7 @@ def main() -> None:
         video_offset=args.video_offset,
         keypoints_offset=args.keypoints_offset,
         seek_to_start=not args.no_seek,
+        draw_bones=args.draw_bones,
     )
 
     if args.videos_dir and args.keypoints_dir:

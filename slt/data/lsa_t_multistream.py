@@ -110,6 +110,95 @@ def _resolve_mediapipe_layout(num_landmarks: int) -> Dict[str, List[int]]:
         ">=543 landmarks.")
 
 
+_MEDIAPIPE_CONNECTIONS_TEMPLATE: Dict[str, List[Tuple[int, int]]] = {
+    "body": [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 7),
+        (0, 4),
+        (4, 5),
+        (5, 6),
+        (6, 8),
+        (9, 10),
+        (11, 12),
+        (11, 13),
+        (13, 15),
+        (12, 14),
+        (14, 16),
+        (15, 17),
+        (17, 19),
+        (15, 19),
+        (16, 18),
+        (18, 20),
+        (16, 20),
+        (11, 23),
+        (12, 24),
+        (23, 24),
+        (23, 25),
+        (24, 26),
+        (25, 27),
+        (26, 28),
+        (27, 29),
+        (28, 30),
+        (29, 31),
+        (30, 32),
+        (27, 31),
+        (28, 32),
+    ],
+    "hand": [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (0, 5),
+        (5, 6),
+        (6, 7),
+        (7, 8),
+        (0, 9),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (0, 13),
+        (13, 14),
+        (14, 15),
+        (15, 16),
+        (0, 17),
+        (17, 18),
+        (18, 19),
+        (19, 20),
+    ],
+    "face": [
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+    ],
+}
+
+
+def _resolve_mediapipe_connections(
+    layout: Dict[str, List[int]]
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Mapea conexiones estándar de MediaPipe según el layout recibido."""
+
+    connections: Dict[str, List[Tuple[int, int]]] = {}
+    for segment, indices in layout.items():
+        template_key = "hand" if segment in {"hand_l", "hand_r"} else segment
+        template = _MEDIAPIPE_CONNECTIONS_TEMPLATE.get(template_key)
+        if not template:
+            continue
+        mapped: List[Tuple[int, int]] = []
+        for start_rel, end_rel in template:
+            if start_rel >= len(indices) or end_rel >= len(indices):
+                continue
+            mapped.append((indices[start_rel], indices[end_rel]))
+        if mapped:
+            connections[segment] = mapped
+    return connections
+
+
 def _face_swap_pairs(face_count: int) -> List[Tuple[int, int]]:
     """Pares de puntos faciales a intercambiar al reflejar."""
 

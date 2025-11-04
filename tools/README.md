@@ -53,6 +53,7 @@ cuando necesites procesar videos o ejecutar demos.
     --keypoints-dir data/single_signer/processed/keypoints \
     --csv meta.csv
   ```
+  Usa `--no-draw-bones` para ocultar las líneas entre keypoints si resultan distractoras.
 
 ## Entrenamiento
 
