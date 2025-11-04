@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -501,6 +502,8 @@ def run_viewer(
 
     frame_index = 0
     total_keypoint_frames = keypoints_data.frames.shape[0]
+    clip_reference = clip_start or 0.0
+    playback_start = time.perf_counter()
 
     try:
         while True:
@@ -515,11 +518,21 @@ def run_viewer(
             original_frame = frame.copy()
             frame = _resize_frame(frame, viewer_cfg.display_scale)
 
-            timestamp = frame_index / fps_video + viewer_cfg.video_offset
-            subtitle_text = _select_subtitle(subtitles, timestamp)
+            raw_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            video_pos = raw_pos_ms / 1000.0 if raw_pos_ms > 0 else float("nan")
+            if math.isnan(video_pos) or video_pos <= 0:
+                video_pos = frame_index / fps_video
+                if viewer_cfg.seek_to_start and clip_start:
+                    video_pos += clip_start
+
+            relative_time = max(0.0, video_pos - clip_reference)
+            subtitle_time = (
+                video_pos if subtitle_cfg.absolute_times else relative_time
+            ) + viewer_cfg.video_offset
+            subtitle_text = _select_subtitle(subtitles, subtitle_time)
 
             if total_keypoint_frames > 0:
-                kp_time = timestamp + viewer_cfg.keypoints_offset
+                kp_time = relative_time + viewer_cfg.keypoints_offset
                 kp_frame = int(round(kp_time * fps_keypoints))
                 kp_frame = max(0, min(kp_frame, total_keypoint_frames - 1))
                 kp_array = keypoints_data.frames[kp_frame].copy()
@@ -542,7 +555,9 @@ def run_viewer(
             if subtitle_text:
                 _draw_subtitles(frame, subtitle_text, viewer_cfg)
 
-            info = f"t={timestamp:0.2f}s frame={frame_index}"
+            info = (
+                f"t={relative_time:0.2f}s | video={video_pos:0.2f}s | frame={frame_index}"
+            )
             cv2.putText(
                 frame,
                 info,
@@ -554,8 +569,19 @@ def run_viewer(
                 lineType=cv2.LINE_AA,
             )
 
+            elapsed = time.perf_counter() - playback_start
+            target_elapsed = relative_time
+            remaining = target_elapsed - elapsed
+            if viewer_cfg.wait_time_ms != 0:
+                delay = max(0.0, remaining)
+                if viewer_cfg.wait_time_ms > 0:
+                    delay = max(delay, viewer_cfg.wait_time_ms / 1000.0)
+                if delay > 0:
+                    time.sleep(delay)
+
             cv2.imshow(viewer_cfg.window_name, frame)
-            key = cv2.waitKey(viewer_cfg.wait_time_ms) & 0xFF
+            wait_arg = 0 if viewer_cfg.wait_time_ms == 0 else 1
+            key = cv2.waitKey(wait_arg) & 0xFF
             if key in (27, ord("q")):
                 break
 
