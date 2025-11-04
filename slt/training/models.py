@@ -340,6 +340,7 @@ class MultiStreamClassifier(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         **extra_inputs: Any,
     ) -> ClassifierOutput:
+        decoder_input_ids = extra_inputs.pop("decoder_input_ids", None)
         keypoint_streams = None
         encoder_kwargs = extra_inputs
         if self._mska_enabled:
@@ -364,15 +365,15 @@ class MultiStreamClassifier(nn.Module):
         encoded, encoder_attention_mask = self._merge_gloss_sequence(
             encoded, encoder_attention_mask, gloss_sequence, gloss_mask
         )
-        decoder_input_ids = extra_inputs.pop("decoder_input_ids", None)
 
-        decoder_output = self.decoder(
-            encoded,
-            encoder_attention_mask=encoder_attention_mask,
-            labels=labels,
-            decoder_attention_mask=decoder_attention_mask,
-            decoder_input_ids=decoder_input_ids,
-        )
+        decoder_kwargs = {
+            "encoder_attention_mask": encoder_attention_mask,
+            "labels": labels,
+            "decoder_attention_mask": decoder_attention_mask,
+        }
+        if decoder_input_ids is not None:
+            decoder_kwargs["decoder_input_ids"] = decoder_input_ids
+        decoder_output = self.decoder(encoded, **decoder_kwargs)
         auxiliary = None
         if self._mska_enabled and self.encoder.mska_encoder is not None:
             mska_output = self.encoder.last_mska_output
