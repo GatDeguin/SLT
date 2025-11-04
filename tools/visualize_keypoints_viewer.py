@@ -1077,14 +1077,14 @@ def _parse_args() -> argparse.Namespace:
     )
     keypoints_group = parser.add_mutually_exclusive_group()
     keypoints_group.add_argument(
-        "--keypoints",
+        "--draw-keypoints",
         dest="initial_keypoints",
         action="store_true",
         default=True,
-        help="Dibuja los keypoints al iniciar (comportamiento por defecto).",
+        help="Dibuja los keypoints al iniciar (usa --no-draw-keypoints para desactivarlo).",
     )
     keypoints_group.add_argument(
-        "--no-keypoints",
+        "--no-draw-keypoints",
         dest="initial_keypoints",
         action="store_false",
         help="Arranca con los keypoints ocultos en pantalla.",

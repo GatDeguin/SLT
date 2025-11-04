@@ -61,7 +61,7 @@ cuando necesites procesar videos o ejecutar demos.
   actual de subtítulos y keypoints. Controla la pausa con la barra espaciadora, avanza o
   retrocede un frame con `←`/`→` (o `,`/`.`), alterna subtítulos con `S`, keypoints con `K`
   y restablece los ajustes iniciales con `R`. Usa `--start-paused`, `--no-subtitles` y
-  `--no-keypoints` para fijar los estados por defecto desde la CLI.
+  `--no-draw-keypoints` para fijar los estados por defecto desde la CLI.
 
 ## Entrenamiento
 

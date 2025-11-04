@@ -105,7 +105,7 @@ adaptar el pipeline a otros datasets.
    `,`/`.`) para avanzar o retroceder un cuadro, `S` para mostrar/ocultar subtítulos, `K`
    para alternar los keypoints y `R` para restaurar el estado inicial. Si prefieres comenzar
    detenido o con elementos ocultos, combina `--start-paused`, `--no-subtitles` y
-   `--no-keypoints` según lo necesites.
+   `--no-draw-keypoints` según lo necesites.
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
    traducción, CTC y distilación según el escenario (ver ejemplos en
