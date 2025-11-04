@@ -70,6 +70,9 @@ class ViewerConfig:
     draw_bones: bool = True
     face_point_stride: int = 1
     max_face_points: Optional[int] = None
+    start_paused: bool = False
+    initial_subtitles: bool = True
+    initial_keypoints: bool = True
 
 
 @dataclass
@@ -566,6 +569,73 @@ def _resize_frame(frame: np.ndarray, scale: float) -> np.ndarray:
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
+def _format_optional_float(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return f"{value:0.2f}"
+
+
+def _draw_info_panel(
+    frame: np.ndarray,
+    viewer_cfg: ViewerConfig,
+    lines: Sequence[str],
+) -> None:
+    """Renderiza un panel semi-transparente con metadatos del visor."""
+
+    if not lines:
+        return
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, viewer_cfg.font_scale * 0.6)
+    thickness = max(1, viewer_cfg.font_thickness - 1)
+    padding = 10
+    margin = viewer_cfg.subtitle_margin
+    max_width = max(int(frame.shape[1] * 0.65), 320)
+
+    wrapped: List[str] = []
+    for line in lines:
+        wrapped.extend(
+            _wrap_text(line, font, scale, thickness, max_width - 2 * padding)
+        )
+
+    if not wrapped:
+        return
+
+    text_sizes = [cv2.getTextSize(text, font, scale, thickness)[0] for text in wrapped]
+    line_height = max(size[1] for size in text_sizes) + 6
+    panel_width = min(max_width, max(size[0] for size in text_sizes) + 2 * padding)
+    panel_height = len(wrapped) * line_height + 2 * padding
+
+    top_left = (margin, margin)
+    bottom_right = (top_left[0] + panel_width, top_left[1] + panel_height)
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        top_left,
+        bottom_right,
+        color=(0, 0, 0),
+        thickness=-1,
+    )
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, dst=frame)
+
+    for idx, text in enumerate(wrapped):
+        origin = (
+            top_left[0] + padding,
+            top_left[1] + padding + idx * line_height + text_sizes[idx][1],
+        )
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+
 def run_viewer(
     video_path: Path,
     keypoints_path: Path,
@@ -619,40 +689,81 @@ def run_viewer(
             cap.set(cv2.CAP_PROP_POS_MSEC, clip_start * 1000)
             attempted_seek = True
 
-    frame_index = 0
+    frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
     total_keypoint_frames = keypoints_data.frames.shape[0]
     clip_reference = (clip_start or 0.0) if attempted_seek else 0.0
-    playback_start = time.perf_counter()
+    playback_anchor = time.perf_counter()
+    paused = viewer_cfg.start_paused
+    show_subtitles = viewer_cfg.initial_subtitles
+    show_keypoints = viewer_cfg.initial_keypoints
+    pending_step = 0
+    current_original: Optional[np.ndarray] = None
+    current_video_pos_ms = float("nan")
 
     cv2.namedWindow(viewer_cfg.window_name, cv2.WINDOW_NORMAL)
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                if attempted_seek and frame_index == 0:
-                    print(
-                        "Advertencia: no fue posible posicionar el video en el timestamp del CSV. "
-                        "Se reproducirá desde el inicio."
-                    )
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    attempted_seek = False
-                    clip_reference = 0.0
-                    playback_start = time.perf_counter()
-                    continue
-                if viewer_cfg.loop:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    frame_index = 0
-                    playback_start = time.perf_counter()
-                    continue
+            step_direction = pending_step
+            pending_step = 0
+            need_new_frame = (
+                current_original is None or not paused or step_direction != 0
+            )
+            target_index: Optional[int] = None
+            if step_direction != 0:
+                target = frame_index + step_direction
+                if frame_count and frame_count > 0:
+                    max_index = max(0, int(frame_count) - 1)
+                    target = max(0, min(target, max_index))
+                else:
+                    target = max(0, target)
+                target_index = target
+                need_new_frame = True
+
+            if need_new_frame:
+                if target_index is not None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+                ok, grabbed = cap.read()
+                if not ok:
+                    if current_original is None and attempted_seek:
+                        print(
+                            "Advertencia: no fue posible posicionar el video en el "
+                            "timestamp del CSV. Se reproducirá desde el inicio."
+                        )
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        attempted_seek = False
+                        clip_reference = 0.0
+                        frame_index = 0
+                        playback_anchor = time.perf_counter()
+                        continue
+                    if viewer_cfg.loop:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        frame_index = 0
+                        current_original = None
+                        current_video_pos_ms = 0.0
+                        playback_anchor = time.perf_counter()
+                        continue
+                    break
+
+                current_original = grabbed
+                pos_frames = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                if target_index is not None:
+                    frame_index = target_index
+                elif pos_frames > 0:
+                    frame_index = max(0, int(round(pos_frames)) - 1)
+                else:
+                    frame_index = max(0, frame_index + 1)
+                current_video_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+
+            if current_original is None:
                 break
 
-            original_frame = frame.copy()
-            frame = _resize_frame(frame, viewer_cfg.display_scale)
+            original_frame = current_original
+            frame = _resize_frame(original_frame.copy(), viewer_cfg.display_scale)
 
-            raw_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            video_pos = raw_pos_ms / 1000.0 if raw_pos_ms > 0 else float("nan")
-            if math.isnan(video_pos) or video_pos <= 0:
+            if current_video_pos_ms > 0:
+                video_pos = current_video_pos_ms / 1000.0
+            else:
                 video_pos = frame_index / fps_video
                 if attempted_seek and clip_start:
                     video_pos += clip_start
@@ -663,7 +774,7 @@ def run_viewer(
             ) + viewer_cfg.video_offset
             subtitle_text = _select_subtitle(subtitles, subtitle_time)
 
-            if total_keypoint_frames > 0:
+            if show_keypoints and total_keypoint_frames > 0:
                 kp_time = relative_time + viewer_cfg.keypoints_offset
                 kp_frame = int(round(kp_time * fps_keypoints))
                 kp_frame = max(0, min(kp_frame, total_keypoint_frames - 1))
@@ -691,54 +802,80 @@ def run_viewer(
                     visibility,
                 )
 
-            if subtitle_text:
+            if show_subtitles and subtitle_text:
                 _draw_subtitles(frame, subtitle_text, viewer_cfg)
 
-            info = (
-                f"t={relative_time:0.2f}s | video={video_pos:0.2f}s | frame={frame_index}"
-            )
-            cv2.putText(
-                frame,
-                info,
-                (viewer_cfg.subtitle_margin, viewer_cfg.subtitle_margin + 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                1,
-                lineType=cv2.LINE_AA,
-            )
+            panel_lines = [
+                f"Video: {video_path}",
+                f"Keypoints: {keypoints_path}",
+                f"CSV: {subtitle_cfg.csv_path}",
+                (
+                    f"Tiempo clip={relative_time:0.2f}s | video={video_pos:0.2f}s "
+                    f"| frame={frame_index}"
+                ),
+                (
+                    f"FPS video={fps_video:0.2f} | keypoints="
+                    f"{_format_optional_float(fps_keypoints)}"
+                ),
+                (
+                    f"Offset video={viewer_cfg.video_offset:+0.2f}s | "
+                    f"keypoints={viewer_cfg.keypoints_offset:+0.2f}s"
+                ),
+                (
+                    f"Estado={'Pausa' if paused else 'Reproducción'} | "
+                    f"Subtítulos={'ON' if show_subtitles else 'OFF'} | "
+                    f"Keypoints={'ON' if show_keypoints else 'OFF'}"
+                ),
+                "Controles: Espacio=pausa | ←/→=paso | S=subtítulos | K=keypoints",
+            ]
+            _draw_info_panel(frame, viewer_cfg, panel_lines)
 
-            elapsed = time.perf_counter() - playback_start
-            target_elapsed = relative_time
-            remaining = target_elapsed - elapsed
-            dynamic_wait_ms = 0
-            if viewer_cfg.wait_time_ms != 0 and remaining > 0:
-                dynamic_wait_ms = int(round(remaining * 1000))
+            cv2.imshow(viewer_cfg.window_name, frame)
 
-            base_wait = viewer_cfg.wait_time_ms
-            if base_wait < 0:
-                base_wait = 0
-
-            if base_wait == 0:
-                wait_arg = 0
+            if paused:
+                playback_anchor = time.perf_counter() - relative_time
+                wait_arg = 100 if viewer_cfg.wait_time_ms != 0 else 1
             else:
-                wait_arg = max(base_wait, dynamic_wait_ms, 1)
+                elapsed = time.perf_counter() - playback_anchor
+                remaining = relative_time - elapsed
+                if viewer_cfg.wait_time_ms <= 0:
+                    wait_arg = 1
+                    if remaining > 0:
+                        wait_arg = max(wait_arg, int(round(remaining * 1000)))
+                else:
+                    wait_arg = viewer_cfg.wait_time_ms
+                    if remaining > 0:
+                        wait_arg = max(wait_arg, int(round(remaining * 1000)))
 
-            cv2.imshow(viewer_cfg.window_name, frame)
-            if viewer_cfg.wait_time_ms != 0:
-                delay = max(0.0, remaining)
-                if viewer_cfg.wait_time_ms > 0:
-                    delay = max(delay, viewer_cfg.wait_time_ms / 1000.0)
-                if delay > 0:
-                    time.sleep(delay)
-
-            cv2.imshow(viewer_cfg.window_name, frame)
-            wait_arg = 0 if viewer_cfg.wait_time_ms == 0 else 1
-            key = cv2.waitKey(wait_arg) & 0xFF
-            if key in (27, ord("q")):
-                break
-
-            frame_index += 1
+            key = cv2.waitKey(wait_arg)
+            if key != -1:
+                key &= 0xFF
+                if key in (27, ord("q")):
+                    break
+                if key == ord(" "):
+                    paused = not paused
+                    playback_anchor = time.perf_counter() - relative_time
+                    continue
+                if key in (81, ord(","), ord("[")):
+                    paused = True
+                    pending_step = -1
+                    continue
+                if key in (83, ord("."), ord("]")):
+                    paused = True
+                    pending_step = 1
+                    continue
+                if key in (ord("s"), ord("S")):
+                    show_subtitles = not show_subtitles
+                    continue
+                if key in (ord("k"), ord("K")):
+                    show_keypoints = not show_keypoints
+                    continue
+                if key == ord("r"):
+                    paused = viewer_cfg.start_paused
+                    show_subtitles = viewer_cfg.initial_subtitles
+                    show_keypoints = viewer_cfg.initial_keypoints
+                    playback_anchor = time.perf_counter() - relative_time
+                    continue
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -816,6 +953,11 @@ def _parse_args() -> argparse.Namespace:
         help="Tiempo de espera para cv2.waitKey (ms). Usa 0 para avanzar manualmente.",
     )
     parser.add_argument(
+        "--start-paused",
+        action="store_true",
+        help="Inicia el visor en pausa y avanza solo con atajos de teclado.",
+    )
+    parser.add_argument(
         "--loop",
         action="store_true",
         help="Reinicia el video automáticamente al llegar al final.",
@@ -877,6 +1019,20 @@ def _parse_args() -> argparse.Namespace:
         default=24,
         help="Margen en píxeles alrededor de los subtítulos.",
     )
+    subtitles_group = parser.add_mutually_exclusive_group()
+    subtitles_group.add_argument(
+        "--subtitles",
+        dest="initial_subtitles",
+        action="store_true",
+        default=True,
+        help="Muestra los subtítulos al iniciar (comportamiento por defecto).",
+    )
+    subtitles_group.add_argument(
+        "--no-subtitles",
+        dest="initial_subtitles",
+        action="store_false",
+        help="Oculta los subtítulos al iniciar la sesión.",
+    )
     kp_norm_group = parser.add_mutually_exclusive_group()
     kp_norm_group.add_argument(
         "--normalised-keypoints",
@@ -918,6 +1074,20 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Offset temporal (s) aplicado a los keypoints respecto del video.",
+    )
+    keypoints_group = parser.add_mutually_exclusive_group()
+    keypoints_group.add_argument(
+        "--keypoints",
+        dest="initial_keypoints",
+        action="store_true",
+        default=True,
+        help="Dibuja los keypoints al iniciar (comportamiento por defecto).",
+    )
+    keypoints_group.add_argument(
+        "--no-keypoints",
+        dest="initial_keypoints",
+        action="store_false",
+        help="Arranca con los keypoints ocultos en pantalla.",
     )
     parser.add_argument(
         "--fps",
@@ -995,6 +1165,9 @@ def main() -> None:
         draw_bones=args.draw_bones,
         face_point_stride=args.face_point_stride,
         max_face_points=args.max_face_points,
+        start_paused=args.start_paused,
+        initial_subtitles=args.initial_subtitles,
+        initial_keypoints=args.initial_keypoints,
     )
 
     if args.videos_dir and args.keypoints_dir:
