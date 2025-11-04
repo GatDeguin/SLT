@@ -589,6 +589,15 @@ def run_viewer(
                 wait_arg = max(base_wait, dynamic_wait_ms, 1)
 
             cv2.imshow(viewer_cfg.window_name, frame)
+            if viewer_cfg.wait_time_ms != 0:
+                delay = max(0.0, remaining)
+                if viewer_cfg.wait_time_ms > 0:
+                    delay = max(delay, viewer_cfg.wait_time_ms / 1000.0)
+                if delay > 0:
+                    time.sleep(delay)
+
+            cv2.imshow(viewer_cfg.window_name, frame)
+            wait_arg = 0 if viewer_cfg.wait_time_ms == 0 else 1
             key = cv2.waitKey(wait_arg) & 0xFF
             if key in (27, ord("q")):
                 break
