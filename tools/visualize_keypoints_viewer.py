@@ -505,6 +505,8 @@ def run_viewer(
     clip_reference = clip_start or 0.0
     playback_start = time.perf_counter()
 
+    cv2.namedWindow(viewer_cfg.window_name, cv2.WINDOW_NORMAL)
+
     try:
         while True:
             ok, frame = cap.read()
@@ -512,6 +514,7 @@ def run_viewer(
                 if viewer_cfg.loop:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     frame_index = 0
+                    playback_start = time.perf_counter()
                     continue
                 break
 
@@ -572,6 +575,20 @@ def run_viewer(
             elapsed = time.perf_counter() - playback_start
             target_elapsed = relative_time
             remaining = target_elapsed - elapsed
+            dynamic_wait_ms = 0
+            if viewer_cfg.wait_time_ms != 0 and remaining > 0:
+                dynamic_wait_ms = int(round(remaining * 1000))
+
+            base_wait = viewer_cfg.wait_time_ms
+            if base_wait < 0:
+                base_wait = 0
+
+            if base_wait == 0:
+                wait_arg = 0
+            else:
+                wait_arg = max(base_wait, dynamic_wait_ms, 1)
+
+            cv2.imshow(viewer_cfg.window_name, frame)
             if viewer_cfg.wait_time_ms != 0:
                 delay = max(0.0, remaining)
                 if viewer_cfg.wait_time_ms > 0:
