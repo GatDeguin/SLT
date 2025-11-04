@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -314,26 +315,34 @@ def _iter_clip_resources(
             f"No se hallaron filas que coincidan con {target!r} en {subtitle_cfg.csv_path}."
         )
 
-    for row in filtered:
+    def _prepare_entry(
+        row: Dict[str, str],
+        resolved_video: Optional[Path],
+    ) -> Tuple[Path, Path, SubtitleConfig, str]:
         clip_id = row.get(subtitle_cfg.id_column)
         if not clip_id:
             raise ValueError(
                 f"La fila {row} no contiene la columna {subtitle_cfg.id_column!r}."
             )
 
-        video_candidates = [clip_id]
         video_value = row.get(subtitle_cfg.video_column)
+        video_candidates = [clip_id]
         if video_value and video_value not in video_candidates:
             video_candidates.append(video_value)
 
-        video_path: Optional[Path] = None
-        for stem in video_candidates:
-            try:
-                video_path = _resolve_path_by_stem(videos_dir, stem, VIDEO_EXTENSIONS)
-                break
-            except FileNotFoundError:
-                continue
-        if not video_path:
+        video_path = resolved_video
+        if video_path is None:
+            for stem in video_candidates:
+                try:
+                    video_path = _resolve_path_by_stem(
+                        videos_dir,
+                        stem,
+                        VIDEO_EXTENSIONS,
+                    )
+                    break
+                except FileNotFoundError:
+                    continue
+        if video_path is None:
             raise FileNotFoundError(
                 f"No se encontró el video asociado a {clip_id!r} dentro de {videos_dir}."
             )
@@ -355,7 +364,63 @@ def _iter_clip_resources(
             target_video=video_value or subtitle_cfg.target_video,
         )
 
-        yield video_path, keypoints_path, clip_cfg, clip_id
+        return video_path, keypoints_path, clip_cfg, clip_id
+
+    if subtitle_cfg.target_id or subtitle_cfg.target_video:
+        for row in filtered:
+            yield _prepare_entry(row, None)
+        return
+
+    video_files = sorted(
+        path
+        for path in videos_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+    rows_by_id: Dict[str, Dict[str, str]] = {}
+    rows_by_video: Dict[str, List[Dict[str, str]]] = {}
+    for row in filtered:
+        clip_id = row.get(subtitle_cfg.id_column)
+        if clip_id:
+            rows_by_id[clip_id] = row
+        video_value = row.get(subtitle_cfg.video_column)
+        if video_value:
+            rows_by_video.setdefault(video_value, []).append(row)
+
+    yielded: set[str] = set()
+    for video_path in video_files:
+        stem = video_path.stem
+        matched_rows: List[Dict[str, str]] = []
+        row_by_id = rows_by_id.get(stem)
+        if row_by_id:
+            matched_rows.append(row_by_id)
+        else:
+            matched_rows.extend(rows_by_video.get(stem, []))
+
+        if not matched_rows:
+            print(
+                f"Advertencia: no se hallaron filas en {subtitle_cfg.csv_path} "
+                f"para el video {stem!r}."
+            )
+            continue
+
+        for row in matched_rows:
+            clip_id = row.get(subtitle_cfg.id_column)
+            if not clip_id or clip_id in yielded:
+                continue
+            yielded.add(clip_id)
+            yield _prepare_entry(row, video_path)
+
+    missing_rows = [
+        row
+        for row in filtered
+        if row.get(subtitle_cfg.id_column) and row.get(subtitle_cfg.id_column) not in yielded
+    ]
+    for row in missing_rows:
+        clip_id = row.get(subtitle_cfg.id_column) or "<sin id>"
+        print(
+            f"Advertencia: no se encontró un video en {videos_dir} para el clip {clip_id!r}."
+        )
 
 
 def _select_subtitle(segments: Sequence[SubtitleEntry], timestamp: float) -> str:
@@ -437,6 +502,8 @@ def run_viewer(
 
     frame_index = 0
     total_keypoint_frames = keypoints_data.frames.shape[0]
+    clip_reference = clip_start or 0.0
+    playback_start = time.perf_counter()
 
     try:
         while True:
@@ -451,11 +518,21 @@ def run_viewer(
             original_frame = frame.copy()
             frame = _resize_frame(frame, viewer_cfg.display_scale)
 
-            timestamp = frame_index / fps_video + viewer_cfg.video_offset
-            subtitle_text = _select_subtitle(subtitles, timestamp)
+            raw_pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            video_pos = raw_pos_ms / 1000.0 if raw_pos_ms > 0 else float("nan")
+            if math.isnan(video_pos) or video_pos <= 0:
+                video_pos = frame_index / fps_video
+                if viewer_cfg.seek_to_start and clip_start:
+                    video_pos += clip_start
+
+            relative_time = max(0.0, video_pos - clip_reference)
+            subtitle_time = (
+                video_pos if subtitle_cfg.absolute_times else relative_time
+            ) + viewer_cfg.video_offset
+            subtitle_text = _select_subtitle(subtitles, subtitle_time)
 
             if total_keypoint_frames > 0:
-                kp_time = timestamp + viewer_cfg.keypoints_offset
+                kp_time = relative_time + viewer_cfg.keypoints_offset
                 kp_frame = int(round(kp_time * fps_keypoints))
                 kp_frame = max(0, min(kp_frame, total_keypoint_frames - 1))
                 kp_array = keypoints_data.frames[kp_frame].copy()
@@ -478,7 +555,9 @@ def run_viewer(
             if subtitle_text:
                 _draw_subtitles(frame, subtitle_text, viewer_cfg)
 
-            info = f"t={timestamp:0.2f}s frame={frame_index}"
+            info = (
+                f"t={relative_time:0.2f}s | video={video_pos:0.2f}s | frame={frame_index}"
+            )
             cv2.putText(
                 frame,
                 info,
@@ -490,8 +569,19 @@ def run_viewer(
                 lineType=cv2.LINE_AA,
             )
 
+            elapsed = time.perf_counter() - playback_start
+            target_elapsed = relative_time
+            remaining = target_elapsed - elapsed
+            if viewer_cfg.wait_time_ms != 0:
+                delay = max(0.0, remaining)
+                if viewer_cfg.wait_time_ms > 0:
+                    delay = max(delay, viewer_cfg.wait_time_ms / 1000.0)
+                if delay > 0:
+                    time.sleep(delay)
+
             cv2.imshow(viewer_cfg.window_name, frame)
-            key = cv2.waitKey(viewer_cfg.wait_time_ms) & 0xFF
+            wait_arg = 0 if viewer_cfg.wait_time_ms == 0 else 1
+            key = cv2.waitKey(wait_arg) & 0xFF
             if key in (27, ord("q")):
                 break
 
