@@ -36,17 +36,23 @@ cuando necesites procesar videos o ejecutar demos.
   referencia para detectar regresiones en CI.
 - `visualize_keypoints_viewer.py`: renderiza video, keypoints y subtítulos para
   validar su alineación temporal. Instala el paquete en modo editable y ejecuta
-  `slt-visualize-keypoints --help` para ver todas las opciones; un ejemplo
-  mínimo sería:
+  `slt-visualize-keypoints --help` para ver todas las opciones. Puedes ejecutar
+  el visor sobre un clip puntual o recorrer un directorio completo:
 
   ```bash
+  # Clip individual
   slt-visualize-keypoints \
     --video data/single_signer/raw/sample.mp4 \
     --keypoints data/single_signer/processed/keypoints/sample.npz \
     --csv meta.csv \
     --segment-id sample_0001
+
+  # Carpeta con múltiples clips (usa meta.csv para resolver el orden)
+  slt-visualize-keypoints \
+    --videos-dir data/single_signer/processed/clips \
+    --keypoints-dir data/single_signer/processed/keypoints \
+    --csv meta.csv
   ```
-  validar su alineación temporal.
 
 ## Entrenamiento
 
