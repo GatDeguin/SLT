@@ -9,7 +9,7 @@ import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -68,6 +68,8 @@ class ViewerConfig:
     keypoints_offset: float = 0.0
     seek_to_start: bool = True
     draw_bones: bool = True
+    face_point_stride: int = 1
+    max_face_points: Optional[int] = None
 
 
 @dataclass
@@ -112,6 +114,31 @@ def _wrap_text(
         lines.append(" ".join(current))
 
     return lines
+
+
+def _parse_face_subset_arg(value: str) -> List[int]:
+    """Convierte una lista separada por comas en enteros no negativos."""
+
+    text = value.strip()
+    if not text:
+        return []
+    try:
+        items = [int(part.strip()) for part in text.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Los índices de --face-landmark-subset deben ser enteros"
+        ) from exc
+    for idx in items:
+        if idx < 0:
+            raise argparse.ArgumentTypeError(
+                "--face-landmark-subset no admite valores negativos"
+            )
+    # Se preserva el orden y se eliminan duplicados manualmente.
+    unique: List[int] = []
+    for idx in items:
+        if idx not in unique:
+            unique.append(idx)
+    return unique
 
 
 def _draw_subtitles(
@@ -223,7 +250,12 @@ def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[
     return segments, (None if cfg.absolute_times else clip_start)
 
 
-def _load_keypoints(path: Path, fps: Optional[float]) -> KeypointData:
+def _load_keypoints(
+    path: Path,
+    fps: Optional[float],
+    *,
+    face_subset: Optional[Sequence[int]] = None,
+) -> KeypointData:
     """Lee el archivo de keypoints y arma un layout estándar."""
 
     if not path.exists():
@@ -246,7 +278,7 @@ def _load_keypoints(path: Path, fps: Optional[float]) -> KeypointData:
         raise ValueError(f"Los keypoints deben tener forma (T, N, C); recibido {frames.shape}.")
 
     num_landmarks = frames.shape[1]
-    layout = _resolve_mediapipe_layout(num_landmarks)
+    layout = _resolve_mediapipe_layout(num_landmarks, face_subset=face_subset)
     connections = _resolve_mediapipe_connections(layout)
 
     fps_value = float(fps) if fps and fps > 0 else math.nan
@@ -479,7 +511,18 @@ def _draw_keypoints(
 
     for name, indices in layout.items():
         color = colors.get(name, (255, 255, 255))
-        for idx in indices:
+        segment_indices = list(indices)
+        if name == "face":
+            stride = max(1, viewer_cfg.face_point_stride)
+            if stride > 1:
+                segment_indices = segment_indices[::stride]
+            if viewer_cfg.max_face_points is not None:
+                limit = max(0, int(viewer_cfg.max_face_points))
+                segment_indices = segment_indices[:limit]
+        allowed_indices: Optional[Set[int]] = (
+            set(segment_indices) if name == "face" else None
+        )
+        for idx in segment_indices:
             if idx >= num_points or not valid_mask[idx]:
                 continue
             x, y = keypoints[idx, :2]
@@ -498,6 +541,10 @@ def _draw_keypoints(
                 or end_idx >= num_points
                 or not valid_mask[start_idx]
                 or not valid_mask[end_idx]
+            ):
+                continue
+            if allowed_indices is not None and (
+                start_idx not in allowed_indices or end_idx not in allowed_indices
             ):
                 continue
             start_point = (
@@ -526,11 +573,16 @@ def run_viewer(
     viewer_cfg: ViewerConfig,
     video_fps: Optional[float] = None,
     keypoints_fps: Optional[float] = None,
+    face_subset: Optional[Sequence[int]] = None,
 ) -> None:
     """Ejecuta el bucle principal del visor."""
 
     subtitles, clip_start = _load_subtitles(subtitle_cfg)
-    keypoints_data = _load_keypoints(keypoints_path, keypoints_fps)
+    keypoints_data = _load_keypoints(
+        keypoints_path,
+        keypoints_fps,
+        face_subset=face_subset,
+    )
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -793,6 +845,27 @@ def _parse_args() -> argparse.Namespace:
         help="Confianza mínima para dibujar un keypoint.",
     )
     parser.add_argument(
+        "--face-landmark-subset",
+        type=_parse_face_subset_arg,
+        help=(
+            "Selecciona índices faciales (0-467) relativos a MediaPipe. "
+            "Ejemplo: 1,133,362,13 para la vista mínima heredada."
+        ),
+    )
+    parser.add_argument(
+        "--face-point-stride",
+        type=int,
+        default=1,
+        help="Dibuja un punto facial cada N índices (>=1).",
+    )
+    parser.add_argument(
+        "--max-face-points",
+        type=int,
+        help=(
+            "Máximo de puntos faciales tras aplicar el stride (permite 0 para ocultarlos)."
+        ),
+    )
+    parser.add_argument(
         "--subtitle-width",
         type=int,
         default=900,
@@ -880,6 +953,11 @@ def _parse_args() -> argparse.Namespace:
                 "--videos-dir/--keypoints-dir."
             )
 
+    if args.face_point_stride <= 0:
+        parser.error("--face-point-stride debe ser >= 1.")
+    if args.max_face_points is not None and args.max_face_points < 0:
+        parser.error("--max-face-points no puede ser negativo.")
+
     return args
 
 
@@ -915,6 +993,8 @@ def main() -> None:
         keypoints_offset=args.keypoints_offset,
         seek_to_start=not args.no_seek,
         draw_bones=args.draw_bones,
+        face_point_stride=args.face_point_stride,
+        max_face_points=args.max_face_points,
     )
 
     if args.videos_dir and args.keypoints_dir:
@@ -935,6 +1015,7 @@ def main() -> None:
                     viewer_cfg=viewer_cfg,
                     video_fps=args.fps,
                     keypoints_fps=args.keypoints_fps,
+                    face_subset=args.face_landmark_subset,
                 )
             except KeyboardInterrupt:
                 print("Interrupción del usuario. Finalizando.")
@@ -955,6 +1036,7 @@ def main() -> None:
             viewer_cfg=viewer_cfg,
             video_fps=args.fps,
             keypoints_fps=args.keypoints_fps,
+            face_subset=args.face_landmark_subset,
         )
 
 

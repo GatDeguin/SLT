@@ -54,6 +54,9 @@ cuando necesites procesar videos o ejecutar demos.
     --csv meta.csv
   ```
   Usa `--no-draw-bones` para ocultar las líneas entre keypoints si resultan distractoras.
+  El visor ahora dibuja los 468 landmarks faciales completos; controla la densidad con
+  `--face-point-stride`/`--max-face-points` o recupera la vista compacta heredada con
+  `--face-landmark-subset 1,133,362,13`.
 
 ## Entrenamiento
 

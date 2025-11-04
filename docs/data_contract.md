@@ -45,9 +45,12 @@ Los `pose/*.npz` deben contener la clave `pose` con valores `float32`.
   `(0.5, 0.5)`. Cuando no hay landmarks válidos se escribe un sentinel con
   `-1` en las coordenadas y visibilidad `0`.
 - `processed/keypoints/`: matrices `.npy` o `.npz` con keypoints MediaPipe en
-  formato `(T, 543, 3)` donde la última dimensión guarda `(x, y, conf)`. Los
-  `.npz` deben incluir la clave `keypoints` y, opcionalmente, `layout=
-  "mediapipe_holistic_v1"` para documentar el origen del layout.
+  formato `(T, 543, 3)` donde la última dimensión guarda `(x, y, conf)`. El
+  dataset conserva por defecto los 468 landmarks faciales exportados por
+  MediaPipe; pueden filtrarse mediante `face_landmark_subset` cuando sea
+  necesario reducir memoria o ancho de banda. Los `.npz` deben incluir la clave
+  `keypoints` y, opcionalmente, `layout="mediapipe_holistic_v1"` para
+  documentar el origen del layout.
 - `index/*.csv`: listas de `video_id` (una columna, sin encabezado) utilizadas
   para los splits de entrenamiento, validación y prueba.
 - `metadata.jsonl`: emitido por `tools/extract_rois_v2.py` con métricas por
@@ -158,7 +161,9 @@ Cada ejemplo entregado por el dataset incluye:
 - `keypoints`: tensor `(T, L, 3)` con los keypoints raw normalizados y
   reordenados según MSKA.
 - `keypoints_*`: vistas separadas (`body`, `hand_l`, `hand_r`, `face`) con sus
-  máscaras por landmark (`*_mask`) y por frame (`*_frame_mask`).
+  máscaras por landmark (`*_mask`) y por frame (`*_frame_mask`). La vista de
+  rostro incluye los 468 puntos cuando se usa el layout completo; se puede
+  acotar pasando `face_landmark_subset` al constructor del dataset.
 - `keypoints_lengths`: vector con las longitudes efectivas por vista.
 - `ctc_labels`, `ctc_mask`, `ctc_lengths`: tensores preparados para pérdidas
   CTC cuando hay metadata de glosas.
