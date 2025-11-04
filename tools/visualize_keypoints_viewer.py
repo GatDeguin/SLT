@@ -314,26 +314,34 @@ def _iter_clip_resources(
             f"No se hallaron filas que coincidan con {target!r} en {subtitle_cfg.csv_path}."
         )
 
-    for row in filtered:
+    def _prepare_entry(
+        row: Dict[str, str],
+        resolved_video: Optional[Path],
+    ) -> Tuple[Path, Path, SubtitleConfig, str]:
         clip_id = row.get(subtitle_cfg.id_column)
         if not clip_id:
             raise ValueError(
                 f"La fila {row} no contiene la columna {subtitle_cfg.id_column!r}."
             )
 
-        video_candidates = [clip_id]
         video_value = row.get(subtitle_cfg.video_column)
+        video_candidates = [clip_id]
         if video_value and video_value not in video_candidates:
             video_candidates.append(video_value)
 
-        video_path: Optional[Path] = None
-        for stem in video_candidates:
-            try:
-                video_path = _resolve_path_by_stem(videos_dir, stem, VIDEO_EXTENSIONS)
-                break
-            except FileNotFoundError:
-                continue
-        if not video_path:
+        video_path = resolved_video
+        if video_path is None:
+            for stem in video_candidates:
+                try:
+                    video_path = _resolve_path_by_stem(
+                        videos_dir,
+                        stem,
+                        VIDEO_EXTENSIONS,
+                    )
+                    break
+                except FileNotFoundError:
+                    continue
+        if video_path is None:
             raise FileNotFoundError(
                 f"No se encontró el video asociado a {clip_id!r} dentro de {videos_dir}."
             )
@@ -355,7 +363,63 @@ def _iter_clip_resources(
             target_video=video_value or subtitle_cfg.target_video,
         )
 
-        yield video_path, keypoints_path, clip_cfg, clip_id
+        return video_path, keypoints_path, clip_cfg, clip_id
+
+    if subtitle_cfg.target_id or subtitle_cfg.target_video:
+        for row in filtered:
+            yield _prepare_entry(row, None)
+        return
+
+    video_files = sorted(
+        path
+        for path in videos_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+    rows_by_id: Dict[str, Dict[str, str]] = {}
+    rows_by_video: Dict[str, List[Dict[str, str]]] = {}
+    for row in filtered:
+        clip_id = row.get(subtitle_cfg.id_column)
+        if clip_id:
+            rows_by_id[clip_id] = row
+        video_value = row.get(subtitle_cfg.video_column)
+        if video_value:
+            rows_by_video.setdefault(video_value, []).append(row)
+
+    yielded: set[str] = set()
+    for video_path in video_files:
+        stem = video_path.stem
+        matched_rows: List[Dict[str, str]] = []
+        row_by_id = rows_by_id.get(stem)
+        if row_by_id:
+            matched_rows.append(row_by_id)
+        else:
+            matched_rows.extend(rows_by_video.get(stem, []))
+
+        if not matched_rows:
+            print(
+                f"Advertencia: no se hallaron filas en {subtitle_cfg.csv_path} "
+                f"para el video {stem!r}."
+            )
+            continue
+
+        for row in matched_rows:
+            clip_id = row.get(subtitle_cfg.id_column)
+            if not clip_id or clip_id in yielded:
+                continue
+            yielded.add(clip_id)
+            yield _prepare_entry(row, video_path)
+
+    missing_rows = [
+        row
+        for row in filtered
+        if row.get(subtitle_cfg.id_column) and row.get(subtitle_cfg.id_column) not in yielded
+    ]
+    for row in missing_rows:
+        clip_id = row.get(subtitle_cfg.id_column) or "<sin id>"
+        print(
+            f"Advertencia: no se encontró un video en {videos_dir} para el clip {clip_id!r}."
+        )
 
 
 def _select_subtitle(segments: Sequence[SubtitleEntry], timestamp: float) -> str:
