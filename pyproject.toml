@@ -48,6 +48,7 @@ dev = [
 
 [project.scripts]
 slt-demo = "slt.__main__:main"
+slt-visualize-keypoints = "tools.visualize_keypoints_viewer:main"
 
 [tool.setuptools.packages.find]
 include = ["slt*"]

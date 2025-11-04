@@ -489,6 +489,21 @@ def _parse_args() -> argparse.Namespace:
         default=24,
         help="Margen en píxeles alrededor de los subtítulos.",
     )
+    kp_norm_group = parser.add_mutually_exclusive_group()
+    kp_norm_group.add_argument(
+        "--normalised-keypoints",
+        dest="normalised_keypoints",
+        action="store_true",
+        default=True,
+        help=(
+            "Interpreta los keypoints en coordenadas normalizadas [0, 1]. "
+            "Usa --absolute-keypoints para desactivarlo."
+        ),
+    )
+    kp_norm_group.add_argument(
+        "--absolute-keypoints",
+        dest="normalised_keypoints",
+        action="store_false",
     parser.add_argument(
         "--normalised-keypoints",
         action="store_true",
@@ -558,6 +573,7 @@ def main() -> None:
         subtitle_margin=args.subtitle_margin,
         subtitle_max_width=args.subtitle_width,
         confidence_threshold=args.confidence_threshold,
+        normalised_keypoints=args.normalised_keypoints,
         normalised_keypoints=not args.absolute_keypoints,
         video_offset=args.video_offset,
         keypoints_offset=args.keypoints_offset,
