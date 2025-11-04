@@ -83,18 +83,51 @@ class SampleItem:
 _MSKA_FACE_SUBSET = [1, 133, 362, 13]
 
 
-def _resolve_mediapipe_layout(num_landmarks: int) -> Dict[str, List[int]]:
+def _resolve_mediapipe_layout(
+    num_landmarks: int,
+    *,
+    face_subset: Optional[Sequence[int]] = None,
+) -> Dict[str, List[int]]:
     """Devuelve el layout de índices esperado para los keypoints de MediaPipe."""
 
     if num_landmarks >= 543:
         face_offset = 33
         hand_l_offset = face_offset + 468
         hand_r_offset = hand_l_offset + 21
+        face_indices = [face_offset + idx for idx in range(468)]
+        if face_subset is not None:
+            try:
+                subset = [int(value) for value in face_subset]
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "face_subset debe ser una secuencia de enteros"
+                ) from exc
+            filtered: List[int] = []
+            for rel_idx in subset:
+                if rel_idx < 0 or rel_idx >= len(face_indices):
+                    warnings.warn(
+                        "Índice facial fuera de rango en face_subset (%d); se ignorará."
+                        % rel_idx,
+                        stacklevel=2,
+                    )
+                    continue
+                abs_idx = face_offset + rel_idx
+                if abs_idx not in filtered:
+                    filtered.append(abs_idx)
+            if filtered:
+                face_indices = filtered
+            elif not subset:
+                face_indices = []
+            else:
+                warnings.warn(
+                    "face_subset vacío o inválido; se usará el rango completo de 468 puntos.",
+                    stacklevel=2,
+                )
         layout = {
             "body": list(range(0, 33)),
             "hand_l": list(range(hand_l_offset, hand_l_offset + 21)),
             "hand_r": list(range(hand_r_offset, hand_r_offset + 21)),
-            "face": [face_offset + idx for idx in _MSKA_FACE_SUBSET],
+            "face": face_indices,
         }
         return {key: list(value) for key, value in layout.items()}
     if num_landmarks == 79:
@@ -249,6 +282,7 @@ class LsaTMultiStream(Dataset):
         keypoint_translate_range: Optional[Sequence[float]] = None,
         keypoint_rotate_range: Optional[Sequence[float]] = None,
         keypoint_resample_range: Optional[Sequence[float]] = None,
+        face_landmark_subset: Optional[Sequence[int]] = None,
     ) -> None:
         pd = _get_pandas()
         np = _get_numpy()
@@ -294,6 +328,9 @@ class LsaTMultiStream(Dataset):
         self._roi_npz_cache: Dict[str, Any] = {}
         self._keypoint_layout: Optional[Dict[str, List[int]]] = None
         self._keypoint_total: int = 0
+        self._face_landmark_subset = self._normalise_face_subset(
+            face_landmark_subset
+        )
         self._gloss_sequences: Dict[str, List[str]] = {}
         self._gloss_texts: Dict[str, str] = {}
         self._ctc_labels: Dict[str, torch.Tensor] = {}
@@ -608,11 +645,36 @@ class LsaTMultiStream(Dataset):
             f"{field_name} espera 1, 2 o 4 valores; se recibieron {len(items)}"
         )
 
+    def _normalise_face_subset(
+        self,
+        value: Optional[Sequence[int]],
+    ) -> Optional[List[int]]:
+        if value is None:
+            return None
+        try:
+            subset = [int(v) for v in value]
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "face_landmark_subset debe ser una secuencia de enteros"
+            ) from exc
+        cleaned: List[int] = []
+        for idx in subset:
+            if idx < 0:
+                raise ValueError(
+                    "face_landmark_subset no admite índices negativos."
+                )
+            if idx not in cleaned:
+                cleaned.append(idx)
+        return cleaned
+
     def _ensure_keypoint_layout(self, num_landmarks: int) -> None:
         if num_landmarks <= 0:
             return
         if self._keypoint_layout is None:
-            layout = _resolve_mediapipe_layout(num_landmarks)
+            layout = _resolve_mediapipe_layout(
+                num_landmarks,
+                face_subset=self._face_landmark_subset,
+            )
             self._keypoint_layout = layout
             self._keypoint_total = sum(len(v) for v in layout.values())
             self._keypoint_source_total = num_landmarks

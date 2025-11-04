@@ -97,6 +97,9 @@ adaptar el pipeline a otros datasets.
      --csv meta.csv
    ```
    Añade `--no-draw-bones` si necesitas revisar únicamente las posiciones sin las líneas.
+   Con los 468 landmarks faciales activos por defecto, puedes acelerar el render con
+   `--face-point-stride 5` o limitar el máximo a 150 puntos. Para recuperar el subconjunto
+   compacto previo pasa `--face-landmark-subset 1,133,362,13`.
 3. **Entrenar con pérdidas combinadas** mediante
    `tools/train_slt_multistream_v9.py --use-mska`, definiendo los pesos de
    traducción, CTC y distilación según el escenario (ver ejemplos en
