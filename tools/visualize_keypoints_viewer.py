@@ -199,7 +199,10 @@ def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[
     if not cfg.csv_path.exists():
         raise FileNotFoundError(f"No se encontró el CSV: {cfg.csv_path}")
 
-    with cfg.csv_path.open("r", encoding="utf-8") as fh:
+    # ``utf-8-sig`` asegura que los archivos con BOM se decodifiquen correctamente
+    # evitando caracteres espurios (por ejemplo ``\ufeff``) en los subtítulos y
+    # cabeceras del CSV.
+    with cfg.csv_path.open("r", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh, delimiter=cfg.delimiter)
         rows = list(reader)
 
@@ -330,7 +333,9 @@ def _iter_clip_resources(
     if not keypoints_dir.is_dir():
         raise FileNotFoundError(f"El directorio de keypoints no existe: {keypoints_dir}")
 
-    with subtitle_cfg.csv_path.open("r", encoding="utf-8") as fh:
+    # ``utf-8-sig`` evita que un posible BOM se propague a los textos mostrados
+    # en el visor, donde puede aparecer como caracteres "??" al renderizarse.
+    with subtitle_cfg.csv_path.open("r", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh, delimiter=subtitle_cfg.delimiter)
         rows = list(reader)
 
