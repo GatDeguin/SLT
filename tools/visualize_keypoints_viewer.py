@@ -60,8 +60,8 @@ class ViewerConfig:
     wait_time_ms: int = 1
     loop: bool = False
     display_scale: float = 1.0
-    font_scale: float = 0.8
-    font_thickness: int = 2
+    font_scale: float = 1.2
+    font_thickness: int = 3
     subtitle_margin: int = 24
     subtitle_max_width: int = 900
     confidence_threshold: float = 0.2
@@ -199,7 +199,7 @@ def _draw_subtitles(
 ) -> None:
     """Superpone el subtítulo activo sobre ``frame``."""
 
-    font_size = max(12, int(round(32 * viewer_cfg.font_scale)))
+    font_size = max(18, int(round(36 * viewer_cfg.font_scale)))
     font = _load_font(font_size)
 
     available_width = max(
@@ -222,7 +222,7 @@ def _draw_subtitles(
     except AttributeError:
         bbox = dummy_draw.textbbox((0, 0), "Ag", font=font)
         base_height = bbox[3] - bbox[1]
-    line_spacing = max(2, int(base_height * 0.25))
+    line_spacing = max(4, int(base_height * 0.25))
     line_height = base_height + line_spacing
 
     y_base = frame.shape[0] - viewer_cfg.subtitle_margin
@@ -654,9 +654,9 @@ def _draw_info_panel(
         return
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.5, viewer_cfg.font_scale * 0.6)
-    thickness = max(1, viewer_cfg.font_thickness - 1)
-    padding = 10
+    scale = max(0.7, viewer_cfg.font_scale * 0.75)
+    thickness = max(2, int(round(viewer_cfg.font_thickness * 0.75)))
+    padding = 14
     margin = viewer_cfg.subtitle_margin
     max_width = max(int(frame.shape[1] * 0.65), 320)
 
@@ -1045,14 +1045,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--font-scale",
         type=float,
-        default=0.8,
-        help="Escala de fuente para los subtítulos.",
+        default=1.2,
+        help="Escala base para subtítulos y panel informativo.",
     )
     parser.add_argument(
         "--font-thickness",
         type=int,
-        default=2,
-        help="Grosor de fuente para subtítulos.",
+        default=3,
+        help="Grosor base de los textos renderizados.",
     )
     parser.add_argument(
         "--confidence-threshold",
