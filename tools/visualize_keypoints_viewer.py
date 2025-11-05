@@ -107,7 +107,14 @@ def _load_font(size: int) -> ImageFont.ImageFont:
             return ImageFont.truetype(str(candidate), size=size)
         except OSError:
             continue
-    return ImageFont.load_default()
+
+    fallback = ImageFont.load_default()
+    if hasattr(fallback, "font_variant"):
+        try:
+            return fallback.font_variant(size=size)
+        except Exception:
+            pass
+    return fallback
 
 
 def _wrap_text(
