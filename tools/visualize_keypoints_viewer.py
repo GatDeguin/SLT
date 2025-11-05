@@ -60,7 +60,7 @@ class ViewerConfig:
     wait_time_ms: int = 1
     loop: bool = False
     display_scale: float = 1.0
-    font_scale: float = 1.2
+    font_scale: float = 1.4
     font_thickness: int = 3
     subtitle_margin: int = 24
     subtitle_max_width: int = 900
@@ -94,10 +94,19 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 def _load_font(size: int) -> ImageFont.ImageFont:
     """Carga la fuente TrueType deseada o recurre a la predeterminada."""
 
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size=size)
-    except OSError:
-        return ImageFont.load_default()
+    candidates = [
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        Path(__file__).with_name("DejaVuSans.ttf"),
+        Path(__file__).with_name("fonts/DejaVuSans.ttf"),
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(str(candidate), size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def _wrap_text(
@@ -199,7 +208,7 @@ def _draw_subtitles(
 ) -> None:
     """Superpone el subtítulo activo sobre ``frame``."""
 
-    font_size = max(18, int(round(36 * viewer_cfg.font_scale)))
+    font_size = max(24, int(round(48 * viewer_cfg.font_scale)))
     font = _load_font(font_size)
 
     available_width = max(
