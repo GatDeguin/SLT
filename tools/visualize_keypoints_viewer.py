@@ -92,29 +92,37 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
 @lru_cache(maxsize=8)
 def _load_font(size: int) -> ImageFont.ImageFont:
-    """Carga la fuente TrueType deseada o recurre a la predeterminada."""
+    """Carga la fuente TrueType deseada o informa de los fallos encontrados."""
 
-    module_path = Path(__file__)
-    candidates = [
-        "DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/local/share/fonts/DejaVuSans.ttf",
-        module_path.with_name("DejaVuSans.ttf"),
-        module_path.with_name("fonts") / "DejaVuSans.ttf",
-    ]
+    module_dir = Path(__file__).resolve().parent
+    packaged_font = module_dir / "fonts" / "DejaVuSans.ttf"
+
+    candidates: List[Path] = []
+    if packaged_font.exists():
+        candidates.append(packaged_font)
+
+    candidates.extend(
+        [
+            Path("DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/local/share/fonts/DejaVuSans.ttf"),
+            module_dir / "DejaVuSans.ttf",
+        ]
+    )
+
+    errors: List[str] = []
     for candidate in candidates:
         try:
             return ImageFont.truetype(str(candidate), size=size)
-        except OSError:
-            continue
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
 
-    fallback = ImageFont.load_default()
-    if hasattr(fallback, "font_variant"):
-        try:
-            return fallback.font_variant(size=size)
-        except Exception:
-            pass
-    return fallback
+    searched_paths = ", ".join(str(path) for path in candidates)
+    error_hint = "\n".join(errors) if errors else "Font file not found."
+    raise RuntimeError(
+        "No se pudo cargar la fuente DejaVuSans.ttf. "
+        f"Rutas intentadas: {searched_paths}.\nDetalles: {error_hint}"
+    )
 
 
 def _wrap_text(
