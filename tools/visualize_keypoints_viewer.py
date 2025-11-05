@@ -94,12 +94,13 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 def _load_font(size: int) -> ImageFont.ImageFont:
     """Carga la fuente TrueType deseada o recurre a la predeterminada."""
 
+    module_path = Path(__file__)
     candidates = [
         "DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/local/share/fonts/DejaVuSans.ttf",
-        Path(__file__).with_name("DejaVuSans.ttf"),
-        Path(__file__).with_name("fonts/DejaVuSans.ttf"),
+        module_path.with_name("DejaVuSans.ttf"),
+        module_path.with_name("fonts") / "DejaVuSans.ttf",
     ]
     for candidate in candidates:
         try:
