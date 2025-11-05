@@ -670,61 +670,61 @@ def _draw_info_panel(
     if not lines:
         return
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.7, viewer_cfg.font_scale * 0.75)
-    thickness = max(2, int(round(viewer_cfg.font_thickness * 0.75)))
+    font_size = max(16, int(round(32 * scale)))
+    font = _load_font(font_size)
+
     padding = 14
     margin = viewer_cfg.subtitle_margin
     max_width = max(int(frame.shape[1] * 0.65), 320)
+    available_width = max(1, max_width - 2 * padding)
 
     wrapped: List[str] = []
     for line in lines:
-        wrapped.extend(
-            _wrap_text_cv2(
-                line,
-                font=font,
-                scale=scale,
-                thickness=thickness,
-                max_width=max_width - 2 * padding,
-            )
-        )
+        wrapped.extend(_wrap_text(line, font=font, max_width=available_width))
 
     if not wrapped:
         return
 
-    text_sizes = [cv2.getTextSize(text, font, scale, thickness)[0] for text in wrapped]
-    line_height = max(size[1] for size in text_sizes) + 6
-    panel_width = min(max_width, max(size[0] for size in text_sizes) + 2 * padding)
+    dummy_image = Image.new("RGB", (1, 1))
+    dummy_draw = ImageDraw.Draw(dummy_image)
+    try:
+        ascent, descent = font.getmetrics()
+        base_height = ascent + descent
+    except AttributeError:
+        bbox = dummy_draw.textbbox((0, 0), "Ag", font=font)
+        base_height = bbox[3] - bbox[1]
+
+    text_bboxes = [dummy_draw.textbbox((0, 0), text, font=font) for text in wrapped]
+    text_widths = [bbox[2] - bbox[0] for bbox in text_bboxes]
+    line_height = base_height + max(6, int(round(base_height * 0.15)))
+
+    panel_width = min(max_width, max(text_widths) + 2 * padding)
     panel_height = len(wrapped) * line_height + 2 * padding
 
     top_left = (margin, margin)
     bottom_right = (top_left[0] + panel_width, top_left[1] + panel_height)
 
-    overlay = frame.copy()
-    cv2.rectangle(
-        overlay,
-        top_left,
-        bottom_right,
-        color=(0, 0, 0),
-        thickness=-1,
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb_frame).convert("RGBA")
+
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle(
+        [top_left, bottom_right],
+        fill=(0, 0, 0, int(255 * 0.6)),
     )
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, dst=frame)
+
+    image = Image.alpha_composite(image, overlay)
+    draw = ImageDraw.Draw(image)
 
     for idx, text in enumerate(wrapped):
-        origin = (
-            top_left[0] + padding,
-            top_left[1] + padding + idx * line_height + text_sizes[idx][1],
-        )
-        cv2.putText(
-            frame,
-            text,
-            origin,
-            font,
-            scale,
-            (255, 255, 255),
-            thickness,
-            lineType=cv2.LINE_AA,
-        )
+        x = top_left[0] + padding
+        y = top_left[1] + padding + idx * line_height
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+
+    updated = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    frame[:, :, :] = updated
 
 
 def run_viewer(
