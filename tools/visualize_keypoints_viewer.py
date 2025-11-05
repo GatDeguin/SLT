@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+from functools import lru_cache
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tupl
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from slt.data.lsa_t_multistream import (
     _resolve_mediapipe_connections,
@@ -88,11 +90,19 @@ class KeypointData:
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
 
+@lru_cache(maxsize=8)
+def _load_font(size: int) -> ImageFont.ImageFont:
+    """Carga la fuente TrueType deseada o recurre a la predeterminada."""
+
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
 def _wrap_text(
     text: str,
-    font: int,
-    font_scale: float,
-    thickness: int,
+    font: ImageFont.ImageFont,
     max_width: int,
 ) -> List[str]:
     """Divide el subtítulo en líneas que quepan en ``max_width`` píxeles."""
@@ -101,12 +111,17 @@ def _wrap_text(
     if not words:
         return [""]
 
+    max_width = max(max_width, 1)
+    dummy_image = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(dummy_image)
+
     lines: List[str] = []
     current: List[str] = []
 
     for word in words:
         tentative = " ".join(current + [word])
-        width, _ = cv2.getTextSize(tentative, font, font_scale, thickness)[0]
+        bbox = draw.textbbox((0, 0), tentative, font=font)
+        width = bbox[2] - bbox[0]
         if width <= max_width or not current:
             current.append(word)
             continue
@@ -151,46 +166,61 @@ def _draw_subtitles(
 ) -> None:
     """Superpone el subtítulo activo sobre ``frame``."""
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    lines = _wrap_text(
-        subtitle,
-        font,
-        viewer_cfg.font_scale,
-        viewer_cfg.font_thickness,
-        min(viewer_cfg.subtitle_max_width, frame.shape[1] - 2 * viewer_cfg.subtitle_margin),
+    font_size = max(12, int(round(32 * viewer_cfg.font_scale)))
+    font = _load_font(font_size)
+
+    available_width = max(
+        1,
+        min(
+            viewer_cfg.subtitle_max_width,
+            frame.shape[1] - 2 * viewer_cfg.subtitle_margin,
+        ),
     )
+    lines = _wrap_text(subtitle, font, available_width)
 
     if not lines:
         return
 
-    line_height = int(30 * viewer_cfg.font_scale)
-    total_height = len(lines) * line_height + viewer_cfg.subtitle_margin
+    dummy_image = Image.new("RGB", (1, 1))
+    dummy_draw = ImageDraw.Draw(dummy_image)
+    try:
+        ascent, descent = font.getmetrics()
+        base_height = ascent + descent
+    except AttributeError:
+        bbox = dummy_draw.textbbox((0, 0), "Ag", font=font)
+        base_height = bbox[3] - bbox[1]
+    line_spacing = max(2, int(base_height * 0.25))
+    line_height = base_height + line_spacing
+
     y_base = frame.shape[0] - viewer_cfg.subtitle_margin
+    text_height = len(lines) * line_height
     x_margin = viewer_cfg.subtitle_margin
 
-    overlay = frame.copy()
-    cv2.rectangle(
-        overlay,
-        (x_margin - 10, y_base - total_height),
-        (frame.shape[1] - x_margin + 10, y_base + viewer_cfg.subtitle_margin // 2),
-        (0, 0, 0),
-        thickness=-1,
-    )
-    alpha = 0.55
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb_frame).convert("RGBA")
 
-    for idx, line in enumerate(lines[::-1]):
-        y = y_base - idx * line_height
-        cv2.putText(
-            frame,
-            line,
-            (x_margin, y),
-            font,
-            viewer_cfg.font_scale,
-            (255, 255, 255),
-            viewer_cfg.font_thickness,
-            lineType=cv2.LINE_AA,
-        )
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    rect_top = max(0, y_base - text_height - viewer_cfg.subtitle_margin // 2)
+    rect_bottom = min(frame.shape[0], y_base + viewer_cfg.subtitle_margin // 2)
+    rect_left = max(0, x_margin - 10)
+    rect_right = min(frame.shape[1], frame.shape[1] - x_margin + 10)
+    overlay_draw.rectangle(
+        [(rect_left, rect_top), (rect_right, rect_bottom)],
+        fill=(0, 0, 0, int(255 * 0.55)),
+    )
+
+    image = Image.alpha_composite(image, overlay)
+    draw = ImageDraw.Draw(image)
+
+    for idx, line in enumerate(lines):
+        y = y_base - (len(lines) - idx) * line_height + line_spacing // 2
+        y = max(0, y)
+        draw.text((x_margin, y), line, font=font, fill=(255, 255, 255, 255))
+
+    updated = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    frame[:, :, :] = updated
 
 
 def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[float]]:
