@@ -134,6 +134,39 @@ def _wrap_text(
     return lines
 
 
+def _wrap_text_cv2(
+    text: str,
+    font: int,
+    scale: float,
+    thickness: int,
+    max_width: int,
+) -> List[str]:
+    """Divide ``text`` en líneas usando ``cv2.getTextSize``."""
+
+    words = text.split()
+    if not words:
+        return [""]
+
+    max_width = max(max_width, 1)
+    lines: List[str] = []
+    current: List[str] = []
+
+    for word in words:
+        tentative = " ".join(current + [word])
+        size, _ = cv2.getTextSize(tentative, font, scale, thickness)
+        width = size[0]
+        if width <= max_width or not current:
+            current.append(word)
+            continue
+        lines.append(" ".join(current))
+        current = [word]
+
+    if current:
+        lines.append(" ".join(current))
+
+    return lines
+
+
 def _parse_face_subset_arg(value: str) -> List[int]:
     """Convierte una lista separada por comas en enteros no negativos."""
 
@@ -630,7 +663,13 @@ def _draw_info_panel(
     wrapped: List[str] = []
     for line in lines:
         wrapped.extend(
-            _wrap_text(line, font, scale, thickness, max_width - 2 * padding)
+            _wrap_text_cv2(
+                line,
+                font=font,
+                scale=scale,
+                thickness=thickness,
+                max_width=max_width - 2 * padding,
+            )
         )
 
     if not wrapped:
