@@ -35,6 +35,12 @@ __all__ = [
 CHECKPOINT_FILENAME = "single_signer_multistream.pt"
 CHECKPOINT_ENV_VAR = "SLT_SINGLE_SIGNER_CHECKPOINT"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_KNOWN_CHECKPOINT_NAMES = (
+    CHECKPOINT_FILENAME,
+    "single_signer_multistream.pth",
+    "best.pt",
+    "best.pth",
+)
 
 
 class SingleSignerCheckpointNotFound(FileNotFoundError):
@@ -50,10 +56,15 @@ def resolve_single_signer_checkpoint_path(
 
     1. The explicit ``checkpoint_path`` argument when provided.
     2. The environment variable :envvar:`SLT_SINGLE_SIGNER_CHECKPOINT`.
-    3. ``data/single_signer/single_signer_multistream.pt`` relative to the
-       current working directory.
-    4. ``data/single_signer/single_signer_multistream.pt`` relative to the
-       repository root (a fallback for callers executed from other paths).
+    3. ``data/single_signer/`` relative to the current working directory.
+    4. ``data/single_signer/`` relative to the repository root (a fallback for
+       callers executed from other paths).
+    5. The current working directory.
+    6. The repository root directory.
+
+    Within each directory the function recognises the validated checkpoint name
+    as well as common alternatives (``single_signer_multistream.pth``,
+    ``best.pt`` and ``best.pth``).
 
     Parameters
     ----------
@@ -77,8 +88,19 @@ def resolve_single_signer_checkpoint_path(
     env_path = os.getenv(CHECKPOINT_ENV_VAR)
     if env_path:
         candidates.append(Path(env_path))
-    candidates.append(Path.cwd() / "data" / "single_signer" / CHECKPOINT_FILENAME)
-    candidates.append(_REPO_ROOT / "data" / "single_signer" / CHECKPOINT_FILENAME)
+    search_directories = [
+        Path.cwd() / "data" / "single_signer",
+        _REPO_ROOT / "data" / "single_signer",
+        Path.cwd(),
+        _REPO_ROOT,
+    ]
+    seen: set[Path] = {candidate for candidate in candidates}
+    for directory in search_directories:
+        for filename in _KNOWN_CHECKPOINT_NAMES:
+            candidate = directory / filename
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
 
     for candidate in candidates:
         if candidate.exists():
