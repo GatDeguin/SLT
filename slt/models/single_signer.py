@@ -437,22 +437,24 @@ def _resolve_state_dict(
 
     if checkpoint is not None:
         fallback_keys = (
-            f"{name}_state_dict",
-            f"{name}_state",
-            f"{name}_model_state_dict",
-            f"{name}_model_state",
-            "model_state_dict",
-            "model_state",
+            (f"{name}_state_dict", False),
+            (f"{name}_state", False),
+            (f"{name}_model_state_dict", True),
+            (f"{name}_model_state", True),
+            ("model_state_dict", True),
+            ("model_state", True),
+            ("state_dict", True),
+            ("state", True),
         )
-        for key in fallback_keys:
+        for key, requires_slice in fallback_keys:
             payload = checkpoint.get(key)
             if not isinstance(payload, Mapping):
                 continue
-            if key.endswith("model_state_dict") or key.endswith("model_state"):
+            if requires_slice:
                 extracted = _slice_model_state(payload, module=name)
                 if extracted:
                     return extracted
-            else:
+            if payload:
                 return cast(Mapping[str, Any], payload)
 
     return {}
@@ -499,6 +501,12 @@ def load_single_signer_encoder(
     backbones = build_single_signer_backbones(**backbone_kwargs)
     encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
     encoder_state = _resolve_state_dict(encoder_blob, name="encoder", checkpoint=checkpoint)
+    if not encoder_state:
+        raise RuntimeError(
+            "The checkpoint does not define encoder parameters. Provide a valid pretrained "
+            "single-signer checkpoint (e.g. via --pretrained PATH) or disable --pretrained to "
+            "initialise the encoder from scratch."
+        )
     encoder.load_state_dict(encoder_state, strict=strict)
     return encoder, metadata, checkpoint
 
