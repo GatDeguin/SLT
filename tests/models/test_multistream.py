@@ -10,6 +10,7 @@ from typing import Dict, Optional
 import pytest
 
 torch = pytest.importorskip("torch")
+from torch.testing import assert_close
 
 import slt.models.single_signer as single_signer_module
 
@@ -20,6 +21,7 @@ from slt.models.single_signer import (
     CHECKPOINT_ENV_VAR,
     CHECKPOINT_FILENAME,
     build_single_signer_backbones,
+    load_single_signer_encoder,
 )
 from slt.models.temporal import TextSeq2SeqDecoder
 
@@ -84,6 +86,50 @@ def _write_dummy_single_signer_checkpoint(path: Path) -> None:
         "metadata": {"dummy": True},
     }
     torch.save(checkpoint, path)
+
+
+def test_load_single_signer_encoder_accepts_state_alias(tmp_path: Path) -> None:
+    backbone_kwargs = {
+        "in_channels": 3,
+        "base_channels": 8,
+        "features": 16,
+        "dropout": 0.0,
+    }
+    encoder_kwargs = {
+        "projector_dim": 8,
+        "d_model": 16,
+        "pose_dim": 39,
+        "positional_num_positions": 16,
+        "projector_dropout": 0.0,
+        "fusion_dropout": 0.0,
+        "temporal_kwargs": {
+            "nhead": 2,
+            "nlayers": 1,
+            "dim_feedforward": 32,
+            "dropout": 0.0,
+        },
+    }
+    backbones = build_single_signer_backbones(**backbone_kwargs)
+    encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
+    checkpoint = {
+        "schema_version": "1.0",
+        "task": "single_signer",
+        "encoder": {
+            "init_kwargs": encoder_kwargs,
+            "backbone_kwargs": backbone_kwargs,
+            "state": encoder.state_dict(),
+        },
+        "tokenizer": {"pad_token_id": 0, "eos_token_id": 1},
+    }
+    checkpoint_path = tmp_path / "state_alias.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    loaded_encoder, _, _ = load_single_signer_encoder(checkpoint_path=checkpoint_path)
+    loaded_state = loaded_encoder.state_dict()
+    reference_state = encoder.state_dict()
+    assert loaded_state.keys() == reference_state.keys()
+    for key, value in reference_state.items():
+        assert_close(loaded_state[key], value)
 
 
 @pytest.fixture()

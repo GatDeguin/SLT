@@ -407,6 +407,21 @@ def _resolve_state_dict(
                 f"Checkpoint field '{name}' expected a mapping under 'state_dict' but "
                 f"received {type(state_dict)!r}."
             )
+        local_state_keys = ("state", "model_state_dict", "model_state")
+        for local_key in local_state_keys:
+            payload = component.get(local_key)
+            if payload is None:
+                continue
+            if not isinstance(payload, Mapping):
+                raise TypeError(
+                    f"Checkpoint field '{name}' expected a mapping under '{local_key}' but "
+                    f"received {type(payload)!r}."
+                )
+            extracted = _slice_model_state(payload, module=name)
+            if extracted:
+                return extracted
+            if payload:
+                return cast(Mapping[str, Any], payload)
         if component and all(isinstance(key, str) for key in component):
             sample_key = next(iter(component))
             if isinstance(sample_key, str) and "." in sample_key:
