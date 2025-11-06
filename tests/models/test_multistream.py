@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import types
 from pathlib import Path
 from typing import Dict, Optional
@@ -83,6 +84,68 @@ def _write_dummy_single_signer_checkpoint(path: Path) -> None:
         "metadata": {"dummy": True},
     }
     torch.save(checkpoint, path)
+
+
+@pytest.fixture()
+def cli_single_signer_checkpoint(tmp_path: Path):
+    backbone_kwargs = {
+        "in_channels": 3,
+        "base_channels": 8,
+        "features": 16,
+        "dropout": 0.0,
+    }
+    encoder_kwargs = {
+        "projector_dim": 8,
+        "d_model": 16,
+        "pose_dim": 39,
+        "positional_num_positions": 16,
+        "projector_dropout": 0.0,
+        "fusion_dropout": 0.0,
+        "temporal_kwargs": {"nhead": 2, "nlayers": 1, "dim_feedforward": 32, "dropout": 0.0},
+    }
+    backbones = build_single_signer_backbones(**backbone_kwargs)
+    encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
+
+    decoder_kwargs = {
+        "d_model": 16,
+        "vocab_size": 32,
+        "num_layers": 1,
+        "num_heads": 2,
+        "dropout": 0.0,
+        "pad_token_id": 0,
+        "eos_token_id": 1,
+    }
+    decoder = TextSeq2SeqDecoder(**decoder_kwargs)
+
+    class _Composite(torch.nn.Module):
+        def __init__(self, encoder: torch.nn.Module, decoder: torch.nn.Module) -> None:
+            super().__init__()
+            self.encoder = encoder
+            self.decoder = decoder
+
+    composite = _Composite(encoder, decoder)
+
+    config = {
+        "model": {
+            "encoder_kwargs": copy.deepcopy(encoder_kwargs),
+            "encoder_backbone_kwargs": copy.deepcopy(backbone_kwargs),
+            "decoder_kwargs": copy.deepcopy(decoder_kwargs),
+        }
+    }
+
+    checkpoint = {
+        "schema_version": "1.2",
+        "task": "single_signer",
+        "encoder_state": encoder.state_dict(),
+        "decoder_state": decoder.state_dict(),
+        "model_state": composite.state_dict(),
+        "config": config,
+        "tokenizer": {"pad_token_id": 0, "eos_token_id": 1},
+    }
+
+    path = tmp_path / "cli_layout.pt"
+    torch.save(checkpoint, path)
+    return path, config
 
 
 def _make_encoder(**kwargs) -> MultiStreamEncoder:
@@ -454,7 +517,9 @@ def test_pose_conf_mask_zeroes_landmarks() -> None:
     landmarks = 2
     face = torch.randn(batch, time, 3, IMAGE_SIZE, IMAGE_SIZE)
     hand = torch.randn_like(face)
-    pose = torch.arange(batch * time * landmarks * 3, dtype=torch.float32).view(batch, time, landmarks * 3)
+    pose = torch.arange(
+        batch * time * landmarks * 3, dtype=torch.float32
+    ).view(batch, time, landmarks * 3)
     mask = torch.tensor([[[True, True], [False, False]]])
 
     _ = encoder(
@@ -498,7 +563,9 @@ def test_stream_state_dict_roundtrip() -> None:
     assert not load_info.unexpected_keys
 
 
-def test_from_pretrained_returns_loaded_encoder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_pretrained_returns_loaded_encoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     checkpoint_path = tmp_path / CHECKPOINT_FILENAME
     _write_dummy_single_signer_checkpoint(checkpoint_path)
     monkeypatch.setenv(CHECKPOINT_ENV_VAR, str(checkpoint_path))
@@ -537,6 +604,24 @@ def test_load_single_signer_components_accepts_legacy_layout(
     assert metadata.encoder_kwargs == checkpoint["encoder"]["init_kwargs"]
     assert metadata.backbone_kwargs == checkpoint["encoder"]["backbone_kwargs"]
     assert metadata.decoder_kwargs == checkpoint["decoder"]["init_kwargs"]
+
+
+def test_load_single_signer_components_accepts_cli_checkpoint(
+    cli_single_signer_checkpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_path, config = cli_single_signer_checkpoint
+    monkeypatch.setenv(CHECKPOINT_ENV_VAR, str(checkpoint_path))
+
+    encoder, decoder, metadata = single_signer_module.load_single_signer_components()
+
+    assert isinstance(encoder, MultiStreamEncoder)
+    assert isinstance(decoder, TextSeq2SeqDecoder)
+    assert metadata.encoder_kwargs == config["model"]["encoder_kwargs"]
+    assert metadata.backbone_kwargs == config["model"]["encoder_backbone_kwargs"]
+    assert metadata.decoder_kwargs == config["model"]["decoder_kwargs"]
+    assert metadata.tokenizer_info["pad_token_id"] == 0
+
+    monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
 
 
 @pytest.mark.parametrize(
