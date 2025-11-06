@@ -10,6 +10,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import slt.models.single_signer as single_signer_module
+
 from slt.models.backbones import load_dinov2_backbone
 from slt.models.mska import MSKAEncoder
 from slt.models.multistream import MultiStreamEncoder
@@ -510,6 +512,24 @@ def test_from_pretrained_returns_loaded_encoder(tmp_path: Path, monkeypatch: pyt
     assert metadata.encoder_kwargs
     assert metadata.backbone_kwargs["features"] == 16
     monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["best.pth", "best.pt", "single_signer_multistream.pth"],
+)
+def test_resolve_single_signer_checkpoint_path_accepts_common_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str
+) -> None:
+    monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(single_signer_module, "_REPO_ROOT", tmp_path)
+    checkpoint_path = tmp_path / filename
+    checkpoint_path.write_bytes(b"checkpoint")
+
+    resolved = single_signer_module.resolve_single_signer_checkpoint_path()
+
+    assert resolved == checkpoint_path
 
 
 def test_gloss_mlp_uses_leaky_relu_activation() -> None:
