@@ -57,10 +57,13 @@ cuando necesites procesar videos o ejecutar demos.
   El visor ahora dibuja los 468 landmarks faciales completos; controla la densidad con
   `--face-point-stride`/`--max-face-points` o recupera la vista compacta heredada con
   `--face-landmark-subset 1,133,362,13`.
+  Al usar `--videos-dir`/`--keypoints-dir` imprime un resumen con coincidencias, faltantes
+  y archivos huérfanos para validar el dataset antes de entrenar.
   Durante la reproducción se muestra un panel con rutas, FPS y offsets, junto con el estado
   actual de subtítulos y keypoints. Controla la pausa con la barra espaciadora, avanza o
   retrocede un frame con `←`/`→` (o `,`/`.`), alterna subtítulos con `S`, keypoints con `K`
-  y restablece los ajustes iniciales con `R`. Usa `--start-paused`, `--no-subtitles` y
+  y restablece los ajustes iniciales con `R`. Presiona `N` para saltar al siguiente clip sin
+  cerrar la ventana o `P` para volver al anterior. Usa `--start-paused`, `--no-subtitles` y
   `--no-draw-keypoints` para fijar los estados por defecto desde la CLI.
 
 ## Entrenamiento

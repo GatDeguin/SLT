@@ -6,11 +6,22 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from functools import lru_cache
 import time
+from collections import Counter
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import cv2
 import numpy as np
@@ -281,15 +292,15 @@ def _draw_subtitles(
     frame[:, :, :] = updated
 
 
-def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[float]]:
-    """Carga los subtítulos y retorna segmentos más el inicio sugerido."""
+def _load_csv_entries(
+    cfg: SubtitleConfig,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Lee el CSV y retorna filas normalizadas junto con el filtro activo."""
 
     if not cfg.csv_path.exists():
         raise FileNotFoundError(f"No se encontró el CSV: {cfg.csv_path}")
 
-    # ``utf-8-sig`` asegura que los archivos con BOM se decodifiquen correctamente
-    # evitando caracteres espurios (por ejemplo ``\ufeff``) en los subtítulos y
-    # cabeceras del CSV.
+    # ``utf-8-sig`` asegura que los archivos con BOM se decodifiquen correctamente.
     with cfg.csv_path.open("r", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh, delimiter=cfg.delimiter)
         rows = list(reader)
@@ -297,12 +308,14 @@ def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[
     if not rows:
         raise ValueError(f"El CSV {cfg.csv_path} no contiene filas.")
 
+    normalised: List[Dict[str, str]] = []
     filtered: List[Dict[str, str]] = []
     for row in rows:
         row_norm = {
             key: (value.strip() if isinstance(value, str) else value)
             for key, value in row.items()
         }
+        normalised.append(row_norm)
         if cfg.target_id and row_norm.get(cfg.id_column) != cfg.target_id:
             continue
         if cfg.target_video and row_norm.get(cfg.video_column) != cfg.target_video:
@@ -311,7 +324,17 @@ def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[
 
     if not filtered:
         target = cfg.target_id or cfg.target_video or "<sin filtro>"
-        raise ValueError(f"No se hallaron filas que coincidan con {target!r} en {cfg.csv_path}.")
+        raise ValueError(
+            f"No se hallaron filas que coincidan con {target!r} en {cfg.csv_path}."
+        )
+
+    return normalised, filtered
+
+
+def _load_subtitles(cfg: SubtitleConfig) -> Tuple[List[SubtitleEntry], Optional[float]]:
+    """Carga los subtítulos y retorna segmentos más el inicio sugerido."""
+
+    _all_rows, filtered = _load_csv_entries(cfg)
 
     segments: List[SubtitleEntry] = []
     clip_start: Optional[float] = None
@@ -421,38 +444,7 @@ def _iter_clip_resources(
     if not keypoints_dir.is_dir():
         raise FileNotFoundError(f"El directorio de keypoints no existe: {keypoints_dir}")
 
-    # ``utf-8-sig`` evita que un posible BOM se propague a los textos mostrados
-    # en el visor, donde puede aparecer como caracteres "??" al renderizarse.
-    with subtitle_cfg.csv_path.open("r", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh, delimiter=subtitle_cfg.delimiter)
-        rows = list(reader)
-
-    if not rows:
-        raise ValueError(f"El CSV {subtitle_cfg.csv_path} no contiene filas.")
-
-    filtered: List[Dict[str, str]] = []
-    for row in rows:
-        row_norm = {
-            key: (value.strip() if isinstance(value, str) else value)
-            for key, value in row.items()
-        }
-        if (
-            subtitle_cfg.target_id
-            and row_norm.get(subtitle_cfg.id_column) != subtitle_cfg.target_id
-        ):
-            continue
-        if (
-            subtitle_cfg.target_video
-            and row_norm.get(subtitle_cfg.video_column) != subtitle_cfg.target_video
-        ):
-            continue
-        filtered.append(row_norm)
-
-    if not filtered:
-        target = subtitle_cfg.target_id or subtitle_cfg.target_video or "<sin filtro>"
-        raise ValueError(
-            f"No se hallaron filas que coincidan con {target!r} en {subtitle_cfg.csv_path}."
-        )
+    _all_rows, filtered = _load_csv_entries(subtitle_cfg)
 
     def _prepare_entry(
         row: Dict[str, str],
@@ -560,6 +552,189 @@ def _iter_clip_resources(
         print(
             f"Advertencia: no se encontró un video en {videos_dir} para el clip {clip_id!r}."
         )
+
+
+def _format_preview(items: Sequence[str], limit: int = 5) -> str:
+    """Construye una representación corta de ``items`` limitando su extensión."""
+
+    limited = list(items[:limit])
+    if not limited:
+        return "-"
+    preview = ", ".join(limited)
+    remaining = len(items) - len(limited)
+    if remaining > 0:
+        preview += f", ... (+{remaining})"
+    return preview
+
+
+def _print_collection(
+    label: str,
+    items: Sequence[str],
+    *,
+    indent: str = "    ",
+    limit: int = 5,
+) -> None:
+    """Imprime ``items`` respetando ``limit`` elementos visibles."""
+
+    if not items:
+        return
+    preview = _format_preview(items, limit=limit)
+    print(f"{indent}{label}: {preview}")
+
+
+def _summarize_dataset(
+    videos_dir: Path,
+    keypoints_dir: Path,
+    subtitle_cfg: SubtitleConfig,
+) -> None:
+    """Imprime estadísticas resumidas del dataset para depuración temprana."""
+
+    all_rows, filtered_rows = _load_csv_entries(subtitle_cfg)
+
+    video_files = sorted(
+        path
+        for path in videos_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+    keypoint_files = sorted(
+        path
+        for path in keypoints_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in (".npy", ".npz")
+    )
+
+    missing_id_count = sum(
+        1 for row in filtered_rows if not row.get(subtitle_cfg.id_column)
+    )
+    clip_ids = [
+        row.get(subtitle_cfg.id_column)
+        for row in filtered_rows
+        if row.get(subtitle_cfg.id_column)
+    ]
+    unique_clip_ids = sorted(set(clip_ids))
+    duplicates = sorted(
+        clip_id for clip_id, count in Counter(clip_ids).items() if count > 1
+    )
+
+    matched_video_ids: Set[str] = set()
+    matched_video_stems: Set[str] = set()
+    missing_videos: Set[str] = set()
+    for row in filtered_rows:
+        clip_id = row.get(subtitle_cfg.id_column)
+        if not clip_id:
+            continue
+        video_value = row.get(subtitle_cfg.video_column)
+        candidates = [clip_id]
+        if video_value and video_value not in candidates:
+            candidates.append(video_value)
+        resolved: Optional[Path] = None
+        for candidate in candidates:
+            try:
+                resolved = _resolve_path_by_stem(
+                    videos_dir,
+                    candidate,
+                    VIDEO_EXTENSIONS,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if resolved is None:
+            missing_videos.add(clip_id)
+            continue
+        matched_video_ids.add(clip_id)
+        matched_video_stems.add(resolved.stem)
+
+    matched_keypoint_ids: Set[str] = set()
+    missing_keypoints: Set[str] = set()
+    for clip_id in unique_clip_ids:
+        try:
+            _resolve_path_by_stem(
+                keypoints_dir,
+                clip_id,
+                (".npy", ".npz"),
+            )
+        except FileNotFoundError:
+            missing_keypoints.add(clip_id)
+        else:
+            matched_keypoint_ids.add(clip_id)
+
+    video_orphans = [
+        path.name
+        for path in video_files
+        if path.stem not in matched_video_stems
+    ]
+    keypoint_orphans = [
+        path.name
+        for path in keypoint_files
+        if path.stem not in unique_clip_ids
+    ]
+
+    missing_videos_list = sorted(missing_videos)
+    missing_keypoints_list = sorted(missing_keypoints)
+    video_orphans_list = sorted(video_orphans)
+    keypoint_orphans_list = sorted(keypoint_orphans)
+
+    error_messages: List[str] = []
+    if missing_id_count:
+        error_messages.append(
+            f"Filas sin columna {subtitle_cfg.id_column!r}: {missing_id_count}"
+        )
+    if duplicates:
+        preview = _format_preview(duplicates)
+        error_messages.append(
+            f"IDs duplicados ({len(duplicates)}): {preview}"
+        )
+    if missing_videos_list:
+        preview = _format_preview(missing_videos_list)
+        error_messages.append(
+            f"Videos faltantes ({len(missing_videos_list)}): {preview}"
+        )
+    if missing_keypoints_list:
+        preview = _format_preview(missing_keypoints_list)
+        error_messages.append(
+            f"Keypoints faltantes ({len(missing_keypoints_list)}): {preview}"
+        )
+    if video_orphans_list:
+        preview = _format_preview(video_orphans_list)
+        error_messages.append(
+            f"Videos sin referencia en CSV ({len(video_orphans_list)}): {preview}"
+        )
+    if keypoint_orphans_list:
+        preview = _format_preview(keypoint_orphans_list)
+        error_messages.append(
+            f"Keypoints sin referencia en CSV ({len(keypoint_orphans_list)}): {preview}"
+        )
+
+    print("Resumen inicial del dataset")
+    print("---------------------------")
+    print(f"- CSV: {len(all_rows)} filas totales")
+    print(f"  Tras filtros: {len(filtered_rows)} filas")
+    print(
+        f"  IDs únicos: {len(unique_clip_ids)} | sin ID: {missing_id_count} | "
+        f"duplicados: {len(duplicates)}"
+    )
+    print(f"- Videos en {videos_dir}: {len(video_files)} archivos")
+    print(
+        f"  Coincidencias: {len(matched_video_ids)} | "
+        f"faltantes: {len(missing_videos_list)} | "
+        f"sobrantes: {len(video_orphans_list)}"
+    )
+    _print_collection("Faltantes (IDs)", missing_videos_list)
+    _print_collection("Sobrantes (archivos)", video_orphans_list)
+    print(f"- Keypoints en {keypoints_dir}: {len(keypoint_files)} archivos")
+    print(
+        f"  Coincidencias: {len(matched_keypoint_ids)} | "
+        f"faltantes: {len(missing_keypoints_list)} | "
+        f"sobrantes: {len(keypoint_orphans_list)}"
+    )
+    _print_collection("Faltantes (IDs)", missing_keypoints_list)
+    _print_collection("Sobrantes (archivos)", keypoint_orphans_list)
+    if error_messages:
+        print(f"- Errores detectados: {len(error_messages)} tipo(s)")
+        for message in error_messages:
+            print(f"  • {message}")
+    else:
+        print("- Errores detectados: ninguno")
+    print("")
 
 
 def _select_subtitle(segments: Sequence[SubtitleEntry], timestamp: float) -> str:
@@ -743,8 +918,8 @@ def run_viewer(
     video_fps: Optional[float] = None,
     keypoints_fps: Optional[float] = None,
     face_subset: Optional[Sequence[int]] = None,
-) -> None:
-    """Ejecuta el bucle principal del visor."""
+) -> Literal["next", "previous", "quit"]:
+    """Ejecuta el visor y retorna la acción solicitada por el usuario."""
 
     subtitles, clip_start = _load_subtitles(subtitle_cfg)
     keypoints_data = _load_keypoints(
@@ -800,6 +975,8 @@ def run_viewer(
     current_video_pos_ms = float("nan")
 
     cv2.namedWindow(viewer_cfg.window_name, cv2.WINDOW_NORMAL)
+
+    control_action: Literal["next", "previous", "quit"] = "next"
 
     try:
         while True:
@@ -926,6 +1103,7 @@ def run_viewer(
                     f"Keypoints={'ON' if show_keypoints else 'OFF'}"
                 ),
                 "Controles: Espacio=pausa | ←/→=paso | S=subtítulos | K=keypoints",
+                "           N=siguiente clip | P=clip anterior | Q=salir",
             ]
             _draw_info_panel(frame, viewer_cfg, panel_lines)
 
@@ -949,7 +1127,14 @@ def run_viewer(
             key = cv2.waitKey(wait_arg)
             if key != -1:
                 key &= 0xFF
-                if key in (27, ord("q")):
+                if key in (27, ord("q"), ord("Q")):
+                    control_action = "quit"
+                    break
+                if key in (ord("n"), ord("N")):
+                    control_action = "next"
+                    break
+                if key in (ord("p"), ord("P")):
+                    control_action = "previous"
                     break
                 if key == ord(" "):
                     paused = not paused
@@ -978,6 +1163,8 @@ def run_viewer(
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
+    return control_action
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1270,17 +1457,25 @@ def main() -> None:
     )
 
     if args.videos_dir and args.keypoints_dir:
-        clips = list(_iter_clip_resources(args.videos_dir, args.keypoints_dir, subtitle_cfg))
+        _summarize_dataset(args.videos_dir, args.keypoints_dir, subtitle_cfg)
+
+        clips = list(
+            _iter_clip_resources(args.videos_dir, args.keypoints_dir, subtitle_cfg)
+        )
+        if not clips:
+            print("No se hallaron clips compatibles con el CSV y los filtros activos.")
+            return
+
         total = len(clips)
-        for index, (video_path, keypoints_path, clip_cfg, clip_id) in enumerate(
-            clips, start=1
-        ):
+        index = 0
+        while 0 <= index < total:
+            video_path, keypoints_path, clip_cfg, clip_id = clips[index]
             print(
-                f"[{index}/{total}] Visualizando clip {clip_id} "
+                f"[{index + 1}/{total}] Visualizando clip {clip_id} "
                 f"({video_path.name}, {keypoints_path.name})."
             )
             try:
-                run_viewer(
+                action = run_viewer(
                     video_path=video_path,
                     keypoints_path=keypoints_path,
                     subtitle_cfg=clip_cfg,
@@ -1293,13 +1488,20 @@ def main() -> None:
                 print("Interrupción del usuario. Finalizando.")
                 break
 
-            if index < total:
-                response = input(
-                    "Presiona Enter para continuar con el siguiente clip o escribe 'q' para salir: "
-                )
-                if response.strip().lower().startswith("q"):
-                    print("Finalizando por solicitud del usuario.")
-                    break
+            if action == "quit":
+                print("Finalizando por solicitud del usuario.")
+                break
+            if action == "previous":
+                if index == 0:
+                    print("No hay clips anteriores; se mantiene el primero.")
+                else:
+                    index -= 1
+                    print(f"Retrocediendo al clip {index + 1} de {total}.")
+                continue
+
+            index += 1
+        else:
+            print("Se completó la visualización de todos los clips.")
     else:
         run_viewer(
             video_path=args.video,
