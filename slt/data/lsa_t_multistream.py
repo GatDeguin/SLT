@@ -43,18 +43,69 @@ def _load_csv_with_auto_delimiter(
     fallback: str = ";",
     **kwargs: Any,
 ):
-    """Lee un CSV detectando delimitadores comunes con ``csv.Sniffer``."""
+    """Lee un CSV detectando delimitadores y priorizando cabeceras con más columnas.
+
+    La heurística complementa a ``csv.Sniffer`` cuando los archivos contienen listas
+    separadas por comas dentro de campos (por ejemplo, ``split=train,val``). En esos
+    casos el detector puede favorecer ``,``, por lo que se revisa la primera línea no
+    vacía y se escoge el delimitador que produzca más columnas, desempatando con el
+    valor ``fallback`` (``;`` por defecto).
+    """
 
     with open(path, "r", encoding="utf-8-sig") as fh:
         sample = fh.read(_CSV_SNIFFER_SAMPLE_SIZE)
         fh.seek(0)
         delimiter = fallback
+        header_line = ""
+        column_counts: Dict[str, int] = {}
         if sample.strip():
+            for raw_line in sample.splitlines():
+                if raw_line.strip():
+                    header_line = raw_line
+                    break
+
+            if header_line:
+                for candidate in _CSV_SNIFFER_DELIMITERS:
+                    reader = csv.reader([header_line], delimiter=candidate)
+                    try:
+                        row = next(reader)
+                    except StopIteration:
+                        count = 0
+                    else:
+                        count = len(row)
+                    column_counts[candidate] = count
+                if fallback not in column_counts:
+                    reader = csv.reader([header_line], delimiter=fallback)
+                    try:
+                        row = next(reader)
+                    except StopIteration:
+                        column_counts[fallback] = 0
+                    else:
+                        column_counts[fallback] = len(row)
+
             try:
                 dialect = csv.Sniffer().sniff(sample, delimiters=_CSV_SNIFFER_DELIMITERS)
                 delimiter = dialect.delimiter
             except csv.Error:
                 pass
+
+        if header_line and column_counts:
+            sniffed_count = column_counts.get(delimiter, 0)
+            fallback_count = column_counts.get(fallback, 0)
+            if sniffed_count <= 1 or sniffed_count < fallback_count:
+                max_columns = max(column_counts.values()) if column_counts else 0
+                best_candidates = [
+                    candidate
+                    for candidate, count in column_counts.items()
+                    if count == max_columns
+                ]
+                if fallback in best_candidates:
+                    delimiter = fallback
+                else:
+                    for candidate in _CSV_SNIFFER_DELIMITERS:
+                        if candidate in best_candidates:
+                            delimiter = candidate
+                            break
         return pd_module.read_csv(fh, sep=delimiter, **kwargs)
 
 
