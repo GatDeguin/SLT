@@ -268,6 +268,8 @@ verificaciones recomendadas tras la instalación.
          test.csv
    meta.csv              # CSV con columnas video_id;texto
    ```
+   Se aceptan alias comunes (``id``/``text``) siempre que las cabeceras se
+   normalicen al importar en los scripts de entrenamiento.
 2. Copia los videos originales en `data/single_signer/videos/`.
 3. Normaliza `meta.csv` antes de lanzar cualquier pipeline. El comando limpia
    separadores repetidos, descarta filas sin temporización y emite resúmenes de
