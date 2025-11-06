@@ -196,6 +196,30 @@ def test_accepts_common_aliases_for_columns(synthetic_dataset: dict) -> None:
     assert "video_id" in ds.df.columns
 
 
+def test_accepts_multiple_aliases_with_warning(synthetic_dataset: dict) -> None:
+    meta_path = Path(synthetic_dataset["csv_path"])
+    split_path = Path(synthetic_dataset["index_csv"])
+    alias_meta = meta_path.with_name("subs_alias_multi.csv")
+    alias_meta.write_text(
+        "id;video;text;fps;duration\n"
+        "vid001;orig_video;hola multi;25,0;1\n",
+        encoding="utf-8",
+    )
+    alias_split = split_path.with_name("split_alias_multi.csv")
+    alias_split.write_text("id\nvid001\n", encoding="utf-8")
+    dataset_args = dict(synthetic_dataset)
+    dataset_args["csv_path"] = str(alias_meta)
+    dataset_args["index_csv"] = str(alias_split)
+
+    with pytest.warns(UserWarning, match="Se ignorará la columna 'video'"):
+        ds = LsaTMultiStream(T=2, img_size=32, flip_prob=0.0, **dataset_args)
+
+    assert ds.ids == ["vid001"]
+    assert ds.df.loc[0, "texto"] == "hola multi"
+    assert "video" in ds.df.columns
+    assert ds.df.loc[0, "video"] == "orig_video"
+
+
 def test_collate_fn_outputs(synthetic_dataset: dict) -> None:
     ds = LsaTMultiStream(T=4, img_size=32, flip_prob=0.0, **synthetic_dataset)
     random.seed(1)

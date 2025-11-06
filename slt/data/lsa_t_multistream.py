@@ -126,15 +126,23 @@ def _apply_column_aliases(
                 f"El {context} debe incluir una de las columnas "
                 f"equivalentes a '{canonical}': {accepted}."
             )
-        if len(present) > 1:
-            accepted = ", ".join(sorted(candidates))
-            raise ValueError(
-                f"El {context} solo puede contener una columna entre {accepted} "
-                f"(alias de '{canonical}'); se hallaron {', '.join(present)}."
+
+        chosen = present[0]
+        if canonical not in df.columns and chosen != canonical:
+            rename_map[chosen] = canonical
+
+        for alias in present[1:]:
+            if alias == canonical:
+                continue
+            warnings.warn(
+                "Se ignorará la columna '%s' al normalizar el %s; utiliza '%s' si "
+                "necesitas acceder a la información adicional." % (
+                    alias,
+                    context,
+                    canonical,
+                ),
+                stacklevel=2,
             )
-        alias = present[0]
-        if alias != canonical:
-            rename_map[alias] = canonical
 
     if rename_map:
         df.rename(columns=rename_map, inplace=True)
