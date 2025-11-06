@@ -624,6 +624,36 @@ def test_load_single_signer_components_accepts_cli_checkpoint(
     monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
 
 
+def test_load_single_signer_components_accepts_state_dict_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_path = tmp_path / CHECKPOINT_FILENAME
+    _write_dummy_single_signer_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path)
+    suffix_checkpoint = {
+        "schema_version": checkpoint.get("schema_version", "1.0"),
+        "task": checkpoint.get("task", "single_signer"),
+        "encoder_state_dict": checkpoint["encoder"]["state_dict"],
+        "decoder_state_dict": checkpoint["decoder"]["state_dict"],
+        "encoder_kwargs": checkpoint["encoder"]["init_kwargs"],
+        "encoder_backbone_kwargs": checkpoint["encoder"]["backbone_kwargs"],
+        "decoder_kwargs": checkpoint["decoder"]["init_kwargs"],
+        "tokenizer": checkpoint.get("tokenizer", {}),
+    }
+    torch.save(suffix_checkpoint, checkpoint_path)
+    monkeypatch.setenv(CHECKPOINT_ENV_VAR, str(checkpoint_path))
+
+    with pytest.warns(None) as record:
+        encoder, decoder, metadata = single_signer_module.load_single_signer_components()
+
+    assert not record
+    assert isinstance(encoder, MultiStreamEncoder)
+    assert isinstance(decoder, TextSeq2SeqDecoder)
+    assert metadata.encoder_kwargs == checkpoint["encoder"]["init_kwargs"]
+    assert metadata.backbone_kwargs == checkpoint["encoder"]["backbone_kwargs"]
+    assert metadata.decoder_kwargs == checkpoint["decoder"]["init_kwargs"]
+
+
 @pytest.mark.parametrize(
     "filename",
     ["best.pth", "best.pt", "single_signer_multistream.pth"],
