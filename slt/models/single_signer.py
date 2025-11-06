@@ -10,9 +10,10 @@ search those locations unless an explicit ``checkpoint_path`` is provided.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -187,16 +188,64 @@ def load_single_signer_checkpoint(
     path = resolve_single_signer_checkpoint_path(checkpoint_path)
     checkpoint: MutableMapping[str, Any] = torch.load(path, map_location=map_location)
 
+    encoder_blob = checkpoint.get("encoder", {})
+    decoder_blob = checkpoint.get("decoder", {})
+
+    encoder_kwargs = {}
+    backbone_kwargs = {}
+    decoder_kwargs = {}
+    if isinstance(encoder_blob, Mapping):
+        encoder_kwargs = dict(encoder_blob.get("init_kwargs", {}))
+        backbone_kwargs = dict(encoder_blob.get("backbone_kwargs", {}))
+    encoder_kwargs = encoder_kwargs or checkpoint.get("encoder_kwargs", {})
+    backbone_kwargs = backbone_kwargs or checkpoint.get("encoder_backbone_kwargs", {})
+    if isinstance(decoder_blob, Mapping):
+        decoder_kwargs = dict(decoder_blob.get("init_kwargs", {}))
+    decoder_kwargs = decoder_kwargs or checkpoint.get("decoder_kwargs", {})
+
     metadata = SingleSignerMetadata(
         schema_version=str(checkpoint.get("schema_version", "1.0")),
         task=str(checkpoint.get("task", "single_signer")),
-        encoder_kwargs=checkpoint.get("encoder", {}).get("init_kwargs", {}),
-        decoder_kwargs=checkpoint.get("decoder", {}).get("init_kwargs", {}),
-        backbone_kwargs=checkpoint.get("encoder", {}).get("backbone_kwargs", {}),
+        encoder_kwargs=encoder_kwargs,
+        decoder_kwargs=decoder_kwargs,
+        backbone_kwargs=backbone_kwargs,
         tokenizer_info=checkpoint.get("tokenizer", {}),
         extra=checkpoint.get("metadata", {}),
     )
     return metadata, checkpoint
+
+
+def _resolve_state_dict(
+    component: Any,
+    *,
+    name: str,
+) -> Mapping[str, Any]:
+    """Return a state_dict mapping from a checkpoint component."""
+
+    state_dict = component.get("state_dict") if isinstance(component, Mapping) else None
+    if isinstance(state_dict, Mapping):
+        return state_dict
+
+    if isinstance(component, Mapping):
+        if state_dict is not None and not isinstance(state_dict, Mapping):
+            raise TypeError(
+                f"Checkpoint field '{name}' expected a mapping under 'state_dict' but "
+                f"received {type(state_dict)!r}."
+            )
+        if component and all(isinstance(key, str) for key in component):
+            sample_key = next(iter(component))
+            if isinstance(sample_key, str) and "." in sample_key:
+                warnings.warn(
+                    (
+                        f"Checkpoint field '{name}' does not define 'state_dict'. "
+                        "Interpreting the mapping as a legacy raw state_dict."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return cast(Mapping[str, Any], component)
+
+    return {}
 
 
 def load_single_signer_encoder(
@@ -210,12 +259,15 @@ def load_single_signer_encoder(
     metadata, checkpoint = load_single_signer_checkpoint(
         checkpoint_path=checkpoint_path, map_location=map_location
     )
-    encoder_blob = checkpoint.get("encoder", {})
+    encoder_blob: Mapping[str, Any] = {}
+    raw_encoder_blob = checkpoint.get("encoder", {})
+    if isinstance(raw_encoder_blob, Mapping):
+        encoder_blob = raw_encoder_blob
     encoder_kwargs = dict(metadata.encoder_kwargs)
     backbone_kwargs = dict(metadata.backbone_kwargs)
     backbones = build_single_signer_backbones(**backbone_kwargs)
     encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
-    encoder_state = encoder_blob.get("state_dict", {})
+    encoder_state = _resolve_state_dict(encoder_blob, name="encoder")
     encoder.load_state_dict(encoder_state, strict=strict)
     return encoder, metadata, checkpoint
 
@@ -262,12 +314,15 @@ def load_single_signer_components(
     encoder, metadata, checkpoint = load_single_signer_encoder(
         checkpoint_path=checkpoint_path, map_location=map_location, strict=strict
     )
-    decoder_blob = checkpoint.get("decoder", {})
+    decoder_blob: Mapping[str, Any] = {}
+    raw_decoder_blob = checkpoint.get("decoder", {})
+    if isinstance(raw_decoder_blob, Mapping):
+        decoder_blob = raw_decoder_blob
 
     decoder_kwargs = dict(metadata.decoder_kwargs)
     _patch_decoder_kwargs(decoder_kwargs, tokenizer, metadata.tokenizer_info)
     decoder = TextSeq2SeqDecoder(**decoder_kwargs)
-    decoder_state = decoder_blob.get("state_dict", {})
+    decoder_state = _resolve_state_dict(decoder_blob, name="decoder")
     decoder.load_state_dict(decoder_state, strict=strict)
 
     return encoder, decoder, metadata

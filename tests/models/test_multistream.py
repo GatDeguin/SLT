@@ -514,6 +514,31 @@ def test_from_pretrained_returns_loaded_encoder(tmp_path: Path, monkeypatch: pyt
     monkeypatch.delenv(CHECKPOINT_ENV_VAR, raising=False)
 
 
+def test_load_single_signer_components_accepts_legacy_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_path = tmp_path / CHECKPOINT_FILENAME
+    _write_dummy_single_signer_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path)
+    legacy_checkpoint = dict(checkpoint)
+    legacy_checkpoint["encoder"] = checkpoint["encoder"]["state_dict"]
+    legacy_checkpoint["decoder"] = checkpoint["decoder"]["state_dict"]
+    legacy_checkpoint["encoder_kwargs"] = checkpoint["encoder"]["init_kwargs"]
+    legacy_checkpoint["encoder_backbone_kwargs"] = checkpoint["encoder"]["backbone_kwargs"]
+    legacy_checkpoint["decoder_kwargs"] = checkpoint["decoder"]["init_kwargs"]
+    torch.save(legacy_checkpoint, checkpoint_path)
+    monkeypatch.setenv(CHECKPOINT_ENV_VAR, str(checkpoint_path))
+
+    with pytest.warns(RuntimeWarning):
+        encoder, decoder, metadata = single_signer_module.load_single_signer_components()
+
+    assert isinstance(encoder, MultiStreamEncoder)
+    assert isinstance(decoder, TextSeq2SeqDecoder)
+    assert metadata.encoder_kwargs == checkpoint["encoder"]["init_kwargs"]
+    assert metadata.backbone_kwargs == checkpoint["encoder"]["backbone_kwargs"]
+    assert metadata.decoder_kwargs == checkpoint["decoder"]["init_kwargs"]
+
+
 @pytest.mark.parametrize(
     "filename",
     ["best.pth", "best.pt", "single_signer_multistream.pth"],
