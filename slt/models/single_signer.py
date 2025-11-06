@@ -421,12 +421,19 @@ def _resolve_state_dict(
                 return cast(Mapping[str, Any], component)
 
     if checkpoint is not None:
-        fallback_keys = (f"{name}_state", "model_state")
+        fallback_keys = (
+            f"{name}_state_dict",
+            f"{name}_state",
+            f"{name}_model_state_dict",
+            f"{name}_model_state",
+            "model_state_dict",
+            "model_state",
+        )
         for key in fallback_keys:
             payload = checkpoint.get(key)
             if not isinstance(payload, Mapping):
                 continue
-            if key == "model_state":
+            if key.endswith("model_state_dict") or key.endswith("model_state"):
                 extracted = _slice_model_state(payload, module=name)
                 if extracted:
                     return extracted
