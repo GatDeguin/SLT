@@ -132,6 +132,83 @@ def test_load_single_signer_encoder_accepts_state_alias(tmp_path: Path) -> None:
         assert_close(loaded_state[key], value)
 
 
+def test_load_single_signer_components_accepts_flat_state_dict(tmp_path: Path) -> None:
+    backbone_kwargs = {
+        "in_channels": 3,
+        "base_channels": 8,
+        "features": 16,
+        "dropout": 0.0,
+    }
+    encoder_kwargs = {
+        "projector_dim": 8,
+        "d_model": 16,
+        "pose_dim": 39,
+        "positional_num_positions": 16,
+        "projector_dropout": 0.0,
+        "fusion_dropout": 0.0,
+        "temporal_kwargs": {
+            "nhead": 2,
+            "nlayers": 1,
+            "dim_feedforward": 32,
+            "dropout": 0.0,
+        },
+    }
+    decoder_kwargs = {
+        "d_model": 16,
+        "vocab_size": 32,
+        "num_layers": 1,
+        "num_heads": 2,
+        "dropout": 0.0,
+        "pad_token_id": 0,
+        "eos_token_id": 1,
+    }
+
+    backbones = build_single_signer_backbones(**backbone_kwargs)
+    reference_encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
+    reference_decoder = TextSeq2SeqDecoder(**decoder_kwargs)
+
+    class _Composite(torch.nn.Module):
+        def __init__(self, encoder: torch.nn.Module, decoder: torch.nn.Module) -> None:
+            super().__init__()
+            self.encoder = encoder
+            self.decoder = decoder
+
+    composite = _Composite(reference_encoder, reference_decoder)
+
+    checkpoint = {
+        "schema_version": "1.0",
+        "task": "single_signer",
+        "state_dict": composite.state_dict(),
+        "config": {
+            "model": {
+                "encoder_kwargs": copy.deepcopy(encoder_kwargs),
+                "encoder_backbone_kwargs": copy.deepcopy(backbone_kwargs),
+                "decoder_kwargs": copy.deepcopy(decoder_kwargs),
+            }
+        },
+        "tokenizer": {"pad_token_id": 0, "eos_token_id": 1},
+    }
+
+    checkpoint_path = tmp_path / "flat_state_dict.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    loaded_encoder, loaded_decoder, _ = load_single_signer_components(
+        checkpoint_path=checkpoint_path
+    )
+
+    expected_encoder_state = reference_encoder.state_dict()
+    loaded_encoder_state = loaded_encoder.state_dict()
+    assert loaded_encoder_state.keys() == expected_encoder_state.keys()
+    for key, value in expected_encoder_state.items():
+        assert_close(loaded_encoder_state[key], value)
+
+    expected_decoder_state = reference_decoder.state_dict()
+    loaded_decoder_state = loaded_decoder.state_dict()
+    assert loaded_decoder_state.keys() == expected_decoder_state.keys()
+    for key, value in expected_decoder_state.items():
+        assert_close(loaded_decoder_state[key], value)
+
+
 @pytest.fixture()
 def cli_single_signer_checkpoint(tmp_path: Path):
     backbone_kwargs = {
