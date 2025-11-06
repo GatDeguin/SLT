@@ -178,6 +178,168 @@ def build_single_signer_backbones(**kwargs: Any) -> Dict[str, TinyConvBackbone]:
     }
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_model_config(checkpoint: Mapping[str, Any]) -> Mapping[str, Any]:
+    config = checkpoint.get("config")
+    if not isinstance(config, Mapping):
+        return {}
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, Mapping):
+        return model_cfg
+    return {}
+
+
+def _encoder_kwargs_from_config(model_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    explicit = model_cfg.get("encoder_kwargs")
+    if isinstance(explicit, Mapping):
+        return dict(explicit)
+
+    kwargs: Dict[str, Any] = {}
+    projector_dim = _coerce_int(model_cfg.get("projector_dim"))
+    if projector_dim is not None:
+        kwargs["projector_dim"] = projector_dim
+    d_model = _coerce_int(model_cfg.get("d_model"))
+    if d_model is not None:
+        kwargs["d_model"] = d_model
+    pose_dim = _coerce_int(model_cfg.get("pose_dim"))
+    if pose_dim is None:
+        pose_landmarks = _coerce_int(model_cfg.get("pose_landmarks"))
+        if pose_landmarks is not None:
+            pose_dim = pose_landmarks * 3
+    if pose_dim is not None:
+        kwargs["pose_dim"] = pose_dim
+    positions = _coerce_int(model_cfg.get("sequence_length"))
+    if positions is not None:
+        kwargs["positional_num_positions"] = positions
+    projector_dropout = _coerce_float(model_cfg.get("projector_dropout"))
+    if projector_dropout is not None:
+        kwargs["projector_dropout"] = projector_dropout
+    fusion_dropout = _coerce_float(model_cfg.get("fusion_dropout"))
+    if fusion_dropout is not None:
+        kwargs["fusion_dropout"] = fusion_dropout
+    negative_slope = _coerce_float(model_cfg.get("leaky_relu_negative_slope"))
+    if negative_slope is not None:
+        kwargs["leaky_relu_negative_slope"] = negative_slope
+
+    temporal_kwargs: Dict[str, Any] = {}
+    nhead = _coerce_int(model_cfg.get("temporal_nhead"))
+    if nhead is not None:
+        temporal_kwargs["nhead"] = nhead
+    nlayers = _coerce_int(model_cfg.get("temporal_layers"))
+    if nlayers is not None:
+        temporal_kwargs["nlayers"] = nlayers
+    dim_feedforward = _coerce_int(model_cfg.get("temporal_dim_feedforward"))
+    if dim_feedforward is not None:
+        temporal_kwargs["dim_feedforward"] = dim_feedforward
+    temporal_dropout = _coerce_float(model_cfg.get("temporal_dropout"))
+    if temporal_dropout is not None:
+        temporal_kwargs["dropout"] = temporal_dropout
+    if temporal_kwargs:
+        kwargs["temporal_kwargs"] = temporal_kwargs
+
+    for key in (
+        "mska_gloss_hidden_dim",
+        "mska_gloss_second_hidden_dim",
+        "mska_gloss_activation",
+        "mska_gloss_dropout",
+    ):
+        value = model_cfg.get(key)
+        if value is not None:
+            kwargs[key] = value
+
+    return kwargs
+
+
+def _backbone_kwargs_from_config(
+    model_cfg: Mapping[str, Any], encoder_kwargs: Mapping[str, Any]
+) -> Dict[str, Any]:
+    explicit = model_cfg.get("encoder_backbone_kwargs")
+    if isinstance(explicit, Mapping):
+        return dict(explicit)
+
+    backbone_kwargs: Dict[str, Any] = {}
+    in_channels = _coerce_int(model_cfg.get("backbone_in_channels"))
+    if in_channels is not None:
+        backbone_kwargs["in_channels"] = in_channels
+    base_channels = _coerce_int(model_cfg.get("backbone_base_channels"))
+    if base_channels is not None:
+        backbone_kwargs["base_channels"] = base_channels
+    features = _coerce_int(model_cfg.get("backbone_features"))
+    if features is None:
+        projector_dim = encoder_kwargs.get("projector_dim")
+        if isinstance(projector_dim, int):
+            features = projector_dim
+    if features is not None:
+        backbone_kwargs["features"] = features
+    dropout = _coerce_float(model_cfg.get("backbone_dropout"))
+    if dropout is not None:
+        backbone_kwargs["dropout"] = dropout
+    return backbone_kwargs
+
+
+def _decoder_kwargs_from_config(model_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    explicit = model_cfg.get("decoder_kwargs")
+    base: Dict[str, Any] = dict(explicit) if isinstance(explicit, Mapping) else {}
+
+    d_model = _coerce_int(model_cfg.get("d_model"))
+    if d_model is not None:
+        base.setdefault("d_model", d_model)
+    num_layers = _coerce_int(model_cfg.get("decoder_layers"))
+    if num_layers is not None:
+        base.setdefault("num_layers", num_layers)
+    num_heads = _coerce_int(model_cfg.get("decoder_heads"))
+    if num_heads is not None:
+        base.setdefault("num_heads", num_heads)
+    dropout = _coerce_float(model_cfg.get("decoder_dropout"))
+    if dropout is not None:
+        base.setdefault("dropout", dropout)
+    prompt_length = _coerce_int(model_cfg.get("decoder_prompt_length"))
+    if prompt_length is not None:
+        base.setdefault("prompt_length", prompt_length)
+    for source, target in (
+        ("decoder_prompt_init", "prompt_init"),
+        ("decoder_prompt_std", "prompt_init_std"),
+        ("decoder_prompt_range", "prompt_init_range"),
+        ("decoder_prompt_tokens", "prompt_init_tokens"),
+    ):
+        value = model_cfg.get(source)
+        if value is not None:
+            base.setdefault(target, value)
+    local_only = model_cfg.get("decoder_local_files_only")
+    if isinstance(local_only, bool):
+        base.setdefault("local_files_only", local_only)
+    for source, target in (
+        ("decoder_search_paths", "local_paths"),
+        ("decoder_path_env_vars", "env_var_paths"),
+    ):
+        value = model_cfg.get(source)
+        if value:
+            base.setdefault(target, value)
+    decoder_model = model_cfg.get("decoder_model")
+    if decoder_model:
+        base.setdefault("pretrained_model_name_or_path", decoder_model)
+    return base
+
+
 def load_single_signer_checkpoint(
     *,
     checkpoint_path: Optional[Union[str, os.PathLike[str]]] = None,
@@ -203,6 +365,18 @@ def load_single_signer_checkpoint(
         decoder_kwargs = dict(decoder_blob.get("init_kwargs", {}))
     decoder_kwargs = decoder_kwargs or checkpoint.get("decoder_kwargs", {})
 
+    model_cfg = _extract_model_config(checkpoint)
+    if model_cfg:
+        config_encoder_kwargs = _encoder_kwargs_from_config(model_cfg)
+        if not encoder_kwargs:
+            encoder_kwargs = config_encoder_kwargs
+        config_backbone_kwargs = _backbone_kwargs_from_config(model_cfg, encoder_kwargs)
+        if not backbone_kwargs:
+            backbone_kwargs = config_backbone_kwargs
+        config_decoder_kwargs = _decoder_kwargs_from_config(model_cfg)
+        if not decoder_kwargs:
+            decoder_kwargs = config_decoder_kwargs
+
     metadata = SingleSignerMetadata(
         schema_version=str(checkpoint.get("schema_version", "1.0")),
         task=str(checkpoint.get("task", "single_signer")),
@@ -219,6 +393,7 @@ def _resolve_state_dict(
     component: Any,
     *,
     name: str,
+    checkpoint: Optional[Mapping[str, Any]] = None,
 ) -> Mapping[str, Any]:
     """Return a state_dict mapping from a checkpoint component."""
 
@@ -245,7 +420,41 @@ def _resolve_state_dict(
                 )
                 return cast(Mapping[str, Any], component)
 
+    if checkpoint is not None:
+        fallback_keys = (f"{name}_state", "model_state")
+        for key in fallback_keys:
+            payload = checkpoint.get(key)
+            if not isinstance(payload, Mapping):
+                continue
+            if key == "model_state":
+                extracted = _slice_model_state(payload, module=name)
+                if extracted:
+                    return extracted
+            else:
+                return cast(Mapping[str, Any], payload)
+
     return {}
+
+
+def _slice_model_state(state: Mapping[str, Any], *, module: str) -> Mapping[str, Any]:
+    prefixes = (f"{module}.", f"module.{module}.")
+    for prefix in prefixes:
+        sliced: Dict[str, Any] = {}
+        for key, value in state.items():
+            if isinstance(key, str) and key.startswith(prefix):
+                sliced[key[len(prefix) :]] = value
+        if sliced:
+            return sliced
+
+    token = f"{module}."
+    sliced_fallback: Dict[str, Any] = {}
+    for key, value in state.items():
+        if not isinstance(key, str):
+            continue
+        index = key.find(token)
+        if index != -1:
+            sliced_fallback[key[index + len(token) :]] = value
+    return sliced_fallback
 
 
 def load_single_signer_encoder(
@@ -267,7 +476,7 @@ def load_single_signer_encoder(
     backbone_kwargs = dict(metadata.backbone_kwargs)
     backbones = build_single_signer_backbones(**backbone_kwargs)
     encoder = MultiStreamEncoder(backbones=backbones, **encoder_kwargs)
-    encoder_state = _resolve_state_dict(encoder_blob, name="encoder")
+    encoder_state = _resolve_state_dict(encoder_blob, name="encoder", checkpoint=checkpoint)
     encoder.load_state_dict(encoder_state, strict=strict)
     return encoder, metadata, checkpoint
 
@@ -322,7 +531,7 @@ def load_single_signer_components(
     decoder_kwargs = dict(metadata.decoder_kwargs)
     _patch_decoder_kwargs(decoder_kwargs, tokenizer, metadata.tokenizer_info)
     decoder = TextSeq2SeqDecoder(**decoder_kwargs)
-    decoder_state = _resolve_state_dict(decoder_blob, name="decoder")
+    decoder_state = _resolve_state_dict(decoder_blob, name="decoder", checkpoint=checkpoint)
     decoder.load_state_dict(decoder_state, strict=strict)
 
     return encoder, decoder, metadata
