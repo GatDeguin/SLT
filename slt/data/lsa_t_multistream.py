@@ -1,6 +1,7 @@
 """Dataset multi-stream para LSA-T."""
 from __future__ import annotations
 
+import csv
 import importlib
 import math
 import os
@@ -22,6 +23,70 @@ from slt.utils.metadata import (
 _POSE_SENTINEL = -1.0
 _POSE_SIGNING_WIDTH = 6.0
 _POSE_SIGNING_HEIGHT = 7.0
+
+_CSV_SNIFFER_SAMPLE_SIZE = 4096
+_CSV_SNIFFER_DELIMITERS = [";", ",", "\t", "|"]
+
+_MAIN_CSV_ALIASES: Dict[str, Sequence[str]] = {
+    "video_id": ("video_id", "id", "video"),
+    "texto": ("texto", "text", "transcript", "sentence"),
+}
+_INDEX_CSV_ALIASES: Dict[str, Sequence[str]] = {
+    "video_id": ("video_id", "id"),
+}
+
+
+def _load_csv_with_auto_delimiter(
+    pd_module,
+    path: str,
+    *,
+    fallback: str = ";",
+    **kwargs: Any,
+):
+    """Lee un CSV detectando delimitadores comunes con ``csv.Sniffer``."""
+
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        sample = fh.read(_CSV_SNIFFER_SAMPLE_SIZE)
+        fh.seek(0)
+        delimiter = fallback
+        if sample.strip():
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=_CSV_SNIFFER_DELIMITERS)
+                delimiter = dialect.delimiter
+            except csv.Error:
+                pass
+        return pd_module.read_csv(fh, sep=delimiter, **kwargs)
+
+
+def _apply_column_aliases(
+    df,
+    aliases: Dict[str, Sequence[str]],
+    *,
+    context: str,
+) -> None:
+    """Normaliza las columnas de ``df`` según ``aliases`` y valida duplicados."""
+
+    rename_map: Dict[str, str] = {}
+    for canonical, candidates in aliases.items():
+        present = [column for column in df.columns if column in candidates]
+        if not present:
+            accepted = ", ".join(sorted(candidates))
+            raise ValueError(
+                f"El {context} debe incluir una de las columnas "
+                f"equivalentes a '{canonical}': {accepted}."
+            )
+        if len(present) > 1:
+            accepted = ", ".join(sorted(candidates))
+            raise ValueError(
+                f"El {context} solo puede contener una columna entre {accepted} "
+                f"(alias de '{canonical}'); se hallaron {', '.join(present)}."
+            )
+        alias = present[0]
+        if alias != canonical:
+            rename_map[alias] = canonical
+
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
 
 
 @lru_cache(maxsize=None)
@@ -253,9 +318,9 @@ class LsaTMultiStream(Dataset):
     - ``hand_r/<video_id>_fXXXXXX.jpg`` o ``hand_r/<video_id>.npz``
     - ``pose/<video_id>.npz`` con clave ``pose``
 
-    Además necesita un CSV con columnas ``video_id`` y ``texto`` (separadas
-    por ``;``) y un CSV adicional con la lista de IDs pertenecientes al split
-    a utilizar.
+    Además necesita un CSV con columnas ``video_id``/``id`` y ``texto``/``text``
+    (separadas por ``;`` por defecto) y un CSV adicional con la lista de IDs
+    pertenecientes al split a utilizar.
     """
 
     def __init__(
@@ -341,15 +406,21 @@ class LsaTMultiStream(Dataset):
         self._split_segments_cache: Dict[str, List[SplitSegment]] = {}
         self._has_split_column = False
 
-        df = pd.read_csv(csv_path, sep=";")
+        df = _load_csv_with_auto_delimiter(pd, csv_path)
         df.columns = [c.strip().lower() for c in df.columns]
-        if "video_id" not in df.columns or "texto" not in df.columns:
-            raise ValueError("El CSV principal debe contener columnas 'video_id' y 'texto'.")
+        _apply_column_aliases(
+            df,
+            _MAIN_CSV_ALIASES,
+            context="CSV principal",
+        )
 
-        idx = pd.read_csv(index_csv)
+        idx = _load_csv_with_auto_delimiter(pd, index_csv)
         idx.columns = [c.strip().lower() for c in idx.columns]
-        if "video_id" not in idx.columns:
-            raise ValueError("El CSV de índices debe contener la columna 'video_id'.")
+        _apply_column_aliases(
+            idx,
+            _INDEX_CSV_ALIASES,
+            context="CSV de índices",
+        )
 
         def _normalise_text(value: Any) -> str:
             if value is None:
