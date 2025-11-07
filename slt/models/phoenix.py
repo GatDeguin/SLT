@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Tuple, Union
 
 import torch
 
@@ -79,6 +80,64 @@ def _ensure_mapping(name: str, value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Expected '{name}' to be a mapping, got {type(value)!r}")
     return value
+
+
+def _extract_encoder_state(
+    payload: Mapping[str, Any], *, encoder: MultiStreamEncoder
+) -> MutableMapping[str, Any]:
+    """Retrieve encoder weights from a Phoenix checkpoint payload."""
+
+    expected_keys = set(encoder.state_dict().keys())
+    candidates: Iterable[str] = (
+        "encoder_state",
+        "encoder_state_dict",
+        "model_state",
+        "model_state_dict",
+        "state_dict",
+        "encoder",
+    )
+
+    def _normalise(mapping: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
+        def _match(candidate: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
+            keys = set(candidate.keys())
+            if keys == expected_keys:
+                return OrderedDict(candidate)
+            if expected_keys.issubset(keys):
+                return OrderedDict((key, candidate[key]) for key in expected_keys)
+            return None
+
+        direct = _match(mapping)
+        if direct is not None:
+            return direct
+
+        for prefix in ("encoder.", "module.encoder."):
+            filtered = {
+                key[len(prefix) :]: value
+                for key, value in mapping.items()
+                if key.startswith(prefix)
+            }
+            if not filtered:
+                continue
+            match = _match(filtered)
+            if match is not None:
+                return match
+        return None
+
+    inspected: list[str] = []
+    for key in candidates:
+        state = payload.get(key)
+        if not isinstance(state, Mapping):
+            continue
+        match = _normalise(state)
+        inspected.append(key)
+        if match is not None:
+            return match
+
+    inspected_desc = ", ".join(inspected) or "none"
+    raise ValueError(
+        "Phoenix checkpoint does not include compatible encoder weights. "
+        f"Inspected keys: {inspected_desc}."
+    )
 
 
 def load_phoenix_checkpoint(
@@ -193,9 +252,7 @@ def load_phoenix_encoder(
         mska_gloss_dropout=_coerce_float(model_cfg.get("mska_gloss_dropout"), default=0.0),
     )
 
-    encoder_state = payload.get("encoder_state")
-    if not isinstance(encoder_state, Mapping):
-        raise ValueError("Phoenix checkpoint missing 'encoder_state' mapping")
+    encoder_state = _extract_encoder_state(payload, encoder=encoder)
     missing, unexpected = encoder.load_state_dict(encoder_state, strict=strict)
     if strict and (missing or unexpected):
         raise RuntimeError(
@@ -224,9 +281,7 @@ def apply_phoenix_weights(
         checkpoint_path=checkpoint_path, map_location=map_location
     )
 
-    encoder_state = payload.get("encoder_state")
-    if not isinstance(encoder_state, Mapping):
-        raise ValueError("Phoenix checkpoint missing 'encoder_state' mapping")
+    encoder_state = _extract_encoder_state(payload, encoder=encoder)
     missing, unexpected = encoder.load_state_dict(encoder_state, strict=strict)
     if strict and (missing or unexpected):
         raise RuntimeError(
