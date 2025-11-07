@@ -112,6 +112,8 @@ def _extract_encoder_state(
 
         prefixes: set[str] = set()
         for key in mapping.keys():
+            if not isinstance(key, str):
+                continue
             if key.startswith("encoder."):
                 prefixes.add("encoder.")
             else:
@@ -121,6 +123,8 @@ def _extract_encoder_state(
         for prefix in sorted(prefixes, key=len):
             filtered = OrderedDict()
             for key, value in mapping.items():
+                if not isinstance(key, str):
+                    continue
                 if key.startswith(prefix):
                     filtered[key[len(prefix) :]] = value
             if not filtered:
