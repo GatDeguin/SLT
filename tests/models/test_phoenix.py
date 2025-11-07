@@ -2,11 +2,57 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import sys
 import types
+from collections import OrderedDict
 
 import pytest
+
+if "torch" not in sys.modules:
+    torch_stub = types.ModuleType("torch")
+
+    def _unsupported_torch_load(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("torch.load is not available in the test environment")
+
+    torch_stub.load = _unsupported_torch_load
+    torch_stub.hub = types.ModuleType("torch.hub")
+    torch_stub.hub.load = _unsupported_torch_load
+
+    class _DummyTensor:
+        pass
+
+    class _DummyModule:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return
+
+        def parameters(self) -> tuple[object, ...]:  # pragma: no cover - helper compatibility
+            return ()
+
+        def requires_grad_(self, flag: bool) -> "_DummyModule":  # pragma: no cover
+            return self
+
+        def __call__(self, *args: object, **kwargs: object) -> "_DummyModule":
+            return self
+
+    class _DummySequential(_DummyModule):
+        pass
+
+    nn_stub = types.ModuleType("torch.nn")
+    nn_stub.Module = _DummyModule
+    nn_stub.Sequential = _DummySequential
+    nn_stub.LayerNorm = _DummyModule
+    nn_stub.Linear = _DummyModule
+    nn_stub.Dropout = _DummyModule
+    nn_stub.GELU = _DummyModule
+
+    torch_stub.Tensor = _DummyTensor
+    torch_stub.nn = nn_stub
+    nn_functional_stub = types.ModuleType("torch.nn.functional")
+    nn_stub.functional = nn_functional_stub
+    sys.modules["torch"] = torch_stub
+    sys.modules["torch.hub"] = torch_stub.hub
+    sys.modules["torch.nn"] = nn_stub
+    sys.modules["torch.nn.functional"] = nn_functional_stub
 
 if "transformers" not in sys.modules:
     transformers_stub = types.ModuleType("transformers")
@@ -81,6 +127,21 @@ def test_extract_encoder_state_from_model_state(dummy_encoder: _DummyEncoder) ->
     state = _extract_encoder_state(payload, encoder=dummy_encoder)
 
     assert dict(state) == {"layer.weight": 10, "layer.bias": 20}
+
+
+def test_extract_encoder_state_from_direct_mapping(
+    dummy_encoder: _DummyEncoder,
+) -> None:
+    payload = OrderedDict(
+        (
+            ("layer.weight", 11),
+            ("layer.bias", 22),
+        )
+    )
+
+    state = _extract_encoder_state(payload, encoder=dummy_encoder)
+
+    assert dict(state) == {"layer.weight": 11, "layer.bias": 22}
 
 
 def test_extract_encoder_state_from_state_dict(dummy_encoder: _DummyEncoder) -> None:

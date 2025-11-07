@@ -124,6 +124,10 @@ def _extract_encoder_state(
         return None
 
     inspected: list[str] = []
+    direct = _normalise(payload)
+    if direct is not None:
+        return direct
+
     for key in candidates:
         state = payload.get(key)
         if not isinstance(state, Mapping):
