@@ -147,8 +147,8 @@ def test_sample_item_structure(synthetic_dataset: dict) -> None:
     assert torch.equal(sample.pad_mask, torch.ones(4, dtype=torch.bool))
     assert sample.length.dtype == torch.long
     assert sample.length.item() == 4
-    assert sample.miss_mask_hr.sum() == 0
-    assert sample.miss_mask_hl.sum() == 4
+    assert sample.miss_mask_hr.sum() == 4
+    assert sample.miss_mask_hl.sum() == 0
     assert sample.keypoints.shape == (4, 79, 3)
     assert sample.keypoints_mask.shape == (4, 79)
     assert sample.keypoints_body.shape[1] == 33
