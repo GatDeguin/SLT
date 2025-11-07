@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Optional, Tuple, Union
@@ -97,25 +97,32 @@ def _extract_encoder_state(
         "encoder",
     )
 
-    def _normalise(mapping: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
-        def _match(candidate: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
-            keys = set(candidate.keys())
-            if keys == expected_keys:
-                return OrderedDict(candidate)
-            if expected_keys.issubset(keys):
-                return OrderedDict((key, candidate[key]) for key in expected_keys)
-            return None
+    def _match(candidate: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
+        keys = set(candidate.keys())
+        if keys == expected_keys:
+            return OrderedDict(candidate)
+        if expected_keys.issubset(keys):
+            return OrderedDict((key, candidate[key]) for key in expected_keys)
+        return None
 
+    def _apply_prefixes(mapping: Mapping[str, Any]) -> Optional[MutableMapping[str, Any]]:
         direct = _match(mapping)
         if direct is not None:
             return direct
 
-        for prefix in ("encoder.", "module.encoder."):
-            filtered = {
-                key[len(prefix) :]: value
-                for key, value in mapping.items()
-                if key.startswith(prefix)
-            }
+        prefixes: set[str] = set()
+        for key in mapping.keys():
+            if key.startswith("encoder."):
+                prefixes.add("encoder.")
+            else:
+                anchor = key.find("encoder.")
+                if anchor != -1:
+                    prefixes.add(key[: anchor + len("encoder.")])
+        for prefix in sorted(prefixes, key=len):
+            filtered = OrderedDict()
+            for key, value in mapping.items():
+                if key.startswith(prefix):
+                    filtered[key[len(prefix) :]] = value
             if not filtered:
                 continue
             match = _match(filtered)
@@ -124,18 +131,30 @@ def _extract_encoder_state(
         return None
 
     inspected: list[str] = []
-    direct = _normalise(payload)
-    if direct is not None:
-        return direct
+    queue: deque[tuple[Optional[str], Mapping[str, Any]]] = deque([(None, payload)])
+    seen: set[int] = set()
 
-    for key in candidates:
-        state = payload.get(key)
-        if not isinstance(state, Mapping):
+    while queue:
+        path, mapping = queue.popleft()
+        mapping_id = id(mapping)
+        if mapping_id in seen:
             continue
-        match = _normalise(state)
-        inspected.append(key)
+        seen.add(mapping_id)
+        if path is not None:
+            inspected.append(path)
+
+        match = _apply_prefixes(mapping)
         if match is not None:
             return match
+
+        for key in candidates:
+            state = mapping.get(key)
+            if isinstance(state, Mapping):
+                queue.append((f"{path}.{key}" if path else key, state))
+
+        for key, value in mapping.items():
+            if isinstance(value, Mapping):
+                queue.append((f"{path}.{key}" if path else key, value))
 
     inspected_desc = ", ".join(inspected) or "none"
     raise ValueError(
