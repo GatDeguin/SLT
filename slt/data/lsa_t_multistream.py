@@ -878,17 +878,17 @@ class LsaTMultiStream(Dataset):
 
             if lp:
                 hl_list.append(self._read_image(lp))
-                miss_hl.append(1)
+                miss_hl.append(0)
             else:
                 hl_list.append(zero_img)
-                miss_hl.append(0)
+                miss_hl.append(1)
 
             if rp:
                 hr_list.append(self._read_image(rp))
-                miss_hr.append(1)
+                miss_hr.append(0)
             else:
                 hr_list.append(zero_img)
-                miss_hr.append(0)
+                miss_hr.append(1)
 
         face = torch.stack(face_list, dim=0)
         hand_l = torch.stack(hl_list, dim=0)

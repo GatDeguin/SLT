@@ -10,8 +10,10 @@ from typing import Dict, Optional
 import pytest
 
 torch = pytest.importorskip("torch")
+pytest.importorskip("PIL")
 from torch.testing import assert_close
 
+from slt.data import LsaTMultiStream
 import slt.models.single_signer as single_signer_module
 
 from slt.models.backbones import load_dinov2_backbone
@@ -21,9 +23,11 @@ from slt.models.single_signer import (
     CHECKPOINT_ENV_VAR,
     CHECKPOINT_FILENAME,
     build_single_signer_backbones,
+    load_single_signer_components,
     load_single_signer_encoder,
 )
 from slt.models.temporal import TextSeq2SeqDecoder
+from tests._synthetic import SyntheticDatasetSpec, generate_multistream_dataset
 
 
 IMAGE_SIZE = 32
@@ -487,6 +491,57 @@ def test_missing_hand_frames_affect_only_masked_positions() -> None:
 
     assert torch.all(delta[unchanged] < 1e-6)
     assert torch.any(delta[changed] > 1e-6)
+
+
+def test_mask_hand_features_respects_dataset_missing_frames(tmp_path) -> None:
+    spec = SyntheticDatasetSpec(
+        sequence_length=4,
+        image_size=IMAGE_SIZE,
+        pose_landmarks=13,
+        frames_per_video=4,
+        num_train=1,
+        num_val=0,
+    )
+    paths = generate_multistream_dataset(tmp_path, spec)
+    for frame in paths.hand_right_dir.glob("*.jpg"):
+        frame.unlink()
+
+    dataset = LsaTMultiStream(
+        T=spec.sequence_length,
+        img_size=IMAGE_SIZE,
+        face_dir=str(paths.face_dir),
+        hand_l_dir=str(paths.hand_left_dir),
+        hand_r_dir=str(paths.hand_right_dir),
+        pose_dir=str(paths.pose_dir),
+        keypoints_dir=str(paths.keypoints_dir),
+        csv_path=str(paths.metadata_csv),
+        index_csv=str(paths.train_index),
+        gloss_csv=str(paths.gloss_csv),
+        flip_prob=0.0,
+    )
+
+    sample = dataset[0]
+    encoder = _make_encoder(
+        projector_dim=8,
+        d_model=16,
+        pose_dim=spec.pose_landmarks * 3,
+        positional_num_positions=spec.sequence_length,
+        temporal_kwargs={"nhead": 4, "nlayers": 1, "dim_feedforward": 32},
+    )
+
+    left_input = torch.randn(1, spec.sequence_length, 6)
+    right_input = torch.randn_like(left_input)
+
+    left_mask = sample.miss_mask_hl.unsqueeze(0)
+    right_mask = sample.miss_mask_hr.unsqueeze(0)
+
+    masked_left = encoder._mask_hand_features(left_input, left_mask, stream="hand_left")
+    masked_right = encoder._mask_hand_features(right_input, right_mask, stream="hand_right")
+
+    assert not sample.miss_mask_hl.any()
+    assert sample.miss_mask_hr.any()
+    assert torch.allclose(masked_left, left_input)
+    assert torch.equal(masked_right, torch.zeros_like(right_input))
 
 
 def test_forward_with_external_backbones(tmp_path, monkeypatch) -> None:
