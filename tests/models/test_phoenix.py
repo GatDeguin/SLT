@@ -159,6 +159,35 @@ def test_extract_encoder_state_from_state_dict(dummy_encoder: _DummyEncoder) -> 
     assert dict(state) == {"layer.weight": 3, "layer.bias": 4}
 
 
+def test_extract_encoder_state_ignores_integer_keys(
+    dummy_encoder: _DummyEncoder,
+) -> None:
+    payload = OrderedDict(
+        (
+            (
+                "optimizer",
+                {
+                    0: {"state": {}},
+                    1: {"state": {"momentum": 0.1}},
+                },
+            ),
+            (
+                "model",
+                {
+                    "state_dict": {
+                        "model.encoder.layer.weight": 7,
+                        "model.encoder.layer.bias": 8,
+                    }
+                },
+            ),
+        )
+    )
+
+    state = _extract_encoder_state(payload, encoder=dummy_encoder)
+
+    assert dict(state) == {"layer.weight": 7, "layer.bias": 8}
+
+
 def test_extract_encoder_state_missing(dummy_encoder: _DummyEncoder) -> None:
     with pytest.raises(ValueError):
         _extract_encoder_state({}, encoder=dummy_encoder)
